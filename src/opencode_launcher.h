@@ -1,0 +1,50 @@
+#pragma once
+
+#include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/launcher_discovery.h>
+
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace opencode {
+
+namespace addon = logonomic::cli_addon;
+
+struct Launcher_command
+{
+    std::string                                      program;
+    std::vector<std::string>                         prefix_arguments;
+    std::vector<std::pair<std::string, std::string>> environment;
+};
+
+struct Verified_launch
+{
+    std::vector<std::string>                         argv;
+    std::string                                      version;
+    std::vector<std::pair<std::string, std::string>> environment;
+};
+
+std::optional<Launcher_command> recognize_launcher(std::string_view script);
+std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request);
+
+// Literal argv follows the host's direct-launch grammar; it never evaluates a
+// shell expression. Recognition is deliberately separate from executable proof.
+std::vector<std::string> literal_launcher_argv(std::string_view script);
+
+bool version_is_at_least(std::string_view version, int major, int minor, int patch);
+std::string parse_version_output(std::string_view output, std::string_view errors);
+
+// Probes only a native image or a verified stock npm installation. Delegated
+// probes execute the selected shim, preserving its behavior and version evidence.
+std::optional<Verified_launch> verified_launch(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    bool                            delegated,
+    addon::Invocation_context&     context);
+
+} // namespace opencode

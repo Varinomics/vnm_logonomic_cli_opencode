@@ -1,0 +1,13 @@
+{
+  "bootstrap_version": 1,
+  "package_id": "logonomic.cli.opencode",
+  "release_version": "@PROJECT_VERSION@",
+  "platforms": ["@OPENCODE_PLATFORM@"],
+  "adapter": {
+    "path": {"@OPENCODE_PLATFORM@": "adapter/opencode_adapter@OPENCODE_EXECUTABLE_SUFFIX@"},
+    "argv": [],
+    "environment": {}
+  },
+  "core_protocol_generations": [1],
+  "integrity_index": "package.files.json"
+}

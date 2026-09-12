@@ -1,0 +1,13 @@
+{
+  "capability_id": "launch-preparation",
+  "version": 2,
+  "payload": {
+    "environment_names": [
+      "OPENCODE_CONFIG_CONTENT",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}

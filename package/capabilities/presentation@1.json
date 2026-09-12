@@ -1,0 +1,8 @@
+{
+  "capability_id": "presentation",
+  "version": 1,
+  "payload": {
+    "display_name": "OpenCode",
+    "icon": {"light": "assets/opencode.svg", "dark": "assets/opencode-white.svg"}
+  }
+}

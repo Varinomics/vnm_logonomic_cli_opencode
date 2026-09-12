@@ -1,0 +1,50 @@
+# OpenCode for Logonomic
+
+This standalone package supplies OpenCode launcher recognition, interactive
+configuration and tools, delegated ACP implementation, lifecycle delivery, and
+historical session identity conversion through the public Logonomic CLI add-on
+SDK. Its package identity is `logonomic.cli.opencode`.
+
+OpenCode has no singular global account, authentication, quota, or usage model in
+this integration. Those capabilities are not advertised. Read-only structured
+review is unavailable; structured inspection belongs to delegated implementation.
+
+Lifecycle integration requires a verified OpenCode version at least 1.18.11;
+delegated ACP requires at least 1.18.25. Newer versions remain eligible and their
+actual protocol messages are validated. The selected stock launcher chain is
+verified before delegation. User configuration is merged, and package writes use
+the exact host-acknowledged profile storage allocation.
+
+## Building and local qualification
+
+The project is C++20 and uses only the standalone SDK, the standard library and
+platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK
+checkout can be supplied with `LOGONOMIC_CLI_ADDON_SDK_SOURCE`. Provider sources
+and build outputs remain separate from the desktop app.
+
+Run every compiler-invoking configure or build through `queued-build` with an
+explicit numeric slot count matching native parallelism. Windows uses Visual
+Studio 2026 x64 with MSVC v145 (`vcvarsall.bat x64 -vcvars_ver=14.51`) and FASTBuild
+when available. Set `CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV=OFF`; cache-enabled MSVC
+uses Embedded `/Z7` debug information. Use a fresh out-of-source build directory.
+The `opencode_package` target assembles and indexes the platform package under
+`<build>/package/logonomic.cli.opencode`.
+
+After the sources are ready, build once for the selected platform and run its
+registered CTest entries. `opencode_package_validation` checks indexed bytes and
+declarations; `opencode_package_conformance` exercises the SDK protocol contract.
+Provider behavior and real helper tests complement those generic checks. Windows
+and Linux require separate native qualification; evidence from one does not prove
+the other's process paths. Local staging uses `logonomic_cli_addon_stage` and the
+desktop's generic package ingestion in isolated profiles.
+
+Local qualification does not activate this package in a user's live profile.
+Publication, signed availability, hosted rehearsal, migration/rollback gates and
+the maintained observation window are separate release checkpoints. The native
+OpenCode implementation remains installed until its authorized deletion landing.
+
+## Attribution
+
+The OpenCode icons derive from Lobe Icons and retain the packaged MIT notice in
+`package/provenance/lobe_icons_mit.txt`. OpenCode names and marks identify the
+independent upstream software; they do not imply endorsement.

@@ -1,0 +1,197 @@
+#include "opencode_preparation.h"
+
+#include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/legacy_state_import.h>
+#include <logonomic_cli_addon/profile_storage.h>
+#include <logonomic_cli_addon/session_contracts.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace {
+
+namespace addon = logonomic::cli_addon;
+namespace fs = std::filesystem;
+
+void require(bool condition, const char* message)
+{
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+std::string path_text(const fs::path& path)
+{
+    const auto bytes = path.u8string();
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+fs::path native_path(std::string_view text)
+{
+    return fs::path(std::u8string(text.begin(), text.end()));
+}
+
+void config_tests()
+{
+    auto environment = addon::Json_value::object();
+    environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(
+        "{/* retained */\"instructions\":[\"user.md\",],\"plugin\":[[\"user-plugin\",{\"url\":\"https://example.test/a//b\"}],],\"model\":\"user/model\",}"));
+    const auto parsed = opencode::inline_config(environment);
+    require(parsed.value.find("model")->as_string() == "user/model", "JSONC retains model");
+    require(parsed.value.find("instructions")->as_array()[0].as_string() == "user.md", "JSONC retains instructions");
+    require(parsed.value.find("plugin")->as_array()[0].as_array()[1].find("url")->as_string() == "https://example.test/a//b", "comment syntax in strings survives");
+    for (const char* invalid : {"[]", "{/*", "{\"instructions\":false}", "{\"instructions\":[3]}", "{\"plugin\":[[\"name\",false]]}"}) {
+        environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(invalid));
+        bool rejected = false;
+        try {
+            (void)opencode::inline_config(environment);
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "malformed user configuration is rejected");
+    }
+#ifdef _WIN32
+    environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{}"));
+    environment.set("opencode_config_content", addon::Json_value("{}"));
+    bool collision_rejected = false;
+    try {
+        (void)opencode::inline_config(environment);
+    }
+    catch (const std::runtime_error&) {
+        collision_rejected = true;
+    }
+    require(collision_rejected, "Windows config case collisions are rejected");
+#endif
+}
+
+void instruction_tests(const fs::path& root)
+{
+    const auto first = opencode::materialize_instruction(path_text(root), "Keep the session title useful.\n");
+    const auto repeat = opencode::materialize_instruction(path_text(root), "Keep the session title useful.\n");
+    const auto changed = opencode::materialize_instruction(path_text(root), "Use the repository task as the title.");
+    require(first == repeat && first != changed, "instruction generations are immutable and content addressed");
+    const auto instruction_path = native_path(first);
+    std::ifstream stream(instruction_path, std::ios::binary);
+    const std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+    require(bytes.find("logonomic_show_changed_files") != std::string::npos, "changed-file tool instruction retained");
+    stream.close();
+    std::ofstream altered(instruction_path, std::ios::binary | std::ios::trunc);
+    altered << "changed";
+    altered.close();
+    bool corruption_rejected = false;
+    try {
+        (void)opencode::materialize_instruction(path_text(root), "Keep the session title useful.\n");
+    }
+    catch (const std::runtime_error&) {
+        corruption_rejected = true;
+    }
+    require(corruption_rejected, "corrupted prior instruction is not silently overwritten");
+}
+
+addon::Host_outcome invoke(addon::Host_simulator& host, const addon::Capability_pair& capability,
+    std::string operation, addon::Json_value payload)
+{
+    const auto id = host.invoke(capability, std::move(operation), std::move(payload), 15000);
+    const auto result = host.wait_outcome(id, 18000);
+    require(result.has_value(), "adapter invocation completed");
+    return *result;
+}
+
+void adapter_tests(const fs::path& package, const fs::path& root)
+{
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.scratch_directory = root / "scratch";
+    options.profile_storage_root = root / "profiles";
+    addon::Host_simulator host(std::move(options), nullptr);
+    addon::Contract_failure failure;
+    require(host.start(&failure), "real package adapter starts");
+    std::string error;
+    const auto profile = addon::allocate_profile_storage_root(host.profile_storage_root(), "logonomic.cli.opencode", &error);
+    require(profile.has_value(), "profile root allocated");
+    addon::Prepare_request request;
+    request.launcher = {"opencode", "direct", ""};
+    request.working_directory = path_text(root);
+    request.title_instruction = "Keep the title connected to the current task.";
+    request.declared_assets = {"assets/logonomic_opencode_plugin.mjs"};
+    request.profile_storage = addon::Profile_storage_context{1, *profile};
+    request.launch_environment = addon::Launch_environment{};
+#ifdef _WIN32
+    request.launch_environment->platform_id = "windows-x86_64";
+#else
+    request.launch_environment->platform_id = "linux-x86_64";
+#endif
+    request.launch_environment->effective_environment.set("PATH", addon::Json_value(path_text(root / "absent-bin")));
+    request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));
+    const auto discovered = invoke(host, {"launcher-discovery", 1}, "discover", addon::encode_discover_request(
+        request.launch_environment->effective_environment, path_text(root), request.launch_environment->platform_id));
+    const auto candidates = addon::decode_discover_result(discovered.payload, request.launch_environment->platform_id, &failure);
+    require(discovered.status == addon::Host_status::SUCCESS && candidates && candidates->empty(),
+        "real adapter discovery does not advertise an absent installation");
+    const auto prepared = invoke(host, {"launch-preparation", 2}, "prepare", addon::encode_prepare_request(request, 2));
+    require(prepared.status == addon::Host_status::SUCCESS, "interactive prepare remains available without verified lifecycle");
+    const auto patch = addon::decode_launch_patch(prepared.payload, &failure);
+    require(patch.has_value(), "prepared patch decodes");
+    require(patch->profile_storage && patch->profile_storage->root == *profile, "exact profile echo survives real process");
+    bool merged = false;
+    bool disabled = false;
+    for (const auto& [name, value] : patch->set) {
+        if (name == "OPENCODE_CONFIG_CONTENT") {
+            merged = value.find("retained/model") != std::string::npos && value.find("user.md") != std::string::npos &&
+                value.find("{{asset_json:assets/logonomic_opencode_plugin.mjs}}") != std::string::npos;
+        }
+        if (name == "OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED") {
+            disabled = value == "0";
+        }
+    }
+    require(merged && disabled, "config is preserved while unverifiable lifecycle is explicitly disabled");
+    request.launcher.script_body = "OPENCODE_CONFIG_CONTENT={} opencode";
+    require(invoke(host, {"launch-preparation", 2}, "prepare", addon::encode_prepare_request(request, 2)).status == addon::Host_status::UNAVAILABLE,
+        "script-owned config is not overwritten");
+
+    const addon::Legacy_resume_record historical{"opencode", "session-preserved-20260912"};
+    const auto imported = invoke(host, {"legacy-state-import", 1}, "import_record",
+        addon::encode_import_record_request("legacy-resume-record", addon::encode_legacy_resume_record(historical)));
+    require(imported.status == addon::Host_status::SUCCESS, "history import succeeds");
+    const auto conversion = addon::decode_import_record_result(imported.payload, &failure);
+    require(conversion && conversion->matched(), "native history is recognized");
+    const auto resume = addon::decode_legacy_resume_conversion(*conversion->conversion(), &failure);
+    require(resume && resume->find("provider_session_id")->as_string() == historical.provider_session_id,
+        "native history session identity is preserved exactly");
+    const auto foreign = invoke(host, {"legacy-state-import", 1}, "import_record",
+        addon::encode_import_record_request("legacy-resume-record", addon::encode_legacy_resume_record({"another-provider", "session-other"})));
+    const auto unmatched = addon::decode_import_record_result(foreign.payload, &failure);
+    require(unmatched && !unmatched->matched(), "foreign history never claims this package");
+    int exit_code = -1;
+    require(host.shutdown(3000, &exit_code) && exit_code == 0, "adapter shuts down cleanly");
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    if (argc != 2) {
+        return 2;
+    }
+    const fs::path root = fs::temp_directory_path() / ("opencode-preparation-" + addon::random_nonce_hex());
+    fs::create_directories(root);
+    int result = 0;
+    try {
+        config_tests();
+        instruction_tests(root);
+        adapter_tests(native_path(argv[1]), root);
+    }
+    catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        result = 1;
+    }
+    fs::remove_all(root);
+    return result;
+}

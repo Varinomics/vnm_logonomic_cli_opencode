@@ -1,0 +1,11 @@
+{
+  "provider": "OpenCode",
+  "source": "https://github.com/anomalyco/opencode",
+  "native_integration_source": "Varinomics/logonomic/src/logonomic_opencode_cli_provider.cpp",
+  "native_integration_snapshot": "d789741a",
+  "lifecycle_minimum": "1.18.11",
+  "delegated_acp_minimum": "1.18.25",
+  "forward_policy": "Newer versions are admitted after stock launcher verification; actual ACP and event records are validated.",
+  "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "icons_license": "provenance/lobe_icons_mit.txt"
+}

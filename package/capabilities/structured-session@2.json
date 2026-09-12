@@ -1,0 +1,16 @@
+{
+  "capability_id": "structured-session",
+  "version": 2,
+  "payload": {
+    "purposes": [
+      "implementation"
+    ],
+    "environment_names": [
+      "OPENCODE_CONFIG_CONTENT",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}
