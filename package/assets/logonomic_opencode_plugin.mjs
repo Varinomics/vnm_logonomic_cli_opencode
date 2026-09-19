@@ -1508,8 +1508,11 @@ export const Logonomic = async ({ client }) => {
     if (!session_id || !message_id || !part_id) return
     const text = output?.text
     enqueue({ kind: "completed_text", session_id, message_id, part_id,
-      text: typeof text === "string" && text.isWellFormed() && !text.includes("\0") &&
-        Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes ? text : undefined })
+      // A UTF-8 round trip rejects lone surrogates without requiring newer
+      // String APIs. Bound the input before allocating the encoded copy.
+      text: typeof text === "string" && text.length <= max_assistant_text_bytes && !text.includes("\0") &&
+        Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes &&
+        Buffer.from(text, "utf8").toString("utf8") === text ? text : undefined })
   }
   return hooks
 }

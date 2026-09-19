@@ -675,7 +675,8 @@ resetCapture()
   assert.deepEqual(captured(), observed)
 }
 
-for (const disposition of ["normal", "intermediate", "aborted", "oversized", "unicode", "pending-question"]) {
+for (const disposition of ["normal", "intermediate", "aborted", "oversized", "unicode", "pending-question",
+  "lone-high", "lone-low", "surrogate-pair", "replacement-character", "nul"]) {
   resetCapture()
   const session_id = `text-${disposition}`
   const turn_id = `published-turn-${session_id}`
@@ -683,7 +684,12 @@ for (const disposition of ["normal", "intermediate", "aborted", "oversized", "un
   const plugin = await Logonomic({ client: clientFor(new Map()) })
   await publishRoot(plugin, session_id)
   const text = disposition === "oversized" ? "界".repeat(700) + "?"
-    : disposition === "unicode" ? "选择哪个目标？" : "Which target should I use?"
+    : disposition === "unicode" ? "选择哪个目标？"
+    : disposition === "lone-high" ? "Choose \ud800?"
+    : disposition === "lone-low" ? "Choose \udc00?"
+    : disposition === "surrogate-pair" ? "Choose \ud83d\ude00?"
+    : disposition === "replacement-character" ? "Choose \ufffd?"
+    : disposition === "nul" ? "Choose \0?" : "Which target should I use?"
   await plugin["experimental.text.complete"](
     { sessionID: session_id, messageID: message_id, partID: "part-answer" }, { text })
   event(plugin, "message.updated", { info: {
@@ -706,7 +712,7 @@ for (const disposition of ["normal", "intermediate", "aborted", "oversized", "un
   await settle(plugin)
   const observed = captured()
   const completion = observed.find((item) => item.event === "session.status")
-  if (disposition === "normal" || disposition === "unicode") {
+  if (["normal", "unicode", "surrogate-pair", "replacement-character"].includes(disposition)) {
     assert.equal(completion.assistant_text, text)
     assert.equal(completion.normal_completion, true)
     assert.equal(observed.filter((item) => item.event === "session.status").length, 1)
