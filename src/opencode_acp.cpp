@@ -515,6 +515,7 @@ addon::Inspection_setup make_acp_inspection(
 {
     const auto state = object({
         {"stage", Json("await_initialize")}, {"pending_base64", Json("")},
+        {"deferred_input_base64", Json("")}, {"deferred_input_is_request", Json(false)},
         {"prompt_base64", Json(addon::encode_base64(prompt))}, {"session_id", Json("")},
         {"working_directory", Json(working_directory)}, {"provider_version", Json(provider_version)},
         {"result_base64", Json("")}, {"result_message_id", Json("")},
@@ -550,7 +551,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     if (!parsed_state ||
         !exact_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
                                   "working_directory", "provider_version", "result_base64",
-                                  "result_message_id", "permission_ids", "mcp_servers", "attestations"}))
+                                  "result_message_id", "permission_ids", "mcp_servers", "attestations",
+                                  "deferred_input_base64", "deferred_input_is_request"}))
     {
         return failure("acp_invalid_state");
     }
@@ -561,14 +563,17 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         !member(state, "result_message_id").is_string() || !member(state, "permission_ids").is_array() ||
         !member(state, "mcp_servers").is_array() || !member(state, "attestations").is_array() ||
         !member(state, "pending_base64").is_string() || !member(state, "prompt_base64").is_string() ||
-        !member(state, "result_base64").is_string())
+        !member(state, "result_base64").is_string() ||
+        !member(state, "deferred_input_base64").is_string() ||
+        !member(state, "deferred_input_is_request").is_boolean())
     {
         return failure("acp_invalid_state");
     }
     auto pending_bytes = addon::decode_base64(text(member(state, "pending_base64")));
     auto prompt_bytes  = addon::decode_base64(text(member(state, "prompt_base64")));
     auto result_bytes  = addon::decode_base64(text(member(state, "result_base64")));
-    if (!pending_bytes || !prompt_bytes || !result_bytes) {
+    auto deferred_input = addon::decode_base64(text(member(state, "deferred_input_base64")));
+    if (!pending_bytes || !prompt_bytes || !result_bytes || !deferred_input) {
         return failure("acp_invalid_state");
     }
     auto pending    = std::move(*pending_bytes);
@@ -579,8 +584,9 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     if (pending.size() > k_max_record_bytes && pending.find('\n') == std::string::npos) {
         return failure("acp_record_bound_exceeded");
     }
-    std::string next_input;
-    bool next_input_contains_request = false;
+    // Preserve the causal boundary while a record preceding these writes is partial.
+    std::string next_input = std::move(*deferred_input);
+    bool next_input_contains_request = member(state, "deferred_input_is_request").as_boolean();
     for (;;) {
         const auto line_end = pending.find('\n');
         if (line_end == std::string::npos) {
@@ -609,7 +615,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 if (reply.empty()) {
                     return failure("acp_unsupported_reverse_request");
                 }
-                if (reply.size() > addon::k_max_structured_stream_bytes - next_input.size()) {
+                if (reply.size() > addon::limits::k_max_structured_stream_bytes - next_input.size()) {
                     return failure("acp_permission_reply_bound_exceeded");
                 }
                 // Independent reverse requests may share a transport read. Their
@@ -617,6 +623,14 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 next_input += reply;
                 state.set("permission_ids", permissions);
                 continue;
+            }
+            if (next_input_contains_request) {
+                const auto type = text(member(member(member(value, "params"), "update"), "sessionUpdate"));
+                if (type != "available_commands_update" &&
+                    !(stage == "await_close" && one_of(type, {"usage_update", "session_info_update"})))
+                {
+                    return failure("acp_out_of_order_notification");
+                }
             }
             auto session = text(member(state, "session_id"));
             if (!apply_update(value, stage, &session, &result, &message_id)) {
@@ -713,7 +727,10 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     state.set("pending_base64", Json(addon::encode_base64(pending)));
     state.set("result_base64", Json(addon::encode_base64(result)));
     state.set("result_message_id", Json(message_id));
-    if (!next_input.empty()) {
+    const bool defer_input = !pending.empty() && !next_input.empty();
+    state.set("deferred_input_base64", Json(defer_input ? addon::encode_base64(next_input) : ""));
+    state.set("deferred_input_is_request", Json(defer_input && next_input_contains_request));
+    if (!next_input.empty() && !defer_input) {
         return partial(state, next_input);
     }
     if (inspection.final) {

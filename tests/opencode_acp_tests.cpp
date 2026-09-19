@@ -113,6 +113,32 @@ private:
 
 void run(const fs::path& attestation)
 {
+    // Startup output must retain its pre-request meaning across every read split.
+    for (const auto& early : {k_message, k_permission}) {
+        for (std::size_t split = 1; split <= early.size(); ++split) {
+            Session session(attestation);
+            session.feed(k_initialize);
+            const auto first = session.feed(k_ready + k_new + early.substr(0, split));
+            require(!first.stdin_bytes, "pre-request output must withhold task input");
+            if (first.failure_reason) continue;
+            const auto empty = session.feed({});
+            require(!empty.stdin_bytes && !empty.failure_reason, "empty read must retain pending input");
+            const auto second = session.feed(early.substr(split));
+            require(second.failure_reason.has_value() && !second.stdin_bytes,
+                "pre-request model/permission tail must be rejected");
+        }
+    }
+    for (std::size_t split = 1; split < k_ready.size(); ++split) {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto first = session.feed(k_ready + k_new + k_ready.substr(0, split));
+        require(!first.stdin_bytes && !first.failure_reason, "partial housekeeping holds prompt");
+        const auto second = session.feed(k_ready.substr(split));
+        require(second.stdin_bytes.has_value() && !second.failure_reason,
+            "valid housekeeping releases deferred prompt");
+        const auto third = session.feed({});
+        require(!third.stdin_bytes && !third.failure_reason, "deferred prompt is not replayed");
+    }
     // The oracle is the native OpenCode ACP contract: causal requests, authenticated
     // root updates, nonce readiness, final-message replacement, and closed completion.
     {
@@ -225,7 +251,7 @@ void run(const fs::path& attestation)
         const auto prefix = session.feed(requests.substr(0, 128 * 1024));
         require(!prefix.complete && !prefix.stdin_bytes, "partial permission record must wait");
         const auto remainder = requests.substr(128 * 1024);
-        require(remainder.size() <= addon::k_max_structured_stream_bytes, "fixture stdout must fit the SDK bound");
+        require(remainder.size() <= addon::limits::k_max_structured_stream_bytes, "fixture stdout must fit the SDK bound");
         const auto result = session.feed(remainder);
         require(result.failure_reason == "acp_permission_reply_bound_exceeded" && !result.stdin_bytes,
             "permission replies must not overflow the SDK stdin bound");
