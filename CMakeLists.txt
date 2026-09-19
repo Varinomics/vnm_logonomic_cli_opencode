@@ -54,7 +54,7 @@ opencode_target(opencode_adapter)
 
 add_executable(opencode_helper src/opencode_helper.cpp)
 opencode_target(opencode_helper)
-add_executable(opencode_launch_bridge src/opencode_launch_bridge.cpp)
+logonomic_cli_addon_add_launch_bridge(opencode_launch_bridge)
 opencode_target(opencode_launch_bridge)
 
 logonomic_cli_addon_package_platform(OPENCODE_PLATFORM)
