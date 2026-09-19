@@ -1,5 +1,6 @@
 #include "opencode_launcher.h"
 
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -31,7 +32,15 @@
 namespace opencode {
 namespace {
 
-using Environment = std::vector<std::pair<std::string, std::string>>;
+using addon::lower;
+using addon::set_environment;
+using addon::regular_file;
+using addon::resolve_program;
+using addon::native_image;
+using addon::path_to_utf8;
+
+using addon::Environment;
+using addon::Launcher_whitespace;
 namespace fs = std::filesystem;
 
 std::string trim(std::string_view value)
@@ -40,14 +49,6 @@ std::string trim(std::string_view value)
     const auto last  = value.find_last_not_of(" \t\r\n");
     return first == std::string_view::npos
         ? std::string{} : std::string(value.substr(first, last - first + 1));
-}
-
-std::string lower(std::string value)
-{
-    for (char& character : value) {
-        if (character >= 'A' && character <= 'Z') character += 'a' - 'A';
-    }
-    return value;
 }
 
 std::string unquote(std::string_view value)
@@ -223,112 +224,12 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
     return std::nullopt;
 }
 
-std::string path_string(const fs::path& path)
-{
-    const auto text = path.u8string();
-    return {reinterpret_cast<const char*>(text.data()), text.size()};
-}
-
 bool equal_name(std::string_view left, std::string_view right)
 {
 #ifdef _WIN32
     return lower(std::string(left)) == lower(std::string(right));
 #else
     return left == right;
-#endif
-}
-
-std::string environment_value(const Environment& environment, std::string_view name)
-{
-    for (const auto& [key, value] : environment) if (equal_name(key, name)) return value;
-    return {};
-}
-
-void set_environment(Environment& environment, std::string name, std::string value)
-{
-    std::erase_if(environment, [&](const auto& entry) { return equal_name(entry.first, name); });
-    environment.emplace_back(std::move(name), std::move(value));
-}
-
-std::optional<fs::path> regular_file(const fs::path& path)
-{
-    std::error_code error;
-    const auto canonical = fs::canonical(path, error);
-    return !error && fs::is_regular_file(canonical, error) && !error
-        ? std::optional(canonical) : std::nullopt;
-}
-
-std::optional<fs::path> resolve_program(
-    std::string_view program, const Environment& environment, std::string_view working_directory)
-{
-    const auto path = addon::path_from_utf8(program);
-    const bool has_working_directory = addon::path_from_utf8(working_directory).is_absolute();
-    const auto usable_program = [](const fs::path& candidate) -> std::optional<fs::path> {
-        const auto file = regular_file(candidate);
-#ifndef _WIN32
-        if (file && access(file->c_str(), X_OK) != 0) return std::nullopt;
-#endif
-        return file;
-    };
-    if (path.is_absolute()) return usable_program(path);
-    if (path.has_parent_path()) {
-        return has_working_directory ? usable_program(addon::path_from_utf8(working_directory) / path) : std::nullopt;
-    }
-    std::vector<fs::path> candidates;
-    {
-        const auto search_path = environment_value(environment, "PATH");
-#ifdef _WIN32
-        constexpr char separator = ';';
-#else
-        constexpr char separator = ':';
-#endif
-        std::istringstream parts(search_path);
-        for (std::string part; std::getline(parts, part, separator);) {
-            if (part.empty()) continue;
-            auto directory = addon::path_from_utf8(unquote(part));
-            if (!directory.is_absolute()) {
-                if (!has_working_directory) continue;
-                directory = addon::path_from_utf8(working_directory) / directory;
-            }
-            candidates.push_back(directory / path);
-        }
-    }
-    for (const auto& candidate : candidates) {
-#ifdef _WIN32
-        if (!candidate.has_extension()) {
-            auto extensions = environment_value(environment, "PATHEXT");
-            if (std::none_of(environment.begin(), environment.end(), [](const auto& entry) {
-                    return equal_name(entry.first, "PATHEXT");
-                })) extensions = ".COM;.EXE;.BAT;.CMD";
-            std::istringstream parts(extensions);
-            for (std::string extension; std::getline(parts, extension, ';');) {
-                extension = trim(extension);
-                if (extension.empty()) continue;
-                if (!extension.starts_with('.')) extension.insert(extension.begin(), '.');
-                if (const auto file = usable_program(addon::path_from_utf8(path_string(candidate) + extension))) return file;
-            }
-            continue;
-        }
-#endif
-        if (const auto file = usable_program(candidate)) return file;
-    }
-    return std::nullopt;
-}
-
-bool native_image(const fs::path& path)
-{
-    std::ifstream file(path, std::ios::binary);
-    std::array<unsigned char, 4> header{};
-    file.read(reinterpret_cast<char*>(header.data()), header.size());
-#ifdef _WIN32
-    return file.gcount() >= 2 && header[0] == 'M' && header[1] == 'Z';
-#else
-    if (file.gcount() != 4) return false;
-    const auto magic = (static_cast<std::uint32_t>(header[0]) << 24) |
-        (static_cast<std::uint32_t>(header[1]) << 16) |
-        (static_cast<std::uint32_t>(header[2]) << 8) | header[3];
-    return magic == 0x7f454c46 || magic == 0xfeedface || magic == 0xfeedfacf ||
-        magic == 0xcefaedfe || magic == 0xcffaedfe || magic == 0xcafebabe || magic == 0xbebafeca;
 #endif
 }
 
@@ -384,30 +285,8 @@ struct Probe_output
 };
 
 #ifdef _WIN32
-std::wstring wide(std::string_view text)
-{
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), nullptr, 0);
-    if (size == 0) return {};
-    std::wstring result(size, L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), result.data(), size);
-    return result;
-}
-
-std::wstring quote_argument(std::wstring_view argument)
-{
-    std::wstring result = L"\"";
-    std::size_t slashes = 0;
-    for (wchar_t character : argument) {
-        if (character == L'\\') { ++slashes; continue; }
-        result.append(character == L'"' ? slashes * 2 + 1 : slashes, L'\\');
-        result += character;
-        slashes = 0;
-    }
-    result.append(slashes * 2, L'\\');
-    return result + L'"';
-}
+using addon::wide;
+using addon::quote_argument;
 
 struct Handle
 {
@@ -610,7 +489,7 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("opencode", environment, {})) return std::nullopt;
+    if (!resolve_program("opencode", environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
     return addon::Launcher_candidate{
         "interactive", "OpenCode", "opencode",
         request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
@@ -697,11 +576,13 @@ std::optional<Verified_launch> verified_launch(
     // The host already expanded and applied launcher.environment_text. Only
     // script-owned assignments remain to overlay on that effective view.
     for (const auto& [name, value] : command->environment) set_environment(environment, name, value);
-    const auto selected = resolve_program(command->program, environment, working_directory);
+    const auto selected = resolve_program(
+        command->program, environment, working_directory, Launcher_whitespace::ASCII);
     if (!selected) return std::nullopt;
     if (launcher.runner_key == "direct") {
-        const auto requested = resolve_program(launcher_argv.front(), environment, working_directory);
-        if (!requested || !equal_name(path_string(*requested), path_string(*selected))) return std::nullopt;
+        const auto requested = resolve_program(
+            launcher_argv.front(), environment, working_directory, Launcher_whitespace::ASCII);
+        if (!requested || !equal_name(path_to_utf8(*requested), path_to_utf8(*selected))) return std::nullopt;
     }
     auto executable = *selected;
     std::string package_version;
@@ -736,22 +617,22 @@ std::optional<Verified_launch> verified_launch(
         files.push_back(executable);
     }
     if (!native_image(executable)) return std::nullopt;
-    std::vector<std::string> probe_argv{path_string(executable), "--version"};
-    std::vector<std::string> launch_argv{path_string(executable)};
+    std::vector<std::string> probe_argv{path_to_utf8(executable), "--version"};
+    std::vector<std::string> launch_argv{path_to_utf8(executable)};
     int timeout_ms = 3000;
     if (delegated) {
-        launch_argv = {path_string(*selected), "acp", "--cwd", std::string(working_directory)};
-        probe_argv  = {path_string(*selected), "--version"};
+        launch_argv = {path_to_utf8(*selected), "acp", "--cwd", std::string(working_directory)};
+        probe_argv  = {path_to_utf8(*selected), "--version"};
         if (launcher.runner_key == "powershell" || !native_image(*selected)) {
 #ifdef _WIN32
             const auto shell = resolve_program(launcher.runner_key == "powershell"
-                ? launcher_argv.front() : "powershell.exe", environment, working_directory);
+                ? launcher_argv.front() : "powershell.exe", environment, working_directory, Launcher_whitespace::ASCII);
             if (!shell || !native_image(*shell)) return std::nullopt;
             const auto make_shell = [&](const std::vector<std::string>& arguments) {
-                std::string script = "& " + powershell_quote(path_string(*selected));
+                std::string script = "& " + powershell_quote(path_to_utf8(*selected));
                 for (const auto& argument : arguments) script += " " + powershell_quote(argument);
                 script += "; exit $LASTEXITCODE";
-                return std::vector<std::string>{path_string(*shell), "-NoLogo", "-Command", script};
+                return std::vector<std::string>{path_to_utf8(*shell), "-NoLogo", "-Command", script};
             };
             probe_argv  = make_shell({"--version"});
             launch_argv = make_shell({"acp", "--cwd", std::string(working_directory)});
@@ -786,7 +667,7 @@ std::optional<Verified_launch> verified_launch(
     for (const auto& argument : probe_argv) append(argument);
     for (const auto& [name, value] : environment) { append(name); append(value); }
     for (std::size_t index = 0; index < files.size(); ++index) {
-        append(path_string(files[index]));
+        append(path_to_utf8(files[index]));
         append(std::to_string(identities[index].first));
         append(std::to_string(identities[index].second.time_since_epoch().count()));
     }
@@ -802,7 +683,7 @@ std::optional<Verified_launch> verified_launch(
             return Verified_launch{std::move(launch_argv), cached->second, command->environment};
         }
     }
-    const auto output = probe(probe_argv, environment, working_directory, timeout_ms, context);
+    const auto output = opencode::probe(probe_argv, environment, working_directory, timeout_ms, context);
     if (!output) return std::nullopt;
     for (std::size_t index = 0; index < files.size(); ++index) {
         std::error_code error;
