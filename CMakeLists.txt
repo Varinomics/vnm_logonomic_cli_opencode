@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0141 NEW)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
 set(CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV OFF CACHE BOOL "Do not capture the configure environment" FORCE)
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV)
+if(POLICY CMP0168)
+    cmake_policy(SET CMP0168 NEW)
+elseif(CMAKE_GENERATOR STREQUAL "FASTBuild")
+    message(FATAL_ERROR "FASTBuild package builds require direct FetchContent population (CMP0168).")
+endif()
 
 project(logonomic_cli_opencode VERSION 1.0.0 LANGUAGES CXX)
 
@@ -51,20 +57,15 @@ opencode_target(opencode_helper)
 add_executable(opencode_launch_bridge src/opencode_launch_bridge.cpp)
 opencode_target(opencode_launch_bridge)
 
-if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(OPENCODE_PLATFORM windows-x86_64)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-    set(OPENCODE_PLATFORM linux-x86_64)
-else()
-    message(FATAL_ERROR "Package artifacts support Windows and Linux x86_64.")
-endif()
+logonomic_cli_addon_package_platform(OPENCODE_PLATFORM)
 set(OPENCODE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
-set(OPENCODE_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/package/logonomic.cli.opencode")
+logonomic_cli_addon_package_directory(logonomic.cli.opencode OPENCODE_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
-    "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance/*")
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance/*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/notices/*")
 add_custom_command(
     OUTPUT "${OPENCODE_PACKAGE_DIRECTORY}/package.files.json"
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${OPENCODE_PACKAGE_DIRECTORY}"
@@ -76,6 +77,8 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities" "${OPENCODE_PACKAGE_DIRECTORY}/capabilities"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance" "${OPENCODE_PACKAGE_DIRECTORY}/provenance"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${OPENCODE_PACKAGE_DIRECTORY}/notices"
     COMMAND "${CMAKE_COMMAND}" -E copy
         "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${OPENCODE_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:opencode_adapter>"
@@ -85,6 +88,10 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:opencode_launch_bridge>"
         "${OPENCODE_PACKAGE_DIRECTORY}/helpers/opencode_launch_bridge${OPENCODE_EXECUTABLE_SUFFIX}"
     COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${OPENCODE_PACKAGE_DIRECTORY}"
+        --third-party "assets/opencode.svg" "notices/lobe_icons_mit.txt"
+            "provenance/lobe_icons.json"
+        --third-party "assets/opencode-white.svg" "notices/lobe_icons_mit.txt"
+            "provenance/lobe_icons.json"
     DEPENDS opencode_adapter opencode_helper opencode_launch_bridge logonomic_cli_addon_index
         "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" ${package_files}
     VERBATIM)
@@ -134,4 +141,4 @@ set_tests_properties(
     opencode_plugin_tests opencode_helper_tests opencode_helper_cancellation_tests
     opencode_package_validation opencode_package_conformance
     PROPERTIES TIMEOUT 120)
-install(DIRECTORY "${OPENCODE_PACKAGE_DIRECTORY}/" DESTINATION logonomic.cli.opencode)
+logonomic_cli_addon_install_package("${OPENCODE_PACKAGE_DIRECTORY}" logonomic.cli.opencode)

@@ -1,5 +1,7 @@
 #include "opencode_acp.h"
 
+#include <logonomic_cli_addon/limits.h>
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -578,6 +580,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         return failure("acp_record_bound_exceeded");
     }
     std::string next_input;
+    bool next_input_contains_request = false;
     for (;;) {
         const auto line_end = pending.find('\n');
         if (line_end == std::string::npos) {
@@ -599,13 +602,19 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         const auto stage = text(member(state, "stage"));
         if (value.find("method")) {
             if (value.find("id")) {
-                if (stage != "await_prompt" || !next_input.empty()) {
+                if (stage != "await_prompt" || next_input_contains_request) {
                     return failure("acp_out_of_order_reverse_request");
                 }
-                next_input = permission_response(value, text(member(state, "session_id")), &permissions);
-                if (next_input.empty()) {
+                const auto reply = permission_response(value, text(member(state, "session_id")), &permissions);
+                if (reply.empty()) {
                     return failure("acp_unsupported_reverse_request");
                 }
+                if (reply.size() > addon::k_max_structured_stream_bytes - next_input.size()) {
+                    return failure("acp_permission_reply_bound_exceeded");
+                }
+                // Independent reverse requests may share a transport read. Their
+                // replies do not authorize responses to an unsent session request.
+                next_input += reply;
                 state.set("permission_ids", permissions);
                 continue;
             }
@@ -699,6 +708,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         else {
             return failure("acp_out_of_order_output");
         }
+        next_input_contains_request = true;
     }
     state.set("pending_base64", Json(addon::encode_base64(pending)));
     state.set("result_base64", Json(addon::encode_base64(result)));

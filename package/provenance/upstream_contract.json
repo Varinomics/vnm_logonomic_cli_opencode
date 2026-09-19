@@ -7,5 +7,5 @@
   "delegated_acp_minimum": "1.18.25",
   "forward_policy": "Newer versions are admitted after stock launcher verification; actual ACP and event records are validated.",
   "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
-  "icons_license": "provenance/lobe_icons_mit.txt"
+  "icons_license": "notices/lobe_icons_mit.txt"
 }

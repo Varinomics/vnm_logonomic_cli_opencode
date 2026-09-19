@@ -28,7 +28,18 @@ Studio 2026 x64 with MSVC v145 (`vcvarsall.bat x64 -vcvars_ver=14.51`) and FASTB
 when available. Set `CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV=OFF`; cache-enabled MSVC
 uses Embedded `/Z7` debug information. Use a fresh out-of-source build directory.
 The `opencode_package` target assembles and indexes the platform package under
-`<build>/package/logonomic.cli.opencode`.
+`<build>/package/logonomic.cli.opencode` for a single-configuration generator, or
+`<build>/package/<config>/logonomic.cli.opencode` for a multi-configuration generator.
+
+The package recipe proves the Windows/Linux x86-64 compiler target during
+configuration. `cmake --install` exports a fresh artifact beneath its install-time
+prefix and preserves executable permissions. An existing per-package destination,
+including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
+nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
+a failure may leave a partial artifact directory. Choose a fresh destination or
+manually remove only that identified disposable export before retrying; never
+remove an installed generation this way. The application's package ingestion
+owns atomic installation and updates.
 
 After the sources are ready, build once for the selected platform and run its
 registered CTest entries. `opencode_package_validation` checks indexed bytes and
@@ -46,5 +57,6 @@ OpenCode implementation remains installed until its authorized deletion landing.
 ## Attribution
 
 The OpenCode icons derive from Lobe Icons and retain the packaged MIT notice in
-`package/provenance/lobe_icons_mit.txt`. OpenCode names and marks identify the
+`package/notices/lobe_icons_mit.txt`; per-resource source and normalization details
+are in `package/provenance/lobe_icons.json`. OpenCode names and marks identify the
 independent upstream software; they do not imply endorsement.

@@ -1,0 +1,16 @@
+{
+  "upstream": "https://github.com/lobehub/lobe-icons",
+  "snapshot": "4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
+  "source_path": "packages/static-svg/icons/opencode.svg",
+  "source_sha256": "7cfa6e9d6726f7c9fa26c7d9aef0dfec52d20a137380454340f30f12ccbfd302",
+  "notice": "notices/lobe_icons_mit.txt",
+  "resources": [
+    "assets/opencode.svg",
+    "assets/opencode-white.svg"
+  ],
+  "changes": [
+    "Inherited fixed black/white fill variants and self-closing path serialization from Logonomic.",
+    "Removed root browser-layout style flex:none;line-height:1 and replaced root width/height 1em with numeric 24. All viewBox, path and fill data are preserved."
+  ],
+  "provenance_basis": "Logonomic compliance/evidence/LOBE_ICONS_PROVENANCE.md records this snapshot as a reproducible source reference, not the historical import revision."
+}
