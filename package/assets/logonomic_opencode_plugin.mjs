@@ -6,6 +6,7 @@ import { join } from "node:path"
 
 const maxMetadataCharacters = 256
 const maxPendingItems = 32
+const max_assistant_text_bytes = 2048
 const maxPendingTurnCandidates = 8
 const maxChildSessions = 128
 const maxChildParentDepth = 16
@@ -443,6 +444,9 @@ export const Logonomic = async ({ client }) => {
         deliveryReapTimeoutMilliseconds) +
     finalCleanupReservationMilliseconds
   const rootTurnIDs = new Map()
+  const pending_questions = new Map()
+  const assistant_replies = new Map()
+  const hint_candidates = new Set()
   const pendingRootTurns = new Map()
   const degradedRootSessions = new Set()
   const sessionRecords = new Map()
@@ -494,7 +498,31 @@ export const Logonomic = async ({ client }) => {
     return { event: "logonomic.delivery_overflow" }
   }
 
+  const clear_attention_state = (session_id) => {
+    assistant_replies.delete(session_id)
+    hint_candidates.delete(session_id)
+    for (const [id, question] of pending_questions) {
+      if (question.session_id === session_id) pending_questions.delete(id)
+    }
+  }
+
+  const complete_reply = (session_id, turn_id, projected) => {
+    const reply = assistant_replies.get(session_id)
+    const pending_question = [...pending_questions.values()]
+      .some((question) => question.session_id === session_id)
+    clear_attention_state(session_id)
+    if (reply?.turn_id === turn_id && reply.normal &&
+        reply.text !== undefined && !pending_question) {
+      if (hint_candidates.size >= maxPendingItems) return childObservationLoss()
+      projected.normal_completion = true
+      projected.assistant_text = reply.text
+      hint_candidates.add(session_id)
+    }
+    return projected
+  }
+
   const clearSessionProjectionState = (sessionID) => {
+    clear_attention_state(sessionID)
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     degradedRootSessions.delete(sessionID)
@@ -502,6 +530,7 @@ export const Logonomic = async ({ client }) => {
   }
 
   const clearRootCorrelationState = (sessionID) => {
+    clear_attention_state(sessionID)
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     degradedRootSessions.delete(sessionID)
@@ -790,6 +819,7 @@ export const Logonomic = async ({ client }) => {
   const degradeTurnCorrelation = (sessionID, degradationType) => {
     if (degradedRootSessions.has(sessionID)) return
     degradedRootSessions.add(sessionID)
+    clear_attention_state(sessionID)
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     return {
@@ -881,6 +911,18 @@ export const Logonomic = async ({ client }) => {
       ) return
       if (degradedRootSessions.has(sessionID)) return
       const pending = pendingRootTurns.get(sessionID)
+      if (rootTurnIDs.get(sessionID) === parentID ||
+          pending?.turnIDs.includes(parentID)) {
+        const retained = assistant_replies.get(sessionID)
+        if (!retained && assistant_replies.size >= maxPendingItems) {
+          return childObservationLoss()
+        }
+        const reply = retained?.message_id === messageID
+          ? retained : { message_id: messageID, turn_id: parentID, text: "", part_id: undefined }
+        reply.normal = info.finish === "stop" && !info.error &&
+          Number.isFinite(info.time?.completed) && info.time.completed > 0
+        assistant_replies.set(sessionID, reply)
+      }
       if (
         !pending ||
         pending.degradationType ||
@@ -950,6 +992,41 @@ export const Logonomic = async ({ client }) => {
 
     if (degradedRootSessions.has(sessionID)) return
 
+    if (event.type === "question.asked") {
+      const question_id = metadata(properties.id)
+      const turn_id = rootTurnIDs.get(sessionID)
+      if (!question_id || !turn_id) return
+      const tool = properties.tool
+      if (tool !== undefined &&
+          (!metadata(tool?.messageID) || !metadata(tool?.callID) ||
+           assistant_replies.get(sessionID)?.message_id !== tool.messageID)) return
+      const prior = pending_questions.get(question_id)
+      if (prior) {
+        if (prior.session_id !== sessionID || prior.turn_id !== turn_id) {
+          return degradeTurnCorrelation(sessionID, "conflicting_confirmation")
+        }
+        return
+      }
+      if (pending_questions.size >= maxPendingItems) return childObservationLoss()
+      const projected = {
+        event: event.type, session_id: sessionID, turn_id, question_id,
+        ...(tool ? { tool_message_id: tool.messageID, tool_call_id: tool.callID } : {}),
+      }
+      pending_questions.set(question_id, projected)
+      return projected
+    }
+    if (event.type === "question.replied" || event.type === "question.rejected") {
+      const question_id = metadata(properties.requestID)
+      const pending = pending_questions.get(question_id)
+      if (!pending || pending.session_id !== sessionID) return
+      if (event.type === "question.replied" && typeof properties.answer_nonempty !== "boolean") return
+      pending_questions.delete(question_id)
+      return {
+        ...pending, event: event.type,
+        ...(event.type === "question.replied" ? { answer_nonempty: properties.answer_nonempty } : {}),
+      }
+    }
+
     if (event.type === "session.status") {
       const statusType = properties.status?.type
       if (!["busy", "retry", "idle"].includes(statusType)) return
@@ -979,12 +1056,13 @@ export const Logonomic = async ({ client }) => {
         pendingRootTurns.delete(sessionID)
         if (!turnID) return
       }
-      return {
+      const projected = {
         event: event.type,
         session_id: sessionID,
         turn_id: turnID,
         status_type: statusType,
       }
+      return complete_reply(sessionID, turnID, projected)
     }
 
     if (event.type === "session.idle") {
@@ -992,14 +1070,15 @@ export const Logonomic = async ({ client }) => {
       rootTurnIDs.delete(sessionID)
       pendingRootTurns.delete(sessionID)
       if (!turnID) return
-      return {
+      return complete_reply(sessionID, turnID, {
         event: event.type,
         session_id: sessionID,
         turn_id: turnID,
-      }
+      })
     }
 
     if (event.type === "session.error") {
+      clear_attention_state(sessionID)
       const turnID = rootTurnIDs.get(sessionID)
       rootTurnIDs.delete(sessionID)
       pendingRootTurns.delete(sessionID)
@@ -1049,12 +1128,15 @@ export const Logonomic = async ({ client }) => {
     const kind = classifiedSessionKind(sessionID)
     if (kind === "child" || kind === "unresolved") return
     if (degradedRootSessions.has(sessionID)) return
+    const submitted = hint_candidates.delete(sessionID)
+      ? { event: "chat.message", session_id: sessionID, turn_id: turnID }
+      : undefined
     const pending = pendingRootTurns.get(sessionID)
     if (!pending) {
       pendingRootTurns.set(sessionID, {
         turnIDs: [turnID],
       })
-      return
+      return submitted
     }
     if (
       pending.degradationType ||
@@ -1064,6 +1146,19 @@ export const Logonomic = async ({ client }) => {
       return markTurnCorrelationAmbiguous(sessionID, "candidate_capacity")
     }
     pending.turnIDs.push(turnID)
+    return submitted
+  }
+
+  const project_completed_text = ({ session_id, message_id, part_id, text }) => {
+    const reply = assistant_replies.get(session_id)
+    if (!reply || reply.message_id !== message_id || reply.part_id === part_id) return
+    reply.part_id = part_id
+    if (text === undefined || reply.text === undefined ||
+        Buffer.byteLength(reply.text, "utf8") + Buffer.byteLength(text, "utf8") > max_assistant_text_bytes) {
+      reply.text = undefined
+      return
+    }
+    reply.text += text
   }
 
   const deliver = (projected) => new Promise((resolve) => {
@@ -1166,6 +1261,7 @@ export const Logonomic = async ({ client }) => {
       return { event: "logonomic.delivery_overflow" }
     }
     if (item.kind === "chat.message") return projectChatMessage(item)
+    if (item.kind === "completed_text") return project_completed_text(item)
     return projectEvent(item.event)
   }
 
@@ -1333,6 +1429,9 @@ export const Logonomic = async ({ client }) => {
         await sessionDiffSettlement
       } finally {
         rootTurnIDs.clear()
+        pending_questions.clear()
+        assistant_replies.clear()
+        hint_candidates.clear()
         pendingRootTurns.clear()
         degradedRootSessions.clear()
         activeChildRuns.clear()
@@ -1353,6 +1452,9 @@ export const Logonomic = async ({ client }) => {
     "session.error",
     "permission.asked",
     "permission.replied",
+    "question.asked",
+    "question.replied",
+    "question.rejected",
   ])
 
   const hooks = {
@@ -1368,6 +1470,24 @@ export const Logonomic = async ({ client }) => {
   hooks.event = ({ event }) => {
     try {
       if (relevantEvents.has(event?.type)) {
+        if (event.type.startsWith("question.")) {
+          const properties = event.properties
+          if (!properties || typeof properties !== "object") return
+          // Only an indication crosses the helper boundary; native answer and
+          // question prose must never enter lifecycle metadata or diagnostics.
+          const answers = properties.answers
+          const valid_answers = Array.isArray(answers) && answers.every((answer) =>
+            Array.isArray(answer) && answer.every((value) => typeof value === "string"))
+          event = { type: event.type, properties: {
+            id: properties.id, sessionID: properties.sessionID, requestID: properties.requestID,
+            ...(properties.tool !== undefined ? { tool: {
+              messageID: properties.tool?.messageID, callID: properties.tool?.callID,
+            } } : {}),
+            ...(event.type === "question.replied" && valid_answers ? {
+              answer_nonempty: answers.some((answer) => answer.some((value) => value.trim().length > 0)),
+            } : {}),
+          } }
+        }
         enqueue({ kind: "event", event })
       }
     } catch {
@@ -1380,6 +1500,16 @@ export const Logonomic = async ({ client }) => {
     } catch {
       // The editor lifecycle must not depend on Logonomic availability.
     }
+  }
+  hooks["experimental.text.complete"] = async (input, output) => {
+    const session_id = metadata(input?.sessionID)
+    const message_id = metadata(input?.messageID)
+    const part_id = metadata(input?.partID)
+    if (!session_id || !message_id || !part_id) return
+    const text = output?.text
+    enqueue({ kind: "completed_text", session_id, message_id, part_id,
+      text: typeof text === "string" && text.isWellFormed() && !text.includes("\0") &&
+        Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes ? text : undefined })
   }
   return hooks
 }

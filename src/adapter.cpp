@@ -4,6 +4,7 @@
 #include "opencode_preparation.h"
 
 #include "logonomic_cli_addon/adapter_runtime.h"
+#include "logonomic_cli_addon/helper_ingress.h"
 #include "logonomic_cli_addon/legacy_state_import.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
@@ -110,7 +111,10 @@ void invoke(addon::Invocation_context& context)
             import_history(context);
         }
         else
-        if (request.capability.capability_id == "lifecycle-events" || request.capability.capability_id == "helper-ingress") {
+        if (request.capability.capability_id == "lifecycle-events" ||
+            request.capability.capability_id == "helper-ingress" ||
+            request.capability.capability_id == addon::k_attention_kind_capability_id)
+        {
             opencode::handle_lifecycle(context);
         }
         else
@@ -154,7 +158,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 2}, {"managed-assets", 1}, {"structured-session", 2},
         {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
-        {"legacy-state-import", 1},
+        {"legacy-state-import", 1}, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

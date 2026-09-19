@@ -1,6 +1,7 @@
 #include "opencode_preparation.h"
 
 #include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -113,6 +114,22 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     addon::Host_simulator host(std::move(options), nullptr);
     addon::Contract_failure failure;
     require(host.start(&failure), "real package adapter starts");
+    addon::Attention_classification_request attention;
+    attention.base.event.name = "question.replied";
+    attention.base.event.body.set("event", addon::Json_value("question.replied"));
+    attention.base.event.body.set("session_id", addon::Json_value("native-session"));
+    attention.base.event.body.set("turn_id", addon::Json_value("native-turn"));
+    attention.base.event.body.set("question_id", addon::Json_value("que_answered"));
+    attention.base.event.body.set("answer_nonempty", addon::Json_value(true));
+    attention.base.transition_nonce = std::string(32, 'd');
+    const auto classified = invoke(host, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+        addon::k_classify_event_operation, addon::encode_attention_classification_request(attention));
+    const auto attention_result = addon::decode_attention_classification_result(classified.payload, &failure);
+    require(classified.status == addon::Host_status::SUCCESS && attention_result &&
+            attention_result->attention_kind && attention_result->attention_kind->kind == "interactive_question" &&
+            attention_result->base.observations.front().attention_request_id == "que_answered" &&
+            attention_result->base.observations.front().provider_event_name == "question.replied",
+        "actual packaged adapter admits the optional question companion without changing native identity");
     std::string error;
     const auto profile = addon::allocate_profile_storage_root(host.profile_storage_root(), "logonomic.cli.opencode", &error);
     require(profile.has_value(), "profile root allocated");

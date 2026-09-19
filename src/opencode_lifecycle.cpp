@@ -66,7 +66,13 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const bool error      = name == "session.error";
     const bool asked      = name == "permission.asked";
     const bool replied    = name == "permission.replied";
-    if (!(child_start || child_stop || deleted || status || idle || error || asked || replied)) {
+    const bool question_asked    = name == "question.asked";
+    const bool question_replied  = name == "question.replied";
+    const bool question_rejected = name == "question.rejected";
+    const bool submitted        = name == "chat.message";
+    if (!(child_start || child_stop || deleted || status || idle || error || asked || replied ||
+          question_asked || question_replied || question_rejected || submitted))
+    {
         return result;
     }
     const auto session = metadata(body, "session_id");
@@ -136,7 +142,25 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
             observation.outcome_evidence = addon::Evidence::CONFIRMED;
         }
     }
-    else {
+    else
+    if (question_asked || question_replied || question_rejected) {
+        const auto question = metadata(body, "question_id");
+        if (!question || body.find("question_id")->as_string() != *question) {
+            return std::nullopt;
+        }
+        if (question_replied) {
+            const auto* nonempty = body.find("answer_nonempty");
+            if (!nonempty || !nonempty->is_boolean()) {
+                return std::nullopt;
+            }
+        }
+        observation.attention_request_id = *question;
+        observation.attention_transition = question_asked
+            ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED;
+        observation.attention_evidence = addon::Evidence::CONFIRMED;
+    }
+    else
+    if (!submitted) {
         const auto permission = metadata(body, "permission_id");
         if (!permission) {
             return std::nullopt;
@@ -147,6 +171,51 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         observation.attention_evidence = addon::Evidence::CONFIRMED;
     }
     result.observations.push_back(std::move(observation));
+    return result;
+}
+
+std::optional<addon::Attention_classification_result> classify_attention(
+    const addon::Attention_classification_request& request)
+{
+    const auto base = classify(request.base);
+    if (!base) {
+        return std::nullopt;
+    }
+    addon::Attention_classification_result result{*base, std::nullopt};
+    if (result.base.observations.empty()) {
+        return result;
+    }
+    auto& observation = result.base.observations.front();
+    const auto& name = request.base.event.name;
+    const auto& body = request.base.event.body;
+    if (observation.attention_transition != addon::Attention_transition::NONE) {
+        const bool permission = name == "permission.asked" || name == "permission.replied";
+        result.attention_kind = addon::Attention_kind{0, permission ? "permission" : "interactive_question"};
+    }
+    else
+    if (name == "chat.message" && request.pending_conversational_request_id) {
+        observation.attention_transition = addon::Attention_transition::RESOLVED;
+        observation.attention_evidence = addon::Evidence::INFERRED;
+        observation.attention_request_id = *request.pending_conversational_request_id;
+        result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+    }
+    else
+    if (name == "session.idle" ||
+        (name == "session.status" && metadata(body, "status_type") == "idle"))
+    {
+        const auto* normal = body.find("normal_completion");
+        const auto* text = body.find("assistant_text");
+        if (normal && normal->is_boolean() && normal->as_boolean() && text && text->is_string() &&
+            text->as_string().size() <= 2048 && addon::looks_like_reply_request(text->as_string()))
+        {
+            observation.attention_transition = addon::Attention_transition::REQUESTED;
+            observation.attention_evidence = addon::Evidence::INFERRED;
+            observation.attention_request_id = "conversation-" + std::to_string(request.base.ledger.current_epoch) + "-" +
+                (request.base.ledger.current_transition ? request.base.ledger.current_transition->nonce : std::string{}) + "-" +
+                addon::provider_event_evidence_digest_hex(request.base.event);
+            result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+        }
+    }
     return result;
 }
 
@@ -163,6 +232,17 @@ void handle_lifecycle(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
+    if (context.request().capability.capability_id == addon::k_attention_kind_capability_id) {
+        const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
+        const auto result = request ? classify_attention(*request) : std::nullopt;
+        if (!result) {
+            context.fail(addon::Result_status::FAILED, request ? "invalid_provider_event" : failure.reason_code);
+        }
+        else {
+            context.succeed(addon::encode_attention_classification_result(*result));
+        }
+        return;
+    }
     const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
     if (!request) {
         context.fail(addon::Result_status::FAILED, failure.reason_code);

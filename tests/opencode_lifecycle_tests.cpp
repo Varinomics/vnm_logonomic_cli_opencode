@@ -25,6 +25,19 @@ public:
         m_request.payload   = addon::encode_classify_event_request(request);
     }
 
+    explicit Classification_call(const addon::Attention_classification_request& request)
+    {
+        m_request.capability = {addon::k_attention_kind_capability_id, addon::k_attention_kind_version};
+        m_request.operation = addon::k_classify_event_operation;
+        m_request.payload = addon::encode_attention_classification_request(request);
+    }
+
+    std::optional<addon::Attention_classification_result> attention_result() const
+    {
+        addon::Contract_failure failure;
+        return addon::decode_attention_classification_result(m_payload, &failure);
+    }
+
     const addon::Invoke_request& request() const override { return m_request; }
     bool cancel_requested() const override { return m_cancelled; }
     bool wait_for_cancel(int) override { return m_cancelled; }
@@ -95,6 +108,77 @@ addon::Classify_event_result classify(const addon::Classify_event_request& reque
 
 int main()
 {
+    for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
+        auto request = event(name);
+        request.event.body.set("question_id", addon::Json_value("que_native_question"));
+        if (std::string_view(name) == "question.replied") {
+            request.event.body.set("answer_nonempty", addon::Json_value(true));
+        }
+        const auto observation = classify(request).observations.front();
+        require(observation.provider_event_name == name &&
+                observation.attention_request_id == "que_native_question" &&
+                observation.attention_transition == (std::string_view(name) == "question.asked"
+                    ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED) &&
+                observation.attention_evidence == addon::Evidence::CONFIRMED,
+            "native question events preserve identity and distinguish reply from rejection");
+        Classification_call call(addon::Attention_classification_request{request, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind && result->attention_kind->kind == "interactive_question",
+            "optional companion identifies explicit native questions");
+    }
+    auto invalid_reply = event("question.replied");
+    invalid_reply.event.body.set("question_id", addon::Json_value("que_native_question"));
+    Classification_call missing_answer(invalid_reply);
+    opencode::handle_lifecycle(missing_answer);
+    require(missing_answer.status() == addon::Result_status::FAILED,
+        "missing answer indication cannot be treated as a verified reply");
+    invalid_reply.event.body.set("answer_nonempty", addon::Json_value(false));
+    require(classify(invalid_reply).observations.front().provider_event_name == "question.replied",
+        "an empty native reply remains a reply but cannot prove nonempty answering");
+
+    auto permission = event("permission.asked");
+    permission.event.body.set("permission_id", addon::Json_value("permission-separate"));
+    Classification_call permission_call(addon::Attention_classification_request{permission, std::nullopt});
+    opencode::handle_lifecycle(permission_call);
+    require(permission_call.attention_result() && permission_call.attention_result()->attention_kind &&
+            permission_call.attention_result()->attention_kind->kind == "permission",
+        "permissions are not classified as questions");
+
+    for (const auto* name : {"session.idle", "session.status"}) {
+        auto completed = event(name);
+        completed.event.body.set("status_type", addon::Json_value("idle"));
+        completed.event.body.set("normal_completion", addon::Json_value(true));
+        completed.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+        require(classify(completed).observations.front().attention_transition == addon::Attention_transition::NONE,
+            "base helper ingress does not acquire optional hint semantics");
+        Classification_call call(addon::Attention_classification_request{completed, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind && result->attention_kind->kind == "conversational_hint" &&
+                result->base.observations.front().attention_evidence == addon::Evidence::INFERRED,
+            "normal completed text uses the local SDK heuristic as inferred evidence");
+        const auto hint_id = result->base.observations.front().attention_request_id;
+        Classification_call resolved(addon::Attention_classification_request{event("chat.message"), hint_id});
+        opencode::handle_lifecycle(resolved);
+        require(resolved.attention_result() &&
+                resolved.attention_result()->base.observations.front().attention_request_id == hint_id &&
+                resolved.attention_result()->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED,
+            "new user input resolves only the host-selected hint identity");
+        for (const auto& text : {std::string("Completed."), std::string(2048, 'x') + "?"}) {
+            completed.event.body.set("assistant_text", addon::Json_value(text));
+            Classification_call ignored(addon::Attention_classification_request{completed, std::nullopt});
+            opencode::handle_lifecycle(ignored);
+            require(ignored.attention_result() && !ignored.attention_result()->attention_kind,
+                "nonquestion or overlong text does not request inferred attention");
+        }
+        completed.event.body.set("assistant_text", addon::Json_value("Which target?"));
+        completed.event.body.set("normal_completion", addon::Json_value(false));
+        Classification_call interrupted(addon::Attention_classification_request{completed, std::nullopt});
+        opencode::handle_lifecycle(interrupted);
+        require(interrupted.attention_result() && !interrupted.attention_result()->attention_kind,
+            "interruption cannot manufacture a completed reply hint");
+    }
     // The native OpenCode event decoder and lifecycle ledger contracts are the
     // oracle: repeated status facts do not open a second provider epoch.
     auto started = event("session.status", false);

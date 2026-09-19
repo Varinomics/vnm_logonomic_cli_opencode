@@ -17,6 +17,30 @@ the exact host-acknowledged profile storage allocation.
 
 ## Building and local qualification
 
+Interactive native question events retain `question.asked`, `question.replied`,
+and `question.rejected`, the native question identity, and its original root
+turn. Replies carry a boolean `answer_nonempty` in the projected provider event:
+true means at least one returned answer string contains non-whitespace text.
+Question and answer prose are omitted. A reply is distinct from a rejection;
+disposal or session termination clears pending correlation without fabricating
+either event. A native qualification gate must require a correlated reply with
+`answer_nonempty: true`, not merely disappearance of attention.
+
+The optional `attention-kind@1` companion distinguishes confirmed native
+questions from permissions and inferred conversational hints. The plugin retains
+at most 2048 UTF-8 bytes of completed assistant text per correlated message and
+supplies it only on normal root completion (`finish: stop`, completed timestamp,
+no error), before the first idle event clears turn identity. Overlong or invalid
+text is unavailable, not truncated into a different question. This bounded text
+is private classifier input, never copied into lifecycle observation fields.
+The existing SDK local heuristic classifies hints; genuine subsequent user input
+can resolve only the host-selected conversational hint. No transcript hydration
+or external classification is used. Pending question, reply, and hint tracking
+are bounded; overflow uses the existing lifecycle-degradation path.
+
+Delegated ACP question disabling and base helper-ingress contracts are unchanged.
+Provider fixtures establish protocol behavior, not paid native or UI qualification.
+
 The project is C++20 and uses only the standalone SDK, the standard library and
 platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK
 checkout can be supplied with `LOGONOMIC_CLI_ADDON_SDK_SOURCE`. Provider sources

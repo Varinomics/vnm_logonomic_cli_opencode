@@ -630,4 +630,112 @@ for (const deletedInfo of [
   ])
 }
 
+resetCapture()
+{
+  const session_id = "question-root"
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  const ask = (id) => event(plugin, "question.asked", {
+    id, sessionID: session_id, questions: [{ question: privateCanary }],
+    tool: { messageID: `assistant-published-turn-${session_id}`, callID: `call-${id}` },
+  })
+  ask("que_answer")
+  ask("que_answer")
+  event(plugin, "question.replied", {
+    sessionID: "unrelated", requestID: "que_answer", answers: [[privateCanary]],
+  })
+  event(plugin, "question.replied", {
+    sessionID: session_id, requestID: "que_answer", answers: [[privateCanary]],
+  })
+  event(plugin, "question.replied", {
+    sessionID: session_id, requestID: "que_answer", answers: [[privateCanary]],
+  })
+  ask("que_empty")
+  event(plugin, "question.replied", {
+    sessionID: session_id, requestID: "que_empty", answers: [[]],
+  })
+  ask("que_reject")
+  event(plugin, "question.rejected", { sessionID: session_id, requestID: "que_reject" })
+  ask("que_pending_at_disposal")
+  await settle(plugin)
+  const observed = captured()
+  assert.deepEqual(observed.map((item) => item.event), [
+    "question.asked", "question.replied", "question.asked", "question.replied",
+    "question.asked", "question.rejected", "question.asked",
+  ])
+  assert.equal(observed[1].answer_nonempty, true)
+  assert.equal(observed[3].answer_nonempty, false)
+  assert.equal(observed[5].answer_nonempty, undefined)
+  assert(observed.every((item) => item.turn_id === `published-turn-${session_id}`))
+  assert.equal(observed[1].tool_call_id, "call-que_answer")
+  assert(!JSON.stringify(observed).includes('"answers"'))
+  event(plugin, "question.replied", {
+    sessionID: session_id, requestID: "que_pending_at_disposal", answers: [[privateCanary]],
+  })
+  assert.deepEqual(captured(), observed)
+}
+
+for (const disposition of ["normal", "intermediate", "aborted", "oversized", "unicode", "pending-question"]) {
+  resetCapture()
+  const session_id = `text-${disposition}`
+  const turn_id = `published-turn-${session_id}`
+  const message_id = `assistant-${turn_id}`
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  const text = disposition === "oversized" ? "界".repeat(700) + "?"
+    : disposition === "unicode" ? "选择哪个目标？" : "Which target should I use?"
+  await plugin["experimental.text.complete"](
+    { sessionID: session_id, messageID: message_id, partID: "part-answer" }, { text })
+  event(plugin, "message.updated", { info: {
+    id: message_id, sessionID: session_id, parentID: turn_id, role: "assistant",
+    finish: disposition === "intermediate" ? "tool-calls" : "stop", time: { completed: 1234 },
+  } })
+  if (disposition === "pending-question") {
+    event(plugin, "question.asked", { id: "que_unanswered", sessionID: session_id })
+  }
+  if (disposition === "aborted") {
+    event(plugin, "session.error", { sessionID: session_id, error: { name: "MessageAbortedError" } })
+  }
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  event(plugin, "session.idle", { sessionID: session_id })
+  // Wait for the first terminal fact before sending the next real user turn.
+  await waitForCapturedLength(disposition === "pending-question" ? 2 : 1)
+  await plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id: `next-${turn_id}` }, parts: [{ synthetic: false }],
+  })
+  await settle(plugin)
+  const observed = captured()
+  const completion = observed.find((item) => item.event === "session.status")
+  if (disposition === "normal" || disposition === "unicode") {
+    assert.equal(completion.assistant_text, text)
+    assert.equal(completion.normal_completion, true)
+    assert.equal(observed.filter((item) => item.event === "session.status").length, 1)
+    assert.equal(observed.at(-1).event, "chat.message")
+  } else {
+    assert(observed.every((item) => item.assistant_text === undefined))
+    assert(observed.every((item) => item.event !== "chat.message"))
+  }
+}
+
+resetCapture()
+{
+  const session_id = "question-turn-binding"
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  event(plugin, "question.asked", { sessionID: session_id, id: "que_original" })
+  await plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id: "next-turn" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", { info: {
+    sessionID: session_id, id: "assistant-next", parentID: "next-turn", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "busy" } })
+  event(plugin, "question.replied", {
+    sessionID: session_id, requestID: "que_original", answers: [[privateCanary]],
+  })
+  await settle(plugin)
+  assert.equal(captured().at(-1).turn_id, `published-turn-${session_id}`)
+  assert.equal(captured().at(-1).question_id, "que_original")
+}
+
 console.log("native-agent-plugin-passed")
