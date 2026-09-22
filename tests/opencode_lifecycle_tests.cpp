@@ -3,9 +3,13 @@
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
+#include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/sidecar.h>
 
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -104,10 +108,80 @@ addon::Classify_event_result classify(const addon::Classify_event_request& reque
     return *result;
 }
 
+// Oracle: the host's feature gate. It rejects an observation carrying a fact
+// the package's own declaration leaves unsupported, phase and all.
+void declared_profile_admits_every_shape(const std::filesystem::path& package)
+{
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(
+        addon::sidecar_relative_path(addon::k_lifecycle_events_capability_id, addon::k_lifecycle_events_version),
+        addon::limits::k_max_sidecar_bytes,
+        nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    const auto declaration = sidecar ? addon::decode_lifecycle_declaration(sidecar->payload, nullptr) : std::nullopt;
+    require(declaration.has_value(), "package lifecycle declaration is readable");
+    std::optional<std::string> pending;
+    const auto admitted = [
+            &declaration,
+            &pending
+        ](
+            addon::Classify_event_request request,
+            const char*                   shape)
+        {
+            Classification_call call(addon::Attention_classification_request{std::move(request), pending});
+            opencode::handle_lifecycle(call);
+            const auto result = call.attention_result();
+            require(result && !result->base.observations.empty(), shape);
+            for (const auto& observation : result->base.observations) {
+                require(addon::lifecycle_profile_admits(declaration->features, observation), shape);
+            }
+            return *result;
+        };
+    auto request = event("session.status", false);
+    request.event.body.set("status_type", addon::Json_value("busy"));
+    admitted(request, "the declaration refuses the status that starts a Session");
+    for (const auto* type : {"busy", "retry", "idle"}) {
+        request = event("session.status");
+        request.event.body.set("status_type", addon::Json_value(type));
+        admitted(request, "the declaration refuses a status");
+    }
+    request = event("session.idle");
+    request.event.body.set("normal_completion", addon::Json_value(true));
+    request.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+    const auto hint = admitted(request, "the declaration refuses a completion that ends in a question");
+    pending = hint.base.observations.front().attention_request_id;
+    admitted(event("chat.message"), "the declaration refuses the reply that resolves a conversational hint");
+    pending.reset();
+    for (const auto* type : {"failed", "aborted"}) {
+        request = event("session.error");
+        request.event.body.set("error_type", addon::Json_value(type));
+        admitted(request, "the declaration refuses a failed or aborted turn");
+    }
+    for (const auto* name : {"permission.asked", "permission.replied"}) {
+        request = event(name);
+        request.event.body.set("permission_id", addon::Json_value("permission-primary"));
+        admitted(request, "the declaration refuses an approval request or its reply");
+    }
+    for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
+        request = event(name);
+        request.event.body.set("question_id", addon::Json_value("que_native_question"));
+        request.event.body.set("answer_nonempty", addon::Json_value(true));
+        admitted(request, "the declaration refuses a structured question or its answer");
+    }
+    for (const auto* name : {"logonomic.subagent.started", "logonomic.subagent.stopped"}) {
+        request = event(name);
+        request.event.body.set("agent_id", addon::Json_value("child-explore"));
+        admitted(request, "the declaration refuses a subagent transition");
+    }
+    admitted(event("session.deleted"), "the declaration refuses a session end");
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
+    declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
         auto request = event(name);
         request.event.body.set("question_id", addon::Json_value("que_native_question"));
