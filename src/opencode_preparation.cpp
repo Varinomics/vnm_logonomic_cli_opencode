@@ -2,6 +2,7 @@
 #include "opencode_acp.h"
 #include "opencode_launcher.h"
 
+#include "logonomic_cli_addon/ids.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
 #include "logonomic_cli_addon/sha256.h"
@@ -305,6 +306,34 @@ std::string interactive_config(addon::Json_value config, const std::string& inst
     return result;
 }
 
+// Refuses, on `context`, a launcher that an interactive launch or resume
+// cannot prepare: one that is not OpenCode, lacks profile storage or the
+// managed plugin, or assigns the inline configuration the package merges into.
+bool interactive_launcher_admitted(
+    const addon::Launcher_request&         launcher,
+    bool                                   profile_storage,
+    const std::vector<std::string>&        declared_assets,
+    addon::Invocation_context&             context)
+{
+    const auto command = recognize_launcher(launcher.script_body);
+    if (!command || !profile_storage) {
+        context.fail(addon::Result_status::UNAVAILABLE, "launcher_unavailable");
+        return false;
+    }
+    for (const auto& [name, value] : command->environment) {
+        (void)value;
+        if (environment_name_equal(name, "OPENCODE_CONFIG_CONTENT")) {
+            context.fail(addon::Result_status::UNAVAILABLE, "inline_configuration_assignment");
+            return false;
+        }
+    }
+    if (std::find(declared_assets.begin(), declared_assets.end(), k_plugin_asset) == declared_assets.end()) {
+        context.fail(addon::Result_status::FAILED, "asset_undeclared");
+        return false;
+    }
+    return true;
+}
+
 void prepare_interactive(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -313,20 +342,9 @@ void prepare_interactive(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
-    const auto launcher = recognize_launcher(request->launcher.script_body);
-    if (!launcher || !request->profile_storage) {
-        context.fail(addon::Result_status::UNAVAILABLE, "launcher_unavailable");
-        return;
-    }
-    for (const auto& [name, value] : launcher->environment) {
-        (void)value;
-        if (environment_name_equal(name, "OPENCODE_CONFIG_CONTENT")) {
-            context.fail(addon::Result_status::UNAVAILABLE, "inline_configuration_assignment");
-            return;
-        }
-    }
-    if (std::find(request->declared_assets.begin(), request->declared_assets.end(), k_plugin_asset) == request->declared_assets.end()) {
-        context.fail(addon::Result_status::FAILED, "asset_undeclared");
+    if (!interactive_launcher_admitted(request->launcher, request->profile_storage.has_value(),
+            request->declared_assets, context))
+    {
         return;
     }
     auto config = inline_config(request->launch_environment->effective_environment);
@@ -345,6 +363,70 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
     patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
     context.succeed(addon::encode_launch_patch(patch, 3));
+}
+
+// OpenCode's own session identifiers: `ses_` and ASCII letters and digits.
+bool opencode_session_id(const addon::Json_value& value)
+{
+    if (!value.is_string()) {
+        return false;
+    }
+    const auto& text = value.as_string();
+    return text.size() > 4 && text.size() <= 256 && text.starts_with("ses_") &&
+        std::all_of(text.begin() + 4, text.end(), [](unsigned char c) { return std::isalnum(c) != 0; });
+}
+
+void prepare_resume(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_resume_prepare_request(context.request().payload, &failure, 2);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+        return;
+    }
+    const auto& launch  = request->context;
+    const auto& record  = request->resume_record;
+    const auto* session = record.is_object() && record.as_object().size() == 1
+        ? record.find("provider_session_id") : nullptr;
+    if (!session || !opencode_session_id(*session)) {
+        context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
+        return;
+    }
+    if (!interactive_launcher_admitted(launch.launcher, launch.profile_storage.has_value(),
+            launch.declared_assets, context))
+    {
+        return;
+    }
+    const auto arguments = resume_arguments(
+        launch.launcher, launch.launcher_argv, launch.launch_environment->effective_environment,
+        launch.working_directory, session->as_string());
+    if (!arguments) {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
+        return;
+    }
+    auto config = inline_config(launch.launch_environment->effective_environment);
+    // The resumed session confirms its identity through its lifecycle, so a
+    // launch that cannot report lifecycle cannot resume.
+    const auto verified = verified_launch(launch.launcher, launch.launcher_argv,
+        launch.launch_environment->effective_environment, launch.working_directory, false, context);
+    if (!verified) {
+        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+            context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
+        return;
+    }
+    const auto instruction = materialize_instruction(launch.profile_storage->root, request->title_instruction);
+    addon::Resume_prepare_result result;
+    result.process.executable     = addon::Process_executable::launcher_program();
+    result.process.argv           = *arguments;
+    result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
+    result.patch.profile_storage  = launch.profile_storage;
+    result.patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction));
+    result.patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", "1");
+    // The managed plugin reports this session as resumed once the resumed
+    // OpenCode has it in its own store.
+    result.patch.set.emplace_back("OPENCODE_LOGONOMIC_RESUME_SESSION", session->as_string());
+    result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(record);
+    context.succeed(addon::encode_resume_prepare_result(result, 2));
 }
 
 void prepare_delegated(addon::Invocation_context& context)
@@ -465,6 +547,12 @@ void prepare_delegated(addon::Invocation_context& context)
 void handle_preparation(addon::Invocation_context& context)
 {
     const auto& request = context.request();
+    if (request.capability.capability_id == "interactive-resume" &&
+        request.operation == addon::k_prepare_resume_operation)
+    {
+        prepare_resume(context);
+    }
+    else
     if (request.operation != "prepare") {
         context.reject_unknown_operation();
     }

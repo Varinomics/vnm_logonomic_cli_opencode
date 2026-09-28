@@ -2,6 +2,8 @@
 
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/helper_ingress.h>
+#include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -176,6 +178,33 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     request.launcher.script_body = "OPENCODE_CONFIG_CONTENT={} opencode";
     require(invoke(host, {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3)).status == addon::Host_status::UNAVAILABLE,
         "script-owned config is not overwritten");
+
+    request.launcher.script_body = "opencode";
+    addon::Resume_prepare_request resume_request;
+    resume_request.context.launcher           = request.launcher;
+    resume_request.context.launcher_argv      = request.launcher_argv;
+    resume_request.context.working_directory  = request.working_directory;
+    resume_request.context.declared_assets    = request.declared_assets;
+    resume_request.context.profile_storage    = request.profile_storage;
+    resume_request.context.launch_environment = request.launch_environment;
+    resume_request.title_instruction          = request.title_instruction;
+    resume_request.resume_record.set("provider_session_id", addon::Json_value("ses_4f1c2a9e7b3d5f8a1c6e0b2d9f"));
+    const auto unverified_resume = invoke(host, {"interactive-resume", 2}, "prepare_resume",
+        addon::encode_resume_prepare_request(resume_request, 2));
+    require(unverified_resume.status == addon::Host_status::UNAVAILABLE &&
+            unverified_resume.reason_code == "launcher_program_unavailable",
+        "a resume that could not confirm itself through lifecycle is unavailable");
+    for (const char* record : {"{\"provider_session_id\":\"session-4f1c2a9e\"}",
+             "{\"provider_session_id\":\"ses_4f1c2a9e\",\"title\":\"Resume the parser work\"}",
+             "{\"provider_session_id\":17}"})
+    {
+        resume_request.resume_record = *addon::parse_json(record, {}, nullptr);
+        const auto refused = invoke(host, {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(resume_request, 2));
+        require(refused.status == addon::Host_status::FAILED &&
+                refused.reason_code == addon::reason::k_resume_record_invalid,
+            "only an OpenCode session identity is resumable");
+    }
 
     const addon::Legacy_resume_record historical{"opencode", "session-preserved-20260912"};
     const auto imported = invoke(host, {"legacy-state-import", 1}, "import_record",

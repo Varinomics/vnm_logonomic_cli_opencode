@@ -744,4 +744,99 @@ resetCapture()
   assert.equal(captured().at(-1).question_id, "que_original")
 }
 
+// A resumed session opens without any native event; the plugin reports it once
+// the resumed OpenCode's own store has it, and only a root session.
+const resumedPlugin = async (sessions, resumedSessionID, client = clientFor(sessions)) => {
+  process.env.OPENCODE_LOGONOMIC_RESUME_SESSION = resumedSessionID
+  try {
+    return await Logonomic({ client })
+  } finally {
+    delete process.env.OPENCODE_LOGONOMIC_RESUME_SESSION
+  }
+}
+resetCapture()
+{
+  const plugin = await resumedPlugin(
+    new Map([["ses_resumed", { id: "ses_resumed", title: privateCanary }]]),
+    "ses_resumed",
+  )
+  await waitForCapturedLength(1)
+  await settle(plugin)
+  assert.deepEqual(captured(), [
+    { event: "logonomic.session.resumed", session_id: "ses_resumed" },
+  ])
+}
+for (const [sessions, description] of [
+  [new Map(), "an unknown session"],
+  [new Map([["ses_resumed", { id: "ses_other" }]]), "another session"],
+  [new Map([["ses_resumed", { id: "ses_resumed", parentID: "ses_root" }]]), "a child session"],
+]) {
+  resetCapture()
+  const plugin = await resumedPlugin(sessions, "ses_resumed")
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  await settle(plugin)
+  assert.deepEqual(captured(), [], `a resume of ${description} is not reported`)
+}
+// The lookup waits for a slow instance bootstrap, and disposal ends the wait.
+const slowClient = (info, milliseconds) => ({
+  session: {
+    get: ({ path, signal }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => resolve({ data: path.id === info.id ? info : undefined }),
+        milliseconds,
+      )
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer)
+        reject(new Error("lookup aborted"))
+      }, { once: true })
+    }),
+  },
+})
+resetCapture()
+{
+  const plugin = await resumedPlugin(undefined, "ses_resumed",
+    slowClient({ id: "ses_resumed" }, 11_000))
+  const deadline = Date.now() + 20_000
+  while (captured().length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  await settle(plugin)
+  assert.deepEqual(captured(), [
+    { event: "logonomic.session.resumed", session_id: "ses_resumed" },
+  ], "a resume confirmed after a slow bootstrap is reported")
+}
+resetCapture()
+{
+  const plugin = await resumedPlugin(undefined, "ses_resumed",
+    slowClient({ id: "ses_resumed" }, 60_000))
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  const disposal = Date.now()
+  await settle(plugin)
+  assert(Date.now() - disposal < 5_000, "disposal ends a pending resume lookup")
+  assert.deepEqual(captured(), [])
+}
+resetCapture()
+{
+  // A resumed session is started once; its first turn does not start it again.
+  const plugin = await resumedPlugin(
+    new Map([["ses_resumed", { id: "ses_resumed" }]]),
+    "ses_resumed",
+  )
+  await waitForCapturedLength(1)
+  await plugin["chat.message"](
+    { sessionID: "ses_resumed" },
+    { message: { id: "turn-after-resume" }, parts: [{ synthetic: false }] },
+  )
+  event(plugin, "message.updated", { info: {
+    id: "assistant-after-resume", sessionID: "ses_resumed",
+    parentID: "turn-after-resume", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: "ses_resumed", status: { type: "busy" } })
+  await waitForCapturedLength(2)
+  await settle(plugin)
+  assert.deepEqual(captured().map((item) => item.event),
+    ["logonomic.session.resumed", "session.status"])
+  assert.equal(captured()[1].turn_id, "turn-after-resume")
+}
+
 console.log("native-agent-plugin-passed")

@@ -607,7 +607,11 @@ export const Logonomic = async ({ client }) => {
     return "child"
   }
 
-  const sessionInfo = async (sessionID) => {
+  // A null timeout waits until the lookup settles or disposal aborts it.
+  const sessionInfo = async (
+    sessionID,
+    timeoutMilliseconds = clientLookupTimeoutMilliseconds,
+  ) => {
     if (!lookupsAllowed || deliveryCutoffReached) return
     const controller = new AbortController()
     const timeoutToken = Symbol("lookup timeout")
@@ -629,12 +633,12 @@ export const Logonomic = async ({ client }) => {
     const completion = Promise.race([
       settled,
       interrupted,
-      new Promise((resolve) => {
+      ...(timeoutMilliseconds === null ? [] : [new Promise((resolve) => {
         timeout = setTimeout(() => {
           controller.abort()
           resolve(timeoutToken)
-        }, clientLookupTimeoutMilliseconds)
-      }),
+        }, timeoutMilliseconds)
+      })]),
     ])
     lookupControllers.add(controller)
     lookupPromises.add(completion)
@@ -1161,6 +1165,23 @@ export const Logonomic = async ({ client }) => {
     reply.text += text
   }
 
+  // Logonomic resumes a session by relaunching OpenCode with --session, which
+  // opens it without emitting any event. The resumed session is reported once
+  // this OpenCode's own store has it, so Logonomic can confirm the resume
+  // before the user's first turn. The lookup waits for the instance to finish
+  // bootstrapping, however long that takes: Logonomic's own resume deadline
+  // decides failure, and disposal ends the wait.
+  const confirmResumedSession = async (sessionID) => {
+    const info = await sessionInfo(sessionID, null)
+    if (metadata(info?.id) !== sessionID) return
+    enqueue({ kind: "resumed", info: { id: info.id, parentID: info.parentID } })
+  }
+
+  const projectResumedSession = ({ info }) => {
+    if (reduceSessionFact(info, "lookup") !== "root") return
+    return { event: "logonomic.session.resumed", session_id: info.id }
+  }
+
   const deliver = (projected) => new Promise((resolve) => {
     if (deliveryCutoffReached) {
       resolve()
@@ -1262,6 +1283,7 @@ export const Logonomic = async ({ client }) => {
     }
     if (item.kind === "chat.message") return projectChatMessage(item)
     if (item.kind === "completed_text") return project_completed_text(item)
+    if (item.kind === "resumed") return projectResumedSession(item)
     return projectEvent(item.event)
   }
 
@@ -1514,5 +1536,9 @@ export const Logonomic = async ({ client }) => {
         Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes &&
         Buffer.from(text, "utf8").toString("utf8") === text ? text : undefined })
   }
+  const resumedSessionID = metadata(
+    process.env.OPENCODE_LOGONOMIC_RESUME_SESSION,
+  )
+  if (resumedSessionID) void confirmResumedSession(resumedSessionID)
   return hooks
 }

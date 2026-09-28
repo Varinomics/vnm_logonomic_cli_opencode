@@ -174,6 +174,7 @@ void declared_profile_admits_every_shape(const std::filesystem::path& package)
         admitted(request, "the declaration refuses a subagent transition");
     }
     admitted(event("session.deleted"), "the declaration refuses a session end");
+    admitted(event("logonomic.session.resumed", false), "the declaration refuses a resumed session's start");
 }
 
 } // namespace
@@ -253,6 +254,24 @@ int main(int argc, char** argv)
         require(interrupted.attention_result() && !interrupted.attention_result()->attention_kind,
             "interruption cannot manufacture a completed reply hint");
     }
+    // A resumed session starts the runtime's first session, from the resume,
+    // and never replaces a session the runtime already follows.
+    auto resumed = event("logonomic.session.resumed", false);
+    resumed.event.body.erase("turn_id");
+    const auto resumed_start = classify(resumed);
+    require(resumed_start.classification == addon::Classification::TRANSITION &&
+            resumed_start.transition == addon::Transition_kind::START &&
+            resumed_start.observations.size() == 1 &&
+            resumed_start.observations[0].session_transition == addon::Session_transition::STARTED &&
+            resumed_start.observations[0].provider_session_id == "session-primary" &&
+            resumed_start.observations[0].session_source == "resume" &&
+            resumed_start.observations[0].phase_transition == addon::Phase_transition::NONE,
+        "a resumed session starts from the resume without a turn");
+    auto followed = event("logonomic.session.resumed");
+    followed.event.body.set("session_id", addon::Json_value("session-resumed-later"));
+    const auto ignored = classify(followed);
+    require(ignored.classification == addon::Classification::IGNORED && ignored.observations.empty(),
+        "a runtime that follows a session keeps it");
     // The native OpenCode event decoder and lifecycle ledger contracts are the
     // oracle: repeated status facts do not open a second provider epoch.
     auto started = event("session.status", false);

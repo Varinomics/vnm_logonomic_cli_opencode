@@ -34,6 +34,19 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
 // shell expression. Recognition is deliberately separate from executable proof.
 std::vector<std::string> literal_launcher_argv(std::string_view script);
 
+// The launcher arguments after its program that reopen OpenCode session
+// `session` in `working_directory`: a direct launcher's own arguments, or its
+// PowerShell script, with the session selector added. nullopt when the
+// launcher's options could select another session or directory, add a turn, or
+// leave out the managed plugin. `effective_environment` supplies the PWD that
+// OpenCode resolves a relative project argument against.
+std::optional<std::vector<std::string>> resume_arguments(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    std::string_view                session);
+
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
 

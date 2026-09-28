@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 
 #ifdef _WIN32
@@ -529,6 +530,98 @@ std::vector<std::string> literal_launcher_argv(std::string_view script)
     }
     if (!current.empty()) result.push_back(current);
     return result;
+}
+
+std::optional<std::vector<std::string>> resume_arguments(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    std::string_view                session)
+{
+    const auto command = recognize_launcher(launcher.script_body);
+    const auto literal = literal_launcher_argv(launcher.script_body);
+    if (!command || !command->prefix_arguments.empty() || !command->environment.empty() ||
+        literal.empty() || base_name(literal.front()) != "opencode")
+    {
+        return std::nullopt;
+    }
+    // The TUI options (1.18) that keep the reopened session in this directory
+    // and interface with plugins loaded, and a project argument naming this
+    // directory. Enabled --continue, --session, --fork, --prompt and --pure pick
+    // another session, add a turn or drop the plugin; anything unknown is refused
+    // rather than guessed at.
+    static const std::set<std::string_view> valued{
+        "--model", "-m", "--agent", "--log-level", "--port", "--hostname", "--mdns-domain", "--replay-limit"};
+    static const std::set<std::string_view> flags{
+        "--auto", "--yolo", "--dangerously-skip-permissions", "--print-logs", "--mdns", "--mini"};
+    static const std::set<std::string_view> negated{
+        "--no-auto", "--no-yolo", "--no-dangerously-skip-permissions", "--no-print-logs", "--no-mdns", "--no-mini",
+        "--no-replay", "--replay=false", "--no-continue", "--continue=false", "--no-fork", "--fork=false",
+        "--no-pure", "--pure=false"};
+    // OpenCode resolves a relative project argument against PWD when it is
+    // set, and against its working directory otherwise.
+    const auto session_directory = addon::path_from_utf8(working_directory);
+    const auto pwd = addon::environment_value(addon::environment_pairs(effective_environment), "PWD");
+    const auto project_base = pwd.empty() ? session_directory : addon::path_from_utf8(pwd);
+    const auto same_directory = [&session_directory, &project_base](std::string_view project) {
+        const auto path = addon::path_from_utf8(project);
+        std::error_code project_error;
+        std::error_code session_error;
+        const auto resolved = fs::weakly_canonical(path.is_absolute() ? path : project_base / path, project_error);
+        const auto expected = fs::weakly_canonical(session_directory, session_error);
+        return !project_error && !session_error && resolved == expected;
+    };
+    bool project = false;
+    for (std::size_t index = 1; index < literal.size(); ++index) {
+        const std::string_view argument = literal[index];
+        if (!argument.starts_with('-')) {
+            if (project || !same_directory(argument)) {
+                return std::nullopt;
+            }
+            project = true;
+            continue;
+        }
+        if (flags.contains(argument) || negated.contains(argument)) {
+            continue;
+        }
+        const auto equals = argument.find('=');
+        if (equals != std::string_view::npos) {
+            const auto name  = argument.substr(0, equals);
+            const auto value = argument.substr(equals + 1);
+            if (!value.empty() && (valued.contains(name) || name == "--cors" ||
+                (flags.contains(name) && (value == "true" || value == "false"))))
+            {
+                continue;
+            }
+            return std::nullopt;
+        }
+        // --cors takes every following word up to the next option.
+        const bool list = argument == "--cors";
+        if ((!list && !valued.contains(argument)) || index + 1 == literal.size() ||
+            literal[index + 1].starts_with('-'))
+        {
+            return std::nullopt;
+        }
+        ++index;
+        while (list && index + 1 < literal.size() && !literal[index + 1].starts_with('-')) {
+            ++index;
+        }
+    }
+    if (launcher.runner_key == "direct" && launcher_argv.size() == literal.size() &&
+        std::equal(literal.begin() + 1, literal.end(), launcher_argv.begin() + 1))
+    {
+        std::vector<std::string> arguments(launcher_argv.begin() + 1, launcher_argv.end());
+        arguments.insert(arguments.end(), {"--session", std::string(session)});
+        return arguments;
+    }
+    if (launcher.runner_key == "powershell" && plain_powershell_command(launcher.script_body) &&
+        launcher_argv.size() == 4 && base_name(launcher_argv[0]) == "powershell" &&
+        launcher_argv[1] == "-NoLogo" && launcher_argv[2] == "-Command" && launcher_argv[3] == launcher.script_body)
+    {
+        return std::vector<std::string>{"-NoLogo", "-Command", launcher.script_body + " --session " + std::string(session)};
+    }
+    return std::nullopt;
 }
 
 bool version_is_at_least(std::string_view version, int major, int minor, int patch)

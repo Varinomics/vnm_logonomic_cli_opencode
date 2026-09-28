@@ -294,6 +294,100 @@ int main(int argc, char** argv)
     };
     check(lifecycle_reported(prepare_interactive()) == true, "verified direct launch reports its lifecycle");
 
+    // A resume relaunches the same verified launcher with the session selector
+    // and names the session the managed plugin confirms.
+    const std::string resumed_session = "ses_4f1c2a9e7b3d5f8a1c6e0b2d9f";
+    addon::Resume_prepare_request resume;
+    resume.context.launcher           = interactive.launcher;
+    resume.context.launcher_argv      = interactive.launcher_argv;
+    resume.context.working_directory  = interactive.working_directory;
+    resume.context.declared_assets    = interactive.declared_assets;
+    resume.context.profile_storage    = interactive.profile_storage;
+    resume.context.launch_environment = interactive.launch_environment;
+    resume.title_instruction          = interactive.title_instruction;
+    resume.resume_record.set("provider_session_id", addon::Json_value(resumed_session));
+    const auto prepare_resume = [&resume](std::string* reason) -> std::optional<addon::Resume_prepare_result> {
+        Context prepared_resume;
+        prepared_resume.invocation = {"resume", {"interactive-resume", 2}, "prepare_resume",
+            addon::encode_resume_prepare_request(resume, 2)};
+        opencode::handle_preparation(prepared_resume);
+        if (reason) *reason = prepared_resume.reason;
+        addon::Contract_failure resume_failure;
+        return prepared_resume.payload
+            ? addon::decode_resume_prepare_result(*prepared_resume.payload, &resume_failure, 2) : std::nullopt;
+    };
+    // The resumed launch as the host validates it: the launcher program with
+    // `arguments`, the managed configuration, the relay and the session to confirm.
+    const auto resumes_with = [&](const std::vector<std::string>& arguments) {
+        std::string reason;
+        const auto result = prepare_resume(&reason);
+        if (!result) {
+            std::cerr << "Resume preparation: " << reason << '\n';
+            return false;
+        }
+        std::string relay;
+        std::string session;
+        std::string config;
+        for (const auto& [name, value] : result->patch.set) {
+            if (name == "OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED") relay   = value;
+            if (name == "OPENCODE_LOGONOMIC_RESUME_SESSION")      session = value;
+            if (name == "OPENCODE_CONFIG_CONTENT")                config  = value;
+        }
+        addon::Contract_failure validation;
+        return result->process.executable.kind == addon::Process_executable::Kind::LAUNCHER_PROGRAM &&
+            result->process.argv == arguments && result->process.stdin_behavior == addon::Stdin_behavior::INHERIT &&
+            addon::validate_resume_process_proposal(result->process, &validation) &&
+            addon::validate_launch_patch(result->patch, resume.context.declared_assets,
+                resume.context.declared_assets, &validation) &&
+            addon::validate_resume_acknowledgment(resume.resume_record, result->acknowledgment, &validation) &&
+            result->patch.profile_storage && result->patch.profile_storage->root == resume.context.profile_storage->root &&
+            relay == "1" && session == resumed_session &&
+            config.find("{{asset_json:assets/logonomic_opencode_plugin.mjs}}") != std::string::npos;
+    };
+    check(resumes_with({"--session", resumed_session}), "a direct launcher resumes the session");
+    resume.context.launcher.script_body = interactive.launcher.script_body + " --model provider/model --auto";
+    resume.context.launcher_argv = {program_text, "--model", "provider/model", "--auto"};
+    check(resumes_with({"--model", "provider/model", "--auto", "--session", resumed_session}),
+        "a resume keeps the launcher's own options");
+    // Networking options, negated flags and a project argument naming this
+    // directory leave the session where it is.
+    for (const auto& options : {
+             std::vector<std::string>{"--no-mdns"},
+             std::vector<std::string>{"--cors", "http://localhost:3000", "--port", "4096"},
+             std::vector<std::string>{"--mini", "--replay=false"},
+             std::vector<std::string>{"--continue=false", "--no-fork", "--pure=false"},
+             std::vector<std::string>{"."}})
+    {
+        resume.context.launcher.script_body = interactive.launcher.script_body;
+        resume.context.launcher_argv = {program_text};
+        for (const auto& option : options) {
+            resume.context.launcher.script_body += " " + option;
+            resume.context.launcher_argv.push_back(option);
+        }
+        auto expected = options;
+        expected.insert(expected.end(), {"--session", resumed_session});
+        check(resumes_with(expected), options.front().c_str());
+    }
+    // Options that pick another session or directory, add a turn, or drop the
+    // managed plugin, cannot resume this session.
+    for (const char* option : {"--continue", "--pure", "--prompt", "--session", "workspace-subdirectory", ".."}) {
+        resume.context.launcher.script_body = interactive.launcher.script_body + " " + option;
+        resume.context.launcher_argv = {program_text, option};
+        std::string reason;
+        check(!prepare_resume(&reason) && reason == "resume_launcher_unavailable", option);
+    }
+    // OpenCode resolves a relative project against PWD when it is set.
+    resume.context.launcher.script_body = interactive.launcher.script_body + " .";
+    resume.context.launcher_argv = {program_text, "."};
+    auto& resume_environment = resume.context.launch_environment->effective_environment;
+    resume_environment.set("PWD", addon::Json_value(path_string(root / "profile")));
+    std::string pwd_reason;
+    check(!prepare_resume(&pwd_reason) && pwd_reason == "resume_launcher_unavailable",
+        "a project resolved against another PWD cannot resume");
+    resume_environment.set("PWD", addon::Json_value(path_string(root)));
+    check(resumes_with({".", "--session", resumed_session}), "a project resolved against the session's PWD");
+    resume_environment.erase("PWD");
+
 #ifdef _WIN32
     // The host runs a PowerShell launcher as `powershell -NoLogo -Command <script>`.
     // The version evidence must come from what that shell itself runs.
@@ -348,6 +442,15 @@ int main(int argc, char** argv)
     interactive.launcher_argv = {"powershell.exe", "-NoLogo", "-Command", "opencode --pure"};
     check(lifecycle_reported(prepare_interactive()) == false,
         "an invocation other than the recognized launcher keeps lifecycle off");
+    resume.context.launcher      = shell_launcher;
+    resume.context.launcher_argv = shell_argv;
+    resume.context.launch_environment->effective_environment = shell_environment;
+    check(resumes_with({"-NoLogo", "-Command", "opencode --session " + resumed_session}),
+        "a PowerShell launcher resumes the session through its script");
+    resume.context.launcher.script_body = "opencode --no-continue --fork=false --no-pure --mini --replay=false .";
+    resume.context.launcher_argv = {"powershell.exe", "-NoLogo", "-Command", resume.context.launcher.script_body};
+    check(resumes_with({"-NoLogo", "-Command", resume.context.launcher.script_body + " --session " + resumed_session}),
+        "a PowerShell launcher keeps its options and project");
 #endif
     effective.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("1.18.24"));
     check(!opencode::verified_launch(launcher, {program_text}, effective, path_string(root), true, context),

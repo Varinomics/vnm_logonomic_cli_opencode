@@ -159,6 +159,7 @@ int main()
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 2},
         {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"legacy-state-import", 1}, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+        {"interactive-resume", 2},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

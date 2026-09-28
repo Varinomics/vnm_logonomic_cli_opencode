@@ -58,6 +58,27 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.lifecycle_degradation = std::move(degradation);
         return result;
     }
+    if (name == "logonomic.session.resumed") {
+        const auto session = metadata(body, "session_id");
+        if (!session) {
+            return std::nullopt;
+        }
+        // The managed plugin read the resumed session from the resumed OpenCode's
+        // own store, before any turn. It starts the runtime's first session only;
+        // a runtime already following a session keeps it.
+        if (request.ledger.current_transition) {
+            return result;
+        }
+        addon::Lifecycle_observation observation;
+        observation.provider_event_name = name;
+        observation.provider_session_id = *session;
+        observation.session_transition  = addon::Session_transition::STARTED;
+        observation.session_source      = "resume";
+        result.classification = addon::Classification::TRANSITION;
+        result.transition     = addon::Transition_kind::START;
+        result.observations.push_back(std::move(observation));
+        return result;
+    }
     const bool child_start = name == "logonomic.subagent.started";
     const bool child_stop  = name == "logonomic.subagent.stopped";
     const bool deleted    = name == "session.deleted";

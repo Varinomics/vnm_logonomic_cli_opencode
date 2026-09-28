@@ -28,6 +28,13 @@ running the recognized script, starts a verified OpenCode; otherwise the launch 
 prepared without lifecycle. User configuration is merged, and package writes use
 the exact host-acknowledged profile storage allocation.
 
+A stored session resumes through the same verified launcher with
+`--session <id>` added. OpenCode opens that session without emitting an event, so
+the managed plugin reports it as resumed once the resumed OpenCode's own store
+has it, which lets Logonomic confirm the resume before the first turn. A launcher
+that cannot report lifecycle, or whose options could select another session,
+directory or interface or leave out plugins, cannot resume.
+
 ## Building and local qualification
 
 Interactive native question events retain `question.asked`, `question.replied`,
