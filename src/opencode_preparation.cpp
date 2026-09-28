@@ -287,47 +287,6 @@ std::string materialize_instruction(std::string_view profile_root, std::string_v
 
 namespace {
 
-std::string shell_quote(std::string_view text)
-{
-    std::string result = "'";
-    for (const char c : text) {
-        if (c == '\'') {
-#ifdef _WIN32
-            result += "''";
-#else
-            result += "'\"'\"'";
-#endif
-        }
-        else {
-            result += c;
-        }
-    }
-    return result + "'";
-}
-
-std::string control_wrapper(const addon::Delegated_task_server& server,
-    const std::string& ready_path, const std::string& nonce)
-{
-    auto environment = server.environment;
-    environment.emplace_back("LOGONOMIC_MCP_CONNECTION_ATTESTATION_PATH", ready_path);
-    environment.emplace_back("LOGONOMIC_MCP_CONNECTION_ATTESTATION_NONCE", nonce);
-#ifdef _WIN32
-    // Windows PowerShell recognizes UTF-8 script bytes reliably with a BOM.
-    std::string script = "\xef\xbb\xbf$ErrorActionPreference='Stop'\r\n";
-    for (const auto& [name, value] : environment) {
-        script += "[Environment]::SetEnvironmentVariable(" + shell_quote(name) + "," + shell_quote(value) + ",'Process')\r\n";
-    }
-    script += "& " + shell_quote(server.program) + "\r\nexit $LASTEXITCODE\r\n";
-#else
-    std::string script = "#!/bin/sh\n";
-    for (const auto& [name, value] : environment) {
-        script += "export " + name + "=" + shell_quote(value) + "\n";
-    }
-    script += "exec " + shell_quote(server.program) + "\n";
-#endif
-    return script;
-}
-
 std::string interactive_config(addon::Json_value config, const std::string& instruction)
 {
     auto instructions = config.find("instructions") ? *config.find("instructions") : addon::Json_value::array();
@@ -394,6 +353,10 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
+    if (!request->control.connection) {
+        context.fail(addon::Result_status::UNAVAILABLE, "task_server_connection_unavailable");
+        return;
+    }
     if (request->purpose != addon::Structured_purpose::IMPLEMENTATION) {
         context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
         return;
@@ -427,26 +390,24 @@ void prepare_delegated(addon::Invocation_context& context)
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
         const auto stem = "mcp/server-" + nonce;
-#ifdef _WIN32
-        const auto relative_wrapper = stem + ".ps1";
-        const auto wrapper_program = "powershell.exe";
+        // The host accepts the receipt path only in its clean '/'-separated
+        // form; a native join would insert '\' on Windows.
+        const auto ready_file =
+            (native_path(request->control.private_artifact_root) / (stem + ".ready")).generic_u8string();
+        const std::string ready_path(reinterpret_cast<const char*>(ready_file.data()), ready_file.size());
+        const auto& connection = *request->control.connection;
         addon::Json_value::Array arguments{
-            addon::Json_value("-NoLogo"), addon::Json_value("-NoProfile"), addon::Json_value("-NonInteractive"),
-            addon::Json_value("-ExecutionPolicy"), addon::Json_value("Bypass"), addon::Json_value("-File"),
+            addon::Json_value("--descriptor"), addon::Json_value(connection.descriptor_path),
+            addon::Json_value("--server"), addon::Json_value(server.server_id),
+            addon::Json_value("--attestation-path"), addon::Json_value(ready_path),
+            addon::Json_value("--attestation-nonce"), addon::Json_value(nonce),
         };
-#else
-        const auto relative_wrapper = stem + ".sh";
-        const auto wrapper_program = "/bin/sh";
-        addon::Json_value::Array arguments;
-#endif
-        const auto root = native_path(request->control.private_artifact_root);
-        const auto ready_path = path_text(root / (stem + ".ready"));
-        arguments.emplace_back(path_text(root / relative_wrapper));
-        result.private_artifacts.push_back({relative_wrapper, control_wrapper(server, ready_path, nonce)});
+        // Materialization creates the parent; the host exclusively reserves the ready file.
+        result.private_artifacts.push_back({stem + ".connection", nonce});
         result.acknowledgment.server_ids.push_back(server.server_id);
         auto mcp = addon::Json_value::object();
         mcp.set("name", addon::Json_value("logonomic-task-" + request->control.task_id + "-" + server.server_id));
-        mcp.set("command", addon::Json_value(wrapper_program));
+        mcp.set("command", addon::Json_value(connection.relay_program));
         mcp.set("args", addon::Json_value(std::move(arguments)));
         mcp.set("env", addon::Json_value::array());
         servers.push_back(std::move(mcp));
@@ -456,6 +417,7 @@ void prepare_delegated(addon::Invocation_context& context)
         attestation.set("nonce", addon::Json_value(nonce));
         attestations.push_back(std::move(attestation));
     }
+    result.acknowledgment.connection_version = addon::k_delegated_connection_version;
     // The package bridge executes the verified selected chain without altering it.
 #ifdef _WIN32
     result.process.executable = "helpers/opencode_launch_bridge.exe";
