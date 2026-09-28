@@ -40,6 +40,10 @@ const std::string k_ready =
     "\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[]}}}\n";
 const std::string k_new =
     "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"ses_root\"}}\n";
+const std::string k_end_turn =
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n";
+const std::string k_closed =
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\n";
 const std::string k_message =
     "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_root\","
     "\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"msg_result\","
@@ -111,8 +115,72 @@ private:
     std::string m_state;
 };
 
+std::string foreign_session(std::string record)
+{
+    record.replace(record.find("ses_root"), 8, "ses_foreign");
+    return record;
+}
+
 void run(const fs::path& attestation)
 {
+    // ACP lets the agent announce the new session before or after it answers
+    // session/new; OpenCode 1.18.32 announces after.
+    for (const auto& root_output : {k_ready + k_new, k_new + k_ready}) {
+        Session session(attestation);
+        session.feed(k_initialize);
+        auto result = session.feed(root_output);
+        require(!result.complete && result.stdin_bytes &&
+                result.stdin_bytes->find("session/prompt") != std::string::npos,
+            "either announcement order must request the prompt");
+        result = session.feed(k_message);
+        require(!result.complete && !result.stdin_bytes, "message must wait for completion response");
+        result = session.feed(k_end_turn);
+        require(!result.complete && result.stdin_bytes &&
+                result.stdin_bytes->find("session/close") != std::string::npos, "end turn must request close");
+        result = session.feed(k_closed, true);
+        require(result.complete && result.result_bytes == "Finished",
+            "either announcement order must deliver the result");
+    }
+    {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto answered = session.feed(k_new);
+        require(!answered.complete && answered.stdin_bytes && !answered.failure_reason,
+            "an attested root response alone must request the prompt");
+        const auto announced = session.feed(k_ready);
+        require(!announced.complete && !announced.stdin_bytes && !announced.failure_reason,
+            "an announcement after the prompt request is housekeeping");
+    }
+    for (std::size_t split = 1; split < k_ready.size(); ++split) {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto first = session.feed(k_new + k_ready.substr(0, split));
+        require(!first.stdin_bytes && !first.failure_reason, "partial late announcement holds prompt");
+        const auto second = session.feed(k_ready.substr(split));
+        require(second.stdin_bytes.has_value() && !second.failure_reason,
+            "late announcement releases deferred prompt");
+    }
+    {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto result = session.feed(foreign_session(k_ready) + k_new);
+        require(result.failure_reason == "acp_unauthenticated_notification",
+            "an announcement before the response must name the answered session");
+    }
+    {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto result = session.feed(k_new + foreign_session(k_ready));
+        require(result.failure_reason == "acp_unauthenticated_notification",
+            "an announcement after the response must name the answered session");
+    }
+    {
+        Session session(attestation);
+        session.feed(k_initialize);
+        const auto result = session.feed(k_ready + "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n");
+        require(result.failure_reason == "acp_invalid_root_session",
+            "a root response without a session is not a readiness failure");
+    }
     // Startup output must retain its pre-request meaning across every read split.
     for (const auto& early : {k_message, k_permission}) {
         for (std::size_t split = 1; split <= early.size(); ++split) {
@@ -282,12 +350,6 @@ void run(const fs::path& attestation)
     }
     {
         Session session(attestation);
-        session.feed(k_initialize);
-        const auto result = session.feed(k_new);
-        require(result.failure_reason == "acp_task_servers_not_ready", "root response needs readiness update");
-    }
-    {
-        Session session(attestation);
         session.reach_prompt();
         session.feed(k_permission);
         std::string duplicate = k_permission;
@@ -338,10 +400,11 @@ void run(const fs::path& attestation)
     {
         std::ofstream file(attestation, std::ios::binary | std::ios::trunc);
         file << "not-ready";
-        file.close();
+    }
+    for (const auto& root_output : {k_ready + k_new, k_new, k_new + k_ready}) {
         Session session(attestation);
         session.feed(k_initialize);
-        const auto result = session.feed(k_ready + k_new);
+        const auto result = session.feed(root_output);
         require(result.failure_reason == "acp_task_servers_not_ready", "nonce file is mandatory readiness evidence");
     }
 }

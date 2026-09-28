@@ -662,14 +662,22 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         }
         else
         if (stage == "await_new") {
-            if (!next_input.empty() || !response(value, 2, &response_result)) {
+            std::string session;
+            if (!next_input.empty() || !response(value, 2, &response_result) ||
+                !new_session_response(response_result, &session))
+            {
                 return failure("acp_invalid_root_session");
             }
-            std::string session;
-            if (!new_session_response(response_result, &session) ||
-                text(member(state, "session_id")).empty() || text(member(state, "session_id")) != session ||
-                !attestations_ready(member(state, "attestations")))
-            {
+            // ACP lets the agent announce the new session before or after it answers
+            // session/new (OpenCode 1.18.32 announces after). The response names the
+            // session; an announcement that preceded it must name the same one.
+            const auto announced = text(member(state, "session_id"));
+            if (!announced.empty() && announced != session) {
+                return failure("acp_unauthenticated_notification");
+            }
+            // OpenCode answers only after listing every task server's tools, and the
+            // host writes each nonce before it forwards that list.
+            if (!attestations_ready(member(state, "attestations"))) {
                 return failure("acp_task_servers_not_ready");
             }
             if (prompt_bytes->empty() || !addon::is_valid_utf8(*prompt_bytes)) {
