@@ -147,15 +147,19 @@ void adapter_tests(const fs::path& package, const fs::path& root)
 #endif
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(path_text(root / "absent-bin")));
     request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));
+    request.launcher_argv = {"opencode"};
     const auto discovered = invoke(host, {"launcher-discovery", 1}, "discover", addon::encode_discover_request(
         request.launch_environment->effective_environment, path_text(root), request.launch_environment->platform_id));
     const auto candidates = addon::decode_discover_result(discovered.payload, request.launch_environment->platform_id, &failure);
     require(discovered.status == addon::Host_status::SUCCESS && candidates && candidates->empty(),
         "real adapter discovery does not advertise an absent installation");
-    const auto prepared = invoke(host, {"launch-preparation", 2}, "prepare", addon::encode_prepare_request(request, 2));
+    const auto prepared = invoke(host, {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3));
     require(prepared.status == addon::Host_status::SUCCESS, "interactive prepare remains available without verified lifecycle");
-    const auto patch = addon::decode_launch_patch(prepared.payload, &failure);
+    const auto patch = addon::decode_launch_patch(prepared.payload, &failure, 3);
     require(patch.has_value(), "prepared patch decodes");
+    require(patch->disposition && patch->disposition->prepared && !patch->disposition->lifecycle_events &&
+            !patch->disposition->coordination_delivery,
+        "an unverified launch is prepared without lifecycle or coordination");
     require(patch->profile_storage && patch->profile_storage->root == *profile, "exact profile echo survives real process");
     bool merged = false;
     bool disabled = false;
@@ -170,7 +174,7 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     }
     require(merged && disabled, "config is preserved while unverifiable lifecycle is explicitly disabled");
     request.launcher.script_body = "OPENCODE_CONFIG_CONTENT={} opencode";
-    require(invoke(host, {"launch-preparation", 2}, "prepare", addon::encode_prepare_request(request, 2)).status == addon::Host_status::UNAVAILABLE,
+    require(invoke(host, {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3)).status == addon::Host_status::UNAVAILABLE,
         "script-owned config is not overwritten");
 
     const addon::Legacy_resume_record historical{"opencode", "session-preserved-20260912"};

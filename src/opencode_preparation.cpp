@@ -308,7 +308,7 @@ std::string interactive_config(addon::Json_value config, const std::string& inst
 void prepare_interactive(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
-    const auto request = addon::decode_prepare_request(context.request().payload, &failure, 2);
+    const auto request = addon::decode_prepare_request(context.request().payload, &failure, 3);
     if (!request) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
@@ -330,8 +330,9 @@ void prepare_interactive(addon::Invocation_context& context)
         return;
     }
     auto config = inline_config(request->launch_environment->effective_environment);
-    const auto argv = literal_launcher_argv(request->launcher.script_body);
-    const auto launch = verified_launch(request->launcher, argv,
+    // The host's complete invocation, shell included, is what the verification
+    // must match before the event relay may report this launch's lifecycle.
+    const auto launch = verified_launch(request->launcher, request->launcher_argv,
         request->launch_environment->effective_environment, request->working_directory, false, context);
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
@@ -342,7 +343,8 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.profile_storage = request->profile_storage;
     patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
-    context.succeed(addon::encode_launch_patch(patch));
+    patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
+    context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
 void prepare_delegated(addon::Invocation_context& context)

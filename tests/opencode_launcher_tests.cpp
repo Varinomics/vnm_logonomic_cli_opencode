@@ -3,13 +3,17 @@
 #include "opencode_acp.h"
 
 #include <logonomic_cli_addon/host_simulator.h>
+#include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <thread>
 
 namespace {
@@ -231,6 +235,108 @@ int main(int argc, char** argv)
     opencode::handle_preparation(refused);
     check(!refused.payload && refused.reason == "task_server_connection_unavailable",
         "missing connection refuses delegation before native probing");
+
+    fs::create_directories(root / "profile");
+    auto launch_environment = addon::Json_value::object();
+    for (const auto* name : {"SystemRoot", "PATHEXT", "TEMP", "TMP", "OPENCODE_FIXTURE_VERSION"}) {
+        if (const auto* value = effective.find(name)) {
+            launch_environment.set(name, *value);
+        }
+    }
+    addon::Prepare_request interactive;
+    interactive.launcher          = launcher;
+    interactive.launcher_argv     = {program_text};
+    interactive.working_directory = path_string(root);
+    interactive.title_instruction = "Keep the title connected to the current task.";
+    interactive.declared_assets   = {"assets/logonomic_opencode_plugin.mjs"};
+    interactive.profile_storage   = addon::Profile_storage_context{1, path_string(root / "profile")};
+    interactive.launch_environment = addon::Launch_environment{};
+    interactive.launch_environment->platform_id = discovery.platform_id;
+    interactive.launch_environment->effective_environment = launch_environment;
+    const auto prepare_interactive = [&interactive]() {
+        Context prepared_interactive;
+        prepared_interactive.invocation = {"interactive", {"launch-preparation", 3}, "prepare",
+            addon::encode_prepare_request(interactive, 3)};
+        opencode::handle_preparation(prepared_interactive);
+        if (!prepared_interactive.payload) {
+            std::cerr << "Interactive preparation: " << prepared_interactive.reason << '\n';
+        }
+        addon::Contract_failure patch_failure;
+        return prepared_interactive.payload
+            ? addon::decode_launch_patch(*prepared_interactive.payload, &patch_failure, 3) : std::nullopt;
+    };
+    // Whether a prepared launch reports its lifecycle, with the relay switch
+    // and the disposition in agreement; nullopt for anything else.
+    const auto lifecycle_reported = [](const std::optional<addon::Launch_patch>& patch) -> std::optional<bool> {
+        if (!patch || !patch->disposition || !patch->disposition->prepared ||
+            patch->disposition->coordination_delivery)
+        {
+            return std::nullopt;
+        }
+        std::string relay;
+        for (const auto& [name, value] : patch->set) {
+            if (name == "OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED") relay = value;
+        }
+        if (relay != (patch->disposition->lifecycle_events ? "1" : "0")) return std::nullopt;
+        return patch->disposition->lifecycle_events;
+    };
+    check(lifecycle_reported(prepare_interactive()) == true, "verified direct launch reports its lifecycle");
+
+#ifdef _WIN32
+    // The host runs a PowerShell launcher as `powershell -NoLogo -Command <script>`.
+    // The version evidence must come from what that shell itself runs.
+    const auto system_root = effective.find("SystemRoot");
+    const auto powershell_directory = (system_root ? system_root->as_string() : std::string("C:\\Windows")) +
+        "\\System32\\WindowsPowerShell\\v1.0";
+    auto shell_environment = launch_environment;
+    shell_environment.set("PATH", addon::Json_value(path_string(root) + ";" + powershell_directory));
+    const addon::Launcher_request shell_launcher{"opencode", "powershell", ""};
+    const std::vector<std::string> shell_argv{"powershell.exe", "-NoLogo", "-Command", "opencode"};
+    check(opencode::verified_launch(shell_launcher, shell_argv, shell_environment, path_string(root), false, context)
+            .has_value(),
+        "interactive PowerShell launcher of a verified program");
+    check(!opencode::verified_launch(shell_launcher, {"powershell.exe", "-NoLogo", "-Command", "opencode --pure"},
+            shell_environment, path_string(root), false, context),
+        "interactive PowerShell launcher must run the recognized script");
+    const std::string quoted_script = "\"" + program_text + "\"";
+    check(!opencode::verified_launch({quoted_script, "powershell", ""},
+            {"powershell.exe", "-NoLogo", "-Command", quoted_script}, shell_environment, path_string(root), false, context),
+        "PowerShell evaluates a quoted path as a string, not a launch");
+    // An npm installation of OpenCode 1.18.25 whose shim prints `shim_version`.
+    const auto npm_installation = [&](const char* name, const char* shim_version) {
+        const auto directory = root / name;
+        fs::create_directories(directory / "node_modules" / "opencode-ai" / "bin");
+        fs::copy_file(program, directory / "node_modules" / "opencode-ai" / "bin" / "opencode.exe");
+        std::ofstream(directory / "node_modules" / "opencode-ai" / "package.json", std::ios::binary)
+            << R"({"name":"opencode-ai","version":"1.18.25","bin":{"opencode":"bin/opencode.exe"}})";
+        std::ofstream(directory / "opencode.cmd", std::ios::binary) << "@echo " << shim_version << "\r\n";
+        auto environment = shell_environment;
+        environment.set("PATH", addon::Json_value(path_string(directory) + ";" + powershell_directory));
+        return environment;
+    };
+    check(!opencode::verified_launch(shell_launcher, shell_argv, npm_installation("shim", "1.18.10"),
+            path_string(root), false, context),
+        "the version evidence is what the PowerShell launch runs");
+    // What PowerShell runs can change without changing anything the package
+    // can identify; here the shim keeps its size and time.
+    const auto cached_environment = npm_installation("cached", "1.18.25");
+    check(opencode::verified_launch(shell_launcher, shell_argv, cached_environment, path_string(root), false, context)
+            .has_value(),
+        "a PowerShell shim that runs the located installation");
+    const auto cached_shim = root / "cached" / "opencode.cmd";
+    const auto written = fs::last_write_time(cached_shim);
+    std::ofstream(cached_shim, std::ios::binary | std::ios::trunc) << "@echo 1.18.10\r\n";
+    fs::last_write_time(cached_shim, written);
+    check(!opencode::verified_launch(shell_launcher, shell_argv, cached_environment, path_string(root), false, context),
+        "PowerShell evidence is probed again for every launch");
+    interactive.launcher      = shell_launcher;
+    interactive.launcher_argv = shell_argv;
+    interactive.launch_environment->effective_environment = shell_environment;
+    check(lifecycle_reported(prepare_interactive()) == true, "verified PowerShell launch reports its lifecycle");
+    interactive.launcher_argv = {"powershell.exe", "-NoLogo", "-Command", "opencode --pure"};
+    check(lifecycle_reported(prepare_interactive()) == false,
+        "an invocation other than the recognized launcher keeps lifecycle off");
+#endif
     effective.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("1.18.24"));
     check(!opencode::verified_launch(launcher, {program_text}, effective, path_string(root), true, context),
         "changed effective environment invalidates version evidence");

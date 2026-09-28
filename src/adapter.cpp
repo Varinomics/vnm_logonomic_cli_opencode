@@ -156,7 +156,7 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
-        {"launch-preparation", 2}, {"managed-assets", 1}, {"structured-session", 2},
+        {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 2},
         {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"legacy-state-import", 1}, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
     };

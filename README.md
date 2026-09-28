@@ -12,7 +12,10 @@ review is unavailable; structured inspection belongs to delegated implementation
 Lifecycle integration requires a verified OpenCode version at least 1.18.11;
 delegated ACP requires at least 1.18.25. Newer versions remain eligible and their
 actual protocol messages are validated. The selected stock launcher chain is
-verified before delegation. User configuration is merged, and package writes use
+verified before delegation. An interactive launch reports its lifecycle only when
+the host's complete invocation, a direct launcher or `powershell -NoLogo -Command`
+running the recognized script, starts a verified OpenCode; otherwise the launch is
+prepared without lifecycle. User configuration is merged, and package writes use
 the exact host-acknowledged profile storage allocation.
 
 ## Building and local qualification

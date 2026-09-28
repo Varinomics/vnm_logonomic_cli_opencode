@@ -79,6 +79,16 @@ std::string base_name(std::string_view value)
     return name;
 }
 
+// Words PowerShell passes through unchanged: no quoting, variables, escapes,
+// separators, redirections, groupings or comments.
+bool plain_powershell_command(std::string_view script)
+{
+    return !trim(script).empty() && std::all_of(script.begin(), script.end(), [](unsigned char character) {
+        return std::isalnum(character) || std::string_view(" \t-_./\\:=").find(static_cast<char>(character)) !=
+            std::string_view::npos;
+    });
+}
+
 bool package_flag(std::string_view value)
 {
     return value == "-y" || value == "--yes" || value == "--quiet" ||
@@ -563,10 +573,16 @@ std::optional<Verified_launch> verified_launch(
         if (launcher_argv.size() != literal.size() ||
             !std::equal(literal.begin() + 1, literal.end(), launcher_argv.begin() + 1)) return std::nullopt;
     }
-    else if (!delegated || launcher.runner_key != "powershell" || launcher_argv.size() != 4 ||
+    else if (launcher.runner_key != "powershell" || launcher_argv.size() != 4 ||
              base_name(launcher_argv[0]) != "powershell" || launcher_argv[1] != "-NoLogo" ||
              launcher_argv[2] != "-Command" || launcher_argv[3] != launcher.script_body)
     {
+        return std::nullopt;
+    }
+    // An interactive launch runs the script itself. Without quoting, expansion
+    // or separators PowerShell reads it as exactly its literal words, the first
+    // one naming the command it runs.
+    if (!delegated && launcher.runner_key == "powershell" && !plain_powershell_command(launcher.script_body)) {
         return std::nullopt;
     }
     Environment environment;
@@ -622,6 +638,7 @@ std::optional<Verified_launch> verified_launch(
     std::vector<std::string> probe_argv{path_to_utf8(executable), "--version"};
     std::vector<std::string> launch_argv{path_to_utf8(executable)};
     int timeout_ms = 3000;
+    bool cacheable = true;
     if (delegated) {
         launch_argv = {path_to_utf8(*selected), "acp", "--cwd", std::string(working_directory)};
         probe_argv  = {path_to_utf8(*selected), "--version"};
@@ -644,6 +661,22 @@ std::optional<Verified_launch> verified_launch(
             return std::nullopt;
 #endif
         }
+    }
+    else if (launcher.runner_key == "powershell") {
+#ifdef _WIN32
+        // Probe the program the launch's own shell resolves and runs, which may
+        // be a shim other than the installation the package located. PowerShell
+        // resolves it by rules no file identity here tracks (.ps1 precedence,
+        // profiles), so this evidence is never reused.
+        const auto shell = resolve_program(launcher_argv.front(), environment, working_directory, Launcher_whitespace::ASCII);
+        if (!shell || !native_image(*shell)) return std::nullopt;
+        probe_argv = {path_to_utf8(*shell), "-NoLogo", "-Command", literal.front() + " --version; exit $LASTEXITCODE"};
+        files.push_back(*shell);
+        timeout_ms = 10000;
+        cacheable  = false;
+#else
+        return std::nullopt;
+#endif
     }
     // The proof belongs to these exact installation bytes. A replacement while
     // the probe runs cannot publish evidence about a different executable.
@@ -676,7 +709,7 @@ std::optional<Verified_launch> verified_launch(
     const auto cache_key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;
     static std::map<std::string, std::string> cache;
-    {
+    if (cacheable) {
         std::lock_guard lock(cache_mutex);
         const auto cached = cache.find(cache_key);
         if (cached != cache.end() && !context.cancel_requested()) {
@@ -695,7 +728,7 @@ std::optional<Verified_launch> verified_launch(
     const auto version = parse_version_output(output->output, output->errors);
     if ((!package_version.empty() && version != package_version) ||
         !version_is_at_least(version, 1, 18, delegated ? 25 : 11)) return std::nullopt;
-    {
+    if (cacheable) {
         std::lock_guard lock(cache_mutex);
         if (cache.size() >= 32) cache.erase(cache.begin());
         cache[cache_key] = version;
