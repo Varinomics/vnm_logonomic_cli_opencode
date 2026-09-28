@@ -9,6 +9,16 @@ OpenCode has no singular global account, authentication, quota, or usage model i
 this integration. Those capabilities are not advertised. Read-only structured
 review is unavailable; structured inspection belongs to delegated implementation.
 
+A delegated task keeps the launcher's permission posture: OpenCode's own
+`permission` configuration, which the package passes through unchanged, decides
+which tools run and which ask. When OpenCode asks, the package answers with the
+request's own `once` option only for the task's own Task tools
+(`logonomic-task-<task>-<server>_<action>`, announced by OpenCode's `tool_call`
+with that title and requested with kind `other`), and with `reject` for anything else, which
+nobody can approve in a headless run; it never chooses `always`. OpenCode fails
+a rejected tool call and continues the turn. A task that needs other tools
+therefore needs a configuration that allows them.
+
 Lifecycle integration requires a verified OpenCode version at least 1.18.11;
 delegated ACP requires at least 1.18.25. Newer versions remain eligible and their
 actual protocol messages are validated. The selected stock launcher chain is

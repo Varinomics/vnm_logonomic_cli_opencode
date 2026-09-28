@@ -11,7 +11,8 @@ logonomic::cli_addon::Inspection_setup make_acp_inspection(
     const std::string& working_directory,
     const std::string& provider_version,
     const logonomic::cli_addon::Json_value& mcp_servers,
-    const logonomic::cli_addon::Json_value& attestations);
+    const logonomic::cli_addon::Json_value& attestations,
+    const logonomic::cli_addon::Json_value& task_tools);
 
 std::string acp_initial_input();
 

@@ -425,7 +425,25 @@ bool attestations_ready(const Json& values)
     return true;
 }
 
-std::string permission_response(const Json& request, const std::string& session_id, Json* permission_ids)
+// The run keeps the launcher's permission posture, which OpenCode's own
+// configuration expresses. The package approves once only a call of one of the
+// task's own Task tools: OpenCode announced it with a `tool_call` titled with
+// the tool's id, and the request carries that id, title and kind `other`.
+// Anything else gets the request's own reject option, since nobody can approve
+// it in a headless run; OpenCode titles a shell request with the command text,
+// so a title alone could be chosen by the command.
+bool announced_task_tool(const Json& tool, const Json& announced)
+{
+    const auto call  = text(member(tool, "toolCallId"));
+    const auto title = text(member(tool, "title"));
+    return text(member(tool, "kind")) == "other" &&
+        std::any_of(announced.as_array().begin(), announced.as_array().end(), [&](const Json& entry) {
+            return text(member(entry, "toolCallId")) == call && text(member(entry, "title")) == title;
+        });
+}
+
+std::string permission_response(
+    const Json& request, const std::string& session_id, const Json& announced, Json* permission_ids)
 {
     const auto& id     = member(request, "id");
     const auto& params = member(request, "params");
@@ -448,7 +466,10 @@ std::string permission_response(const Json& request, const std::string& session_
     if (!tool_update(tool)) {
         return {};
     }
-    bool allow_once = false;
+    const bool approve = announced_task_tool(tool, announced);
+    const std::string chosen_id   = approve ? "once" : "reject";
+    const std::string chosen_kind = approve ? "allow_once" : "reject_once";
+    bool offered = false;
     std::set<std::string> option_ids;
     for (const auto& option : options.as_array()) {
         const auto option_id = text(member(option, "optionId"));
@@ -460,11 +481,11 @@ std::string permission_response(const Json& request, const std::string& session_
         {
             return {};
         }
-        if (option_id == "once" && kind == "allow_once") {
-            allow_once = true;
+        if (option_id == chosen_id && kind == chosen_kind) {
+            offered = true;
         }
     }
-    if (!allow_once || option_ids.empty() || option_ids.size() > 64 ||
+    if (!offered || option_ids.empty() || option_ids.size() > 64 ||
         permission_ids->as_array().size() >= 256)
     {
         return {};
@@ -481,7 +502,7 @@ std::string permission_response(const Json& request, const std::string& session_
     return json_line(object({
         {"jsonrpc", Json("2.0")}, {"id", id},
         {"result", object({{"outcome", object({
-            {"outcome", Json("selected")}, {"optionId", Json("once")},
+            {"outcome", Json("selected")}, {"optionId", Json(chosen_id)},
         })}})},
     }));
 }
@@ -511,7 +532,8 @@ addon::Inspection_setup make_acp_inspection(
     const std::string& working_directory,
     const std::string& provider_version,
     const Json& mcp_servers,
-    const Json& attestations)
+    const Json& attestations,
+    const Json& task_tools)
 {
     const auto state = object({
         {"stage", Json("await_initialize")}, {"pending_base64", Json("")},
@@ -520,6 +542,7 @@ addon::Inspection_setup make_acp_inspection(
         {"working_directory", Json(working_directory)}, {"provider_version", Json(provider_version)},
         {"result_base64", Json("")}, {"result_message_id", Json("")},
         {"permission_ids", Json::array()}, {"mcp_servers", mcp_servers}, {"attestations", attestations},
+        {"task_tools", task_tools}, {"announced", Json::array()},
     });
     addon::Inspection_setup setup;
     setup.incremental    = true;
@@ -552,7 +575,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         !exact_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
                                   "working_directory", "provider_version", "result_base64",
                                   "result_message_id", "permission_ids", "mcp_servers", "attestations",
-                                  "deferred_input_base64", "deferred_input_is_request"}))
+                                  "deferred_input_base64", "deferred_input_is_request", "task_tools", "announced"}))
     {
         return failure("acp_invalid_state");
     }
@@ -565,7 +588,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         !member(state, "pending_base64").is_string() || !member(state, "prompt_base64").is_string() ||
         !member(state, "result_base64").is_string() ||
         !member(state, "deferred_input_base64").is_string() ||
-        !member(state, "deferred_input_is_request").is_boolean())
+        !member(state, "deferred_input_is_request").is_boolean() ||
+        !member(state, "task_tools").is_array() || !member(state, "announced").is_array())
     {
         return failure("acp_invalid_state");
     }
@@ -611,7 +635,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 if (stage != "await_prompt" || next_input_contains_request) {
                     return failure("acp_out_of_order_reverse_request");
                 }
-                const auto reply = permission_response(value, text(member(state, "session_id")), &permissions);
+                const auto reply = permission_response(
+                    value, text(member(state, "session_id")), member(state, "announced"), &permissions);
                 if (reply.empty()) {
                     return failure("acp_unsupported_reverse_request");
                 }
@@ -635,6 +660,18 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             auto session = text(member(state, "session_id"));
             if (!apply_update(value, stage, &session, &result, &message_id)) {
                 return failure("acp_unauthenticated_notification");
+            }
+            const auto& update = member(member(value, "params"), "update");
+            const auto& tools  = member(state, "task_tools").as_array();
+            if (text(member(update, "sessionUpdate")) == "tool_call" &&
+                std::find(tools.begin(), tools.end(), member(update, "title")) != tools.end())
+            {
+                auto announced = member(state, "announced");
+                if (announced.as_array().size() >= 256) {
+                    return failure("acp_task_tool_call_bound_exceeded");
+                }
+                announced.push_back(object({{"toolCallId", member(update, "toolCallId")}, {"title", member(update, "title")}}));
+                state.set("announced", std::move(announced));
             }
             state.set("result_base64", Json(addon::encode_base64(result)));
             state.set("result_message_id", Json(message_id));

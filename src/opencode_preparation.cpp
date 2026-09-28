@@ -389,6 +389,7 @@ void prepare_delegated(addon::Invocation_context& context)
     result.profile_storage = request->context.profile_storage;
     auto servers = addon::Json_value::array();
     auto attestations = addon::Json_value::array();
+    auto task_tools = addon::Json_value::array();
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
         const auto stem = "mcp/server-" + nonce;
@@ -408,7 +409,12 @@ void prepare_delegated(addon::Invocation_context& context)
         result.private_artifacts.push_back({stem + ".connection", nonce});
         result.acknowledgment.server_ids.push_back(server.server_id);
         auto mcp = addon::Json_value::object();
-        mcp.set("name", addon::Json_value("logonomic-task-" + request->control.task_id + "-" + server.server_id));
+        const auto name = "logonomic-task-" + request->control.task_id + "-" + server.server_id;
+        // OpenCode names an MCP tool <server>_<tool>.
+        for (const auto& action : server.actions) {
+            task_tools.push_back(addon::Json_value(name + "_" + action));
+        }
+        mcp.set("name", addon::Json_value(name));
         mcp.set("command", addon::Json_value(connection.relay_program));
         mcp.set("args", addon::Json_value(std::move(arguments)));
         mcp.set("env", addon::Json_value::array());
@@ -435,8 +441,16 @@ void prepare_delegated(addon::Invocation_context& context)
         result.process.environment.end());
     result.process.environment.emplace_back(config.environment_name, addon::serialize_json(config.value));
     result.process.environment.emplace_back("OPENCODE_ENABLE_QUESTION_TOOL", "0");
-    result.process.environment_names = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME"};
-    result.inspection = make_acp_inspection(request->prompt, request->context.working_directory, launch->version, servers, attestations);
+    // OPENCODE_CONFIG and OPENCODE_CONFIG_DIR select the user's configuration,
+    // and with it the permission rules the delegated run keeps.
+    result.process.environment_names = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"};
+    std::erase_if(result.process.environment_names, [&result](const std::string& name) {
+        return std::any_of(result.process.environment.begin(), result.process.environment.end(),
+            [&name](const auto& entry) { return environment_name_equal(entry.first, name); });
+    });
+    result.inspection = make_acp_inspection(
+        request->prompt, request->context.working_directory, launch->version, servers, attestations, task_tools);
     result.inspection.keep_stdin_open = true;
     auto payload = addon::encode_delegated_prepare_result(result, 2);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {

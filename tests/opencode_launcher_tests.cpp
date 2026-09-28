@@ -8,6 +8,7 @@
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -213,6 +214,17 @@ int main(int argc, char** argv)
         check(result->private_artifacts.size() == 1 &&
             result->private_artifacts.front().relative_path.ends_with(".connection"),
             "ordinary artifact creates readiness parent without reserving ready file");
+        // Oracle: OpenCode's configuration documentation - OPENCODE_CONFIG and
+        // OPENCODE_CONFIG_DIR select the configuration whose permission rules a
+        // delegated run keeps (the owner's rule, 2026-09-28).
+        const auto& names = result->process.environment_names;
+        check(std::find(names.begin(), names.end(), "OPENCODE_CONFIG") != names.end() &&
+            std::find(names.begin(), names.end(), "OPENCODE_CONFIG_DIR") != names.end(),
+            "the user's configuration selectors reach the delegated OpenCode");
+        check(std::find(names.begin(), names.end(), "OPENCODE_CONFIG_CONTENT") == names.end(),
+            "the package's own inline configuration is not also inherited");
+        check(addon::validate_structured_process_proposal(result->process, &failure),
+            "the host admits the delegated process proposal");
         check(!fs::exists(addon::path_from_utf8(attestation.find("path")->as_string())),
             "preparation leaves the ready file absent for host reservation");
         check(result->inspection.protocol_state.find("opencode-host-authority-canary") == std::string::npos &&

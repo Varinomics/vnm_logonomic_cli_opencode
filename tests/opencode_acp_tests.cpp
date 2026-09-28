@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace {
@@ -48,10 +49,16 @@ const std::string k_message =
     "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_root\","
     "\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"msg_result\","
     "\"content\":{\"type\":\"text\",\"text\":\"Finished\"}}}}\n";
+// OpenCode 1.18.32 offers once, always and reject; the package answers a tool
+// the launcher's posture did not approve with the request's own reject option.
 const std::string k_permission =
     "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"session/request_permission\",\"params\":{"
-    "\"sessionId\":\"ses_root\",\"toolCall\":{\"toolCallId\":\"call_read\"},\"options\":[{"
-    "\"kind\":\"allow_once\",\"name\":\"Allow once\",\"optionId\":\"once\"}]}}\n";
+    "\"sessionId\":\"ses_root\",\"toolCall\":{\"toolCallId\":\"call_read\"},\"options\":["
+    "{\"kind\":\"allow_once\",\"name\":\"Allow once\",\"optionId\":\"once\"},"
+    "{\"kind\":\"allow_always\",\"name\":\"Always allow\",\"optionId\":\"always\"},"
+    "{\"kind\":\"reject_once\",\"name\":\"Reject\",\"optionId\":\"reject\"}]}}\n";
+// The task's own Task tool, as the fixture's server names it.
+const std::string k_task_tool = "logonomic-task-t-task_control_status";
 
 std::string permission_request(const Json& id)
 {
@@ -60,7 +67,7 @@ std::string permission_request(const Json& id)
     return addon::serialize_json(request) + '\n';
 }
 
-void require_permission_reply(const std::string& bytes, const Json& id)
+void require_permission_reply(const std::string& bytes, const Json& id, const char* option = "reject")
 {
     const auto reply = parse(bytes);
     const auto* reply_id = reply.find("id");
@@ -69,8 +76,8 @@ void require_permission_reply(const std::string& bytes, const Json& id)
     const auto* result = reply.find("result");
     const auto* outcome = result ? result->find("outcome") : nullptr;
     require(outcome && addon::serialize_json(*outcome) ==
-            addon::serialize_json(parse("{\"outcome\":\"selected\",\"optionId\":\"once\"}")),
-        "permission reply must select the adopted allow-once option");
+            addon::serialize_json(parse(std::string("{\"outcome\":\"selected\",\"optionId\":\"") + option + "\"}")),
+        "permission reply must select the request's own option the posture calls for");
 }
 
 class Session
@@ -83,7 +90,7 @@ public:
         entry.set("path", Json(std::string(path.begin(), path.end())));
         m_state = opencode::make_acp_inspection(
             "Implement the requested change", ".", "1.2.3", Json::array(),
-            Json(Json::Array{entry})).protocol_state;
+            Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)})).protocol_state;
     }
 
     addon::Structured_inspect_result feed(const std::string& bytes, bool final = false,
@@ -396,6 +403,56 @@ void run(const fs::path& attestation)
         session.feed("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n");
         const auto result = session.feed("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\ntrailing");
         require(result.failure_reason == "acp_invalid_close", "trailing close output must fail");
+    }
+    // Oracle: the owner's rule that a delegated run keeps its launcher's
+    // permission posture and the package approves only its own Task tools
+    // (2026-09-28), and OpenCode 1.18.32's requests recorded against a
+    // scripted endpoint: an MCP tool call is announced by a tool_call titled
+    // <server>_<tool> with kind other, and its permission request repeats that
+    // id, title and kind; a shell request is titled with the command text and
+    // has kind execute.
+    {
+        const auto announce = [](const std::string& call, const std::string& title, const char* kind) {
+            return "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"ses_root\","
+                "\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"" + call + "\",\"title\":\"" + title +
+                "\",\"kind\":\"" + kind + "\",\"status\":\"pending\",\"locations\":[],\"rawInput\":{}}}}\n";
+        };
+        const auto request = [](const std::string& call, const std::string& title, const char* kind, bool reject) {
+            auto value = parse(k_permission);
+            auto tool = parse("{\"status\":\"pending\",\"locations\":[],\"rawInput\":{}}");
+            tool.set("toolCallId", Json(call));
+            tool.set("title", Json(title));
+            tool.set("kind", Json(std::string(kind)));
+            value.find("params")->set("toolCall", std::move(tool));
+            if (!reject) {
+                auto& options = value.find("params")->find("options")->as_array();
+                options.pop_back();
+            }
+            return addon::serialize_json(value) + '\n';
+        };
+        Session approved(attestation);
+        approved.reach_prompt();
+        const auto task = approved.feed(announce("call_task", k_task_tool, "other") +
+            request("call_task", k_task_tool, "other", true));
+        require(!task.complete && task.stdin_bytes, "an announced Task tool call is answered");
+        require_permission_reply(*task.stdin_bytes, Json(17), "once");
+        for (const auto& [announced, requested, kind] : {
+                std::tuple<std::string, std::string, const char*>{"bash", k_task_tool, "execute"},
+                {"logonomic-task-t-task_control_other", "logonomic-task-t-task_control_other", "other"},
+                {"", k_task_tool, "other"}})
+        {
+            Session session(attestation);
+            session.reach_prompt();
+            const auto prefix = announced.empty() ? std::string{} : announce("call_task", announced, "other");
+            const auto answered = session.feed(prefix + request("call_task", requested, kind, true));
+            require(!answered.complete && answered.stdin_bytes,
+                "a request for anything but an announced Task tool is answered");
+            require_permission_reply(*answered.stdin_bytes, Json(17), "reject");
+        }
+        Session unoffered(attestation);
+        unoffered.reach_prompt();
+        require(unoffered.feed(request("call_other", "echo probe", "execute", false)).failure_reason ==
+            "acp_unsupported_reverse_request", "a request without its own reject option is not answered otherwise");
     }
     {
         std::ofstream file(attestation, std::ios::binary | std::ios::trunc);
