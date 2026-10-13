@@ -288,7 +288,8 @@ std::string materialize_instruction(std::string_view profile_root, std::string_v
 
 namespace {
 
-std::string interactive_config(addon::Json_value config, const std::string& instruction)
+std::string interactive_config(addon::Json_value config, const std::string& instruction,
+    const std::optional<addon::Session_wake_preparation>& wake = std::nullopt)
 {
     auto instructions = config.find("instructions") ? *config.find("instructions") : addon::Json_value::array();
     instructions.push_back(addon::Json_value(instruction));
@@ -302,7 +303,29 @@ std::string interactive_config(addon::Json_value config, const std::string& inst
         result += addon::serialize_json(plugin) + ",";
     }
     // The host substitutes a complete JSON string, including Windows escaping.
-    result += "{{asset_json:assets/logonomic_opencode_plugin.mjs}}]}";
+    if (wake && wake->available) {
+        auto options = addon::Json_value::object();
+        options.set("session_wake", wake->binding);
+        result += "[{{asset_json:assets/logonomic_opencode_plugin.mjs}}," + addon::serialize_json(options) + "]]}";
+    }
+    else {
+        result += "{{asset_json:assets/logonomic_opencode_plugin.mjs}}]}";
+    }
+    return result;
+}
+
+addon::Session_wake_preparation prepare_wake(std::string_view profile_root, bool verified)
+{
+    addon::Session_wake_preparation result;
+    if (!verified) {
+        result.reason = "opencode_launcher_unverified";
+        return result;
+    }
+    // The plugin creates this file exclusively with owner-only permissions.
+    // Neither credentials nor a native endpoint are placed in the launch patch.
+    const auto file = native_path(profile_root) / ("wake-" + addon::random_nonce_hex() + ".json");
+    result.binding.set("registration_file", addon::Json_value(path_text(file)));
+    result.available = true;
     return result;
 }
 
@@ -359,7 +382,8 @@ void prepare_interactive(addon::Invocation_context& context)
     const auto instruction = materialize_instruction(request->profile_storage->root, request->title_instruction);
     addon::Launch_patch patch;
     patch.profile_storage = request->profile_storage;
-    patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction));
+    if (request->session_wake) patch.session_wake = prepare_wake(request->profile_storage->root, launch.has_value());
+    patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, patch.session_wake));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
     patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
     context.succeed(addon::encode_launch_patch(patch, 3));
@@ -420,7 +444,8 @@ void prepare_resume(addon::Invocation_context& context)
     result.process.argv           = *arguments;
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
     result.patch.profile_storage  = launch.profile_storage;
-    result.patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction));
+    if (launch.session_wake) result.patch.session_wake = prepare_wake(launch.profile_storage->root, true);
+    result.patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, result.patch.session_wake));
     result.patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", "1");
     // The managed plugin reports this session as resumed once the resumed
     // OpenCode has it in its own store.

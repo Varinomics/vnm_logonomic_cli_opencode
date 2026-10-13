@@ -55,10 +55,14 @@ add_library(opencode_provider STATIC
     src/opencode_acp.cpp
     src/opencode_launcher.cpp
     src/opencode_lifecycle.cpp
+    src/opencode_wake.cpp
     src/opencode_preparation.cpp)
 opencode_target(opencode_provider)
 target_include_directories(opencode_provider PUBLIC src)
 target_link_libraries(opencode_provider PUBLIC logonomic_cli_addon_sdk::sdk)
+if(WIN32)
+    target_link_libraries(opencode_provider PRIVATE ws2_32)
+endif()
 
 add_executable(opencode_adapter src/adapter.cpp)
 target_link_libraries(opencode_adapter PRIVATE opencode_provider)
@@ -142,6 +146,13 @@ add_test(NAME opencode_launcher_tests COMMAND opencode_launcher_tests)
 add_executable(opencode_fake_vnmctl tests/opencode_fake_vnmctl.cpp)
 opencode_target(opencode_fake_vnmctl)
 find_program(OPENCODE_NODE_EXECUTABLE node REQUIRED)
+add_executable(opencode_wake_adapter_tests tests/opencode_wake_adapter_tests.cpp)
+opencode_target(opencode_wake_adapter_tests)
+add_dependencies(opencode_wake_adapter_tests opencode_package)
+add_test(NAME opencode_wake_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_wake_plugin_tests.mjs"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_wake.mjs"
+    "$<TARGET_FILE:opencode_wake_adapter_tests>" "${OPENCODE_PACKAGE_DIRECTORY}")
 add_test(NAME opencode_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"
@@ -163,7 +174,7 @@ add_test(NAME opencode_package_conformance COMMAND logonomic_cli_addon_conforman
     "${OPENCODE_PACKAGE_DIRECTORY}")
 set_tests_properties(
     opencode_preparation_tests opencode_acp_tests opencode_lifecycle_tests opencode_launcher_tests
-    opencode_plugin_tests opencode_helper_tests opencode_helper_cancellation_tests
+    opencode_plugin_tests opencode_helper_tests opencode_helper_cancellation_tests opencode_wake_plugin_tests
     opencode_package_validation opencode_package_conformance
     PROPERTIES TIMEOUT 120)
 

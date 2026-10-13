@@ -2,12 +2,14 @@
 #include "opencode_launcher.h"
 #include "opencode_lifecycle.h"
 #include "opencode_preparation.h"
+#include "opencode_wake.h"
 
 #include "logonomic_cli_addon/adapter_runtime.h"
 #include "logonomic_cli_addon/helper_ingress.h"
 #include "logonomic_cli_addon/legacy_state_import.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
+#include "logonomic_cli_addon/session_wake.h"
 
 #include <exception>
 #include <optional>
@@ -118,6 +120,10 @@ void invoke(addon::Invocation_context& context)
             opencode::handle_lifecycle(context);
         }
         else
+        if (request.capability.capability_id == "session-wake") {
+            opencode::handle_wake(context);
+        }
+        else
         if (request.capability.capability_id == "structured-session" && request.operation == "inspect") {
             addon::Contract_failure failure;
             const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 2);
@@ -160,6 +166,7 @@ int main()
         {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"legacy-state-import", 1}, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"interactive-resume", 2},
+        {"session-wake", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler(invoke);

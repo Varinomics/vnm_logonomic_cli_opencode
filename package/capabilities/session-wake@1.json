@@ -1,0 +1,5 @@
+{
+  "capability_id": "session-wake",
+  "version": 1,
+  "payload": { "environment_names": [] }
+}

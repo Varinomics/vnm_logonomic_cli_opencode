@@ -35,6 +35,23 @@ has it, which lets Logonomic confirm the resume before the first turn. A launche
 that cannot report lifecycle, or whose options could select another session,
 directory or interface or leave out plugins, cannot resume.
 
+The optional `session-wake@1` capability wakes an idle existing interactive
+session through its managed plugin's own native SDK client. A private, launch-owned
+loopback bridge binds delivery to that live plugin instance, native session, and
+launch correlation. The plugin requires a completed normal turn and preserves
+its actual agent, model and variant. Busy sessions and pending native permissions
+or questions defer delivery; interrupted sessions remain unavailable. It never
+submits terminal input or edits the TUI draft. A retained notification receipt
+prevents a repeated accepted or uncertain delivery from creating another turn;
+acceptance does not mean the mailbox has been read or acknowledged.
+
+This route uses the current `opencode-ai` plugin and SDK contracts. The separate
+`@opencode/cli` 2.x generation exposes a native inbox API but changed its launcher
+and plugin module contracts; this package has not adapted those contracts. Such
+a launch cannot establish this bridge and reports unavailable. No version ceiling
+is imposed on compatible launchers: the live plugin checks the required methods
+and validates native session state before submission.
+
 ## Building and local qualification
 
 Interactive native question events retain `question.asked`, `question.replied`,
@@ -60,6 +77,15 @@ are bounded; overflow uses the existing lifecycle-degradation path.
 
 Delegated ACP question disabling and base helper-ingress contracts are unchanged.
 Provider fixtures establish protocol behavior, not paid native or UI qualification.
+The wake fixture exercises the real authenticated bridge and packaged C++ adapter,
+including repeat delivery, busy/attention deferral and uncertain acceptance.
+`node tests/opencode_wake_native_tests.mjs <opencode-executable> <managed-plugin> [public-dependency-seed]`
+is an opt-in native gate: it creates an isolated profile and loopback fake model,
+then observes two turns in the same native session. It does not prove TUI rendering
+or draft preservation visually and never uses the user's provider credentials.
+The optional seed directory supplies only `node_modules`, `package.json` and
+`package-lock.json` to avoid a first-run dependency download; no native profile
+configuration, authentication or history is copied.
 
 The project is C++20 and uses only the standalone SDK, the standard library and
 platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK

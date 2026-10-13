@@ -3,6 +3,7 @@
 import { Buffer } from "node:buffer"
 import { spawn } from "node:child_process"
 import { join } from "node:path"
+import { create_session_wake } from "./logonomic_opencode_wake.mjs"
 
 const maxMetadataCharacters = 256
 const maxPendingItems = 32
@@ -431,7 +432,10 @@ const createChangesInvocation = (
   }
 }
 
-export const Logonomic = async ({ client }) => {
+export const Logonomic = async ({ client }, options = {}) => {
+  const session_wake = process.env.OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED === "1"
+    ? await create_session_wake(client, options.session_wake?.registration_file)
+    : undefined
   const managedDeliveryTimeoutMilliseconds =
     "47000"
   const deliveryTimeoutMilliseconds = positiveMilliseconds(
@@ -1427,6 +1431,7 @@ export const Logonomic = async ({ client }) => {
     sessionDiffDisposalStarted = true
     disposePromise = (async () => {
       try {
+        await session_wake?.dispose()
         accepting = false
         const sessionDiffSettlement = settleActiveSessionDiffInvocations()
         const deadline = Date.now() + disposeTimeoutMilliseconds
@@ -1491,6 +1496,7 @@ export const Logonomic = async ({ client }) => {
   }
   hooks.event = ({ event }) => {
     try {
+      session_wake?.event(event)
       if (relevantEvents.has(event?.type)) {
         if (event.type.startsWith("question.")) {
           const properties = event.properties
@@ -1518,6 +1524,7 @@ export const Logonomic = async ({ client }) => {
   }
   hooks["chat.message"] = async (input, output) => {
     try {
+      session_wake?.chat_message(input, output)
       enqueue({ kind: "chat.message", input, output })
     } catch {
       // The editor lifecycle must not depend on Logonomic availability.
