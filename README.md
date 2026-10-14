@@ -45,6 +45,13 @@ submits terminal input or edits the TUI draft. A retained notification receipt
 prevents a repeated accepted or uncertain delivery from creating another turn;
 acceptance does not mean the mailbox has been read or acknowledged.
 
+Receipts are retained for the lifetime of the managed plugin instance and shared
+across its native sessions. Once 256 receipts have accumulated, a new otherwise
+eligible notification returns `unavailable` with `provider_receipt_capacity`;
+the mailbox message remains stored. Repeated notification IDs for the same session
+still return their retained result. Deleting a session does not free receipts;
+restarting OpenCode creates a fresh plugin instance and receipt table.
+
 This route uses the current `opencode-ai` plugin and SDK contracts. The separate
 `@opencode/cli` 2.x generation exposes a native inbox API but changed its launcher
 and plugin module contracts; this package has not adapted those contracts. Such
