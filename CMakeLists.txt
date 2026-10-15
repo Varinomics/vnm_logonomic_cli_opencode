@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0141 NEW)
-set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
 # A build that embeds this package owns its cache, its try_compile settings and
 # the SDK (the SDK's docs/package_contract.md, "Embedded build").
 if(NOT LOGONOMIC_CLI_ADDON_EMBEDDED)
