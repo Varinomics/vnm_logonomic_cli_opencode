@@ -363,19 +363,10 @@ bool apply_update(
         return stage == "await_prompt" && plan_update(update);
     }
     if (type == "usage_update") {
-        const auto& cost = member(update, "cost");
-        bool cost_valid = cost.is_null();
-        if (cost.is_object()) {
-            const auto& amount = member(cost, "amount");
-            const auto currency = text(member(cost, "currency"));
-            cost_valid = exact_keys(cost, {"amount", "currency"}) && amount.is_number() &&
-                std::isfinite(amount.as_number()) && amount.as_number() >= 0 && currency.size() == 3 &&
-                std::all_of(currency.begin(), currency.end(), [](char c) { return c >= 'A' && c <= 'Z'; });
-        }
         return one_of(stage, {"await_prompt", "await_close"}) &&
             only_keys(update, {"_meta", "cost", "sessionUpdate", "size", "used"}) && valid_meta(update) &&
             exact_integer(member(update, "used")) && exact_integer(member(update, "size")) &&
-            member(update, "size").as_number() > 0 && cost_valid;
+            member(update, "size").as_number() > 0;
     }
     if (type == "session_info_update") {
         const auto& title   = member(update, "title");
