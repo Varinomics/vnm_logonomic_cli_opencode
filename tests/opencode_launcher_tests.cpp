@@ -18,6 +18,10 @@
 #include <optional>
 #include <thread>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace {
 
 namespace addon = logonomic::cli_addon;
@@ -68,6 +72,11 @@ int main(int argc, char** argv)
     // exercises actual probe startup/output/cancellation without an installed
     // vendor CLI or network access.
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
+#ifndef _WIN32
+        if (const char* custody = std::getenv("OPENCODE_FIXTURE_CUSTODY")) {
+            if (custody != std::to_string(getpgrp()) + ":" + std::to_string(getsid(0))) return 8;
+        }
+#endif
         const char* mode = std::getenv("OPENCODE_FIXTURE_MODE");
         if (mode && std::string_view(mode) == "wait") std::this_thread::sleep_for(std::chrono::seconds(30));
         if (mode && std::string_view(mode) == "overflow") { std::cout << std::string(70000, 'a'); return 0; }
@@ -157,6 +166,10 @@ int main(int argc, char** argv)
     const auto program_text = path_string(program);
     addon::Launcher_request launcher{"\"" + program_text + "\"", "direct", ""};
     Context context;
+#ifndef _WIN32
+    effective.set("OPENCODE_FIXTURE_CUSTODY",
+        addon::Json_value(std::to_string(getpgrp()) + ":" + std::to_string(getsid(0))));
+#endif
     const auto launch = opencode::verified_launch(launcher, {program_text}, effective, path_string(root), true, context);
     check(launch && launch->version == "1.18.25" && launch->argv.size() == 4 &&
         launch->argv[1] == "acp" && launch->argv[2] == "--cwd", "real native ACP probe");

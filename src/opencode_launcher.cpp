@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +15,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace opencode {
 namespace {
@@ -275,8 +275,6 @@ std::optional<std::string> stream_version(std::string_view value)
     }
     return std::string{};
 }
-
-using addon::probe;
 
 #ifdef _WIN32
 std::string powershell_quote(std::string_view text)
@@ -612,7 +610,7 @@ std::optional<Verified_launch> verified_launch(
             return Verified_launch{std::move(launch_argv), cached->second, command->environment};
         }
     }
-    const auto output = opencode::probe(probe_argv, environment, working_directory, timeout_ms, context);
+    const auto output = addon::probe(probe_argv, environment, working_directory, timeout_ms, context);
     if (!output) return std::nullopt;
     for (std::size_t index = 0; index < files.size(); ++index) {
         std::error_code error;
