@@ -55,7 +55,14 @@ public:
         if (ioctlsocket(m_socket, FIONBIO, &nonblocking) != 0) close();
 #else
         if (m_socket >= FD_SETSIZE) { close(); return; }
-        if (fcntl(m_socket, F_SETFL, O_NONBLOCK) < 0) close();
+        if (fcntl(m_socket, F_SETFL, O_NONBLOCK) < 0 || fcntl(m_socket, F_SETFD, FD_CLOEXEC) < 0) {
+            close();
+            return;
+        }
+#ifdef __APPLE__
+        const int no_sigpipe = 1;
+        if (setsockopt(m_socket, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) close();
+#endif
 #endif
     }
     ~Socket()
@@ -170,7 +177,7 @@ Exchange_result exchange(const addon::Session_wake_target& target, addon::Json_v
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         if (!wait_socket(socket.get(), true, deadline, context)) return result;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         const int flags = 0;
 #else
         const int flags = MSG_NOSIGNAL;

@@ -17,21 +17,6 @@
 #include <set>
 #include <sstream>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <cerrno>
-#include <csignal>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
 namespace opencode {
 namespace {
 
@@ -291,191 +276,7 @@ std::optional<std::string> stream_version(std::string_view value)
     return std::string{};
 }
 
-struct Probe_output
-{
-    std::string output;
-    std::string errors;
-};
-
-#ifdef _WIN32
-using addon::wide;
-using addon::quote_argument;
-
-struct Handle
-{
-    HANDLE value = nullptr;
-    ~Handle() { if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value); }
-};
-#endif
-
-std::optional<Probe_output> probe(
-    const std::vector<std::string>& argv, const Environment& environment,
-    std::string_view working_directory, int timeout_ms, addon::Invocation_context& context)
-{
-    if (context.cancel_requested()) return std::nullopt;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    Probe_output result;
-    bool valid = true;
-#ifdef _WIN32
-    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
-    Handle output_read, output_write, errors_read, errors_write;
-    if (!CreatePipe(&output_read.value, &output_write.value, &security, 0) ||
-        !CreatePipe(&errors_read.value, &errors_write.value, &security, 0)) return std::nullopt;
-    SetHandleInformation(output_read.value, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(errors_read.value, HANDLE_FLAG_INHERIT, 0);
-    Handle input{CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    if (input.value == INVALID_HANDLE_VALUE) return std::nullopt;
-    std::wstring command;
-    for (const auto& argument : argv) {
-        if (!command.empty()) command += L' ';
-        command += quote_argument(wide(argument));
-    }
-    std::vector<std::wstring> variables;
-    for (const auto& [name, value] : environment) variables.push_back(wide(name + "=" + value));
-    std::sort(variables.begin(), variables.end(), [](const auto& left, const auto& right) {
-        return _wcsicmp(left.c_str(), right.c_str()) < 0;
-    });
-    std::wstring environment_block;
-    for (const auto& variable : variables) { environment_block += variable; environment_block += L'\0'; }
-    environment_block += L'\0';
-    if (variables.empty()) environment_block += L'\0';
-    // Restrict handle inheritance: concurrent adapter invokes must not retain
-    // each other's pipe handles and keep a completed probe alive.
-    SIZE_T attribute_bytes = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
-    std::vector<unsigned char> attributes(attribute_bytes);
-    auto* attribute_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
-    if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_bytes)) return std::nullopt;
-    HANDLE handles[]{input.value, output_write.value, errors_write.value};
-    const bool updated = UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        handles, sizeof(handles), nullptr, nullptr) != FALSE;
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput  = input.value;
-    startup.StartupInfo.hStdOutput = output_write.value;
-    startup.StartupInfo.hStdError  = errors_write.value;
-    startup.lpAttributeList = attribute_list;
-    PROCESS_INFORMATION information{};
-    Handle job{CreateJobObjectW(nullptr, nullptr)};
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    const auto directory = wide(working_directory);
-    const bool created = updated && job.value &&
-        SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
-        CreateProcessW(wide(argv.front()).c_str(), command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-            environment_block.data(), directory.empty() ? nullptr : directory.c_str(),
-            &startup.StartupInfo, &information);
-    DeleteProcThreadAttributeList(attribute_list);
-    if (!created) return std::nullopt;
-    Handle process{information.hProcess}, thread{information.hThread};
-    CloseHandle(output_write.value); output_write.value = nullptr;
-    CloseHandle(errors_write.value); errors_write.value = nullptr;
-    if (!AssignProcessToJobObject(job.value, process.value) || ResumeThread(thread.value) == static_cast<DWORD>(-1)) {
-        TerminateProcess(process.value, 1);
-        WaitForSingleObject(process.value, INFINITE);
-        return std::nullopt;
-    }
-    const auto drain = [&](HANDLE pipe, std::string& output) {
-        DWORD available = 0;
-        while (PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr) && available) {
-            std::array<char, 4096> buffer{};
-            DWORD count = 0;
-            if (!ReadFile(pipe, buffer.data(), std::min(available, static_cast<DWORD>(buffer.size())), &count, nullptr)) break;
-            if (output.size() + count > 65536) { valid = false; break; }
-            output.append(buffer.data(), count);
-        }
-    };
-    for (;;) {
-        drain(output_read.value, result.output);
-        drain(errors_read.value, result.errors);
-        if (WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0) break;
-        if (!valid || context.cancel_requested() || std::chrono::steady_clock::now() >= deadline) {
-            valid = false;
-            TerminateJobObject(job.value, 1);
-            WaitForSingleObject(process.value, INFINITE);
-            break;
-        }
-        context.wait_for_cancel(10);
-    }
-    TerminateJobObject(job.value, 1);
-    drain(output_read.value, result.output);
-    drain(errors_read.value, result.errors);
-    DWORD exit_code = 1;
-    valid = GetExitCodeProcess(process.value, &exit_code) && exit_code == 0 && valid;
-#else
-    int output_pipe[2], errors_pipe[2];
-    if (pipe2(output_pipe, O_CLOEXEC) != 0) return std::nullopt;
-    if (pipe2(errors_pipe, O_CLOEXEC) != 0) {
-        close(output_pipe[0]); close(output_pipe[1]); return std::nullopt;
-    }
-    const int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
-    if (input < 0) {
-        for (int descriptor : {output_pipe[0], output_pipe[1], errors_pipe[0], errors_pipe[1]}) close(descriptor);
-        return std::nullopt;
-    }
-    std::vector<std::string> environment_strings;
-    for (const auto& [name, value] : environment) environment_strings.push_back(name + "=" + value);
-    std::vector<char*> arguments, variables;
-    for (const auto& argument : argv) arguments.push_back(const_cast<char*>(argument.c_str()));
-    for (auto& variable : environment_strings) variables.push_back(variable.data());
-    arguments.push_back(nullptr);
-    variables.push_back(nullptr);
-    posix_spawn_file_actions_t actions;
-    posix_spawnattr_t attributes;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawnattr_init(&attributes);
-    posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, errors_pipe[1], STDERR_FILENO);
-    const std::string directory(working_directory);
-    if (!directory.empty()) posix_spawn_file_actions_addchdir_np(&actions, directory.c_str());
-    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
-    posix_spawnattr_setpgroup(&attributes, 0);
-    pid_t process = 0;
-    const int spawned = posix_spawn(&process, argv.front().c_str(), &actions, &attributes,
-        arguments.data(), variables.data());
-    posix_spawn_file_actions_destroy(&actions);
-    posix_spawnattr_destroy(&attributes);
-    close(input); close(output_pipe[1]); close(errors_pipe[1]);
-    if (spawned != 0) { close(output_pipe[0]); close(errors_pipe[0]); return std::nullopt; }
-    fcntl(output_pipe[0], F_SETFL, O_NONBLOCK);
-    fcntl(errors_pipe[0], F_SETFL, O_NONBLOCK);
-    const auto drain = [&](int descriptor, std::string& output) {
-        std::array<char, 4096> buffer{};
-        for (;;) {
-            const auto count = read(descriptor, buffer.data(), buffer.size());
-            if (count <= 0) break;
-            if (output.size() + static_cast<std::size_t>(count) > 65536) { valid = false; break; }
-            output.append(buffer.data(), static_cast<std::size_t>(count));
-        }
-    };
-    int status = 0;
-    for (;;) {
-        drain(output_pipe[0], result.output);
-        drain(errors_pipe[0], result.errors);
-        const auto waited = waitpid(process, &status, WNOHANG);
-        if (waited == process) break;
-        if (waited < 0 && errno != EINTR) { valid = false; break; }
-        if (!valid || context.cancel_requested() || std::chrono::steady_clock::now() >= deadline) {
-            valid = false;
-            kill(-process, SIGKILL);
-            while (waitpid(process, &status, 0) < 0 && errno == EINTR) {}
-            break;
-        }
-        pollfd descriptors[]{{output_pipe[0], POLLIN, 0}, {errors_pipe[0], POLLIN, 0}};
-        poll(descriptors, 2, 10);
-    }
-    kill(-process, SIGKILL);
-    drain(output_pipe[0], result.output);
-    drain(errors_pipe[0], result.errors);
-    close(output_pipe[0]); close(errors_pipe[0]);
-    valid = valid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#endif
-    return valid && !context.cancel_requested() ? std::optional(std::move(result)) : std::nullopt;
-}
+using addon::probe;
 
 #ifdef _WIN32
 std::string powershell_quote(std::string_view text)
@@ -797,7 +598,7 @@ std::optional<Verified_launch> verified_launch(
     for (std::size_t index = 0; index < files.size(); ++index) {
         append(path_to_utf8(files[index]));
         append(std::to_string(identities[index].first));
-        append(std::to_string(identities[index].second.time_since_epoch().count()));
+        append(addon::file_time_ticks_text(identities[index].second));
     }
     const auto cache_key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;
