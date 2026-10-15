@@ -145,7 +145,7 @@ void adapter_tests(const fs::path& package, const fs::path& root)
 #ifdef _WIN32
     request.launch_environment->platform_id = "windows-x86_64";
 #else
-    request.launch_environment->platform_id = "linux-x86_64";
+    request.launch_environment->platform_id = addon::host_platform_id();
 #endif
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(path_text(root / "absent-bin")));
     request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));

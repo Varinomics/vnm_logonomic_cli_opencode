@@ -596,7 +596,7 @@ std::optional<Verified_launch> verified_launch(
     for (std::size_t index = 0; index < files.size(); ++index) {
         append(path_to_utf8(files[index]));
         append(std::to_string(identities[index].first));
-        append(std::to_string(identities[index].second.time_since_epoch().count()));
+        append(addon::file_time_ticks_text(identities[index].second));
     }
     const auto cache_key = addon::to_hex(digest.finish());
     static std::mutex cache_mutex;

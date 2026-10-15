@@ -2,6 +2,7 @@
 #include "opencode_preparation.h"
 #include "opencode_acp.h"
 
+#include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/package_source.h>
@@ -137,7 +138,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     discovery.platform_id = "windows-x86_64";
 #else
-    discovery.platform_id = "linux-x86_64";
+    discovery.platform_id = addon::host_platform_id();
 #endif
     discovery.ambient_environment.set("PATH", addon::Json_value(path_string(root)));
     const auto discovered = opencode::discover_launcher(discovery);
