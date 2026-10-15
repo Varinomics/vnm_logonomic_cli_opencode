@@ -97,16 +97,7 @@ void invoke(addon::Invocation_context& context)
                 context.fail(addon::Result_status::FAILED, "frame_violation");
                 return;
             }
-            const auto* value = request.payload.find("profile_storage");
-            std::string detail;
-            const auto storage = value ? addon::decode_profile_storage_context(*value, &detail) : std::nullopt;
-            if (!storage) {
-                context.fail(addon::Result_status::FAILED, "profile_storage_mismatch");
-                return;
-            }
-            auto result = addon::Json_value::object();
-            result.set("profile_storage", addon::profile_storage_member(*storage));
-            context.succeed(std::move(result));
+            addon::acknowledge_profile_storage(context);
         }
         else
         if (request.capability.capability_id == "legacy-state-import" && request.operation == "import_record") {
