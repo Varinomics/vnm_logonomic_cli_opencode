@@ -77,6 +77,7 @@ logonomic_cli_addon_package_platform(OPENCODE_PLATFORM)
 set(OPENCODE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.opencode OPENCODE_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
+logonomic_cli_addon_package_indexer(package_index_command package_index_dependencies)
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
@@ -108,13 +109,14 @@ add_custom_command(
         "${OPENCODE_PACKAGE_DIRECTORY}/helpers/opencode_helper${OPENCODE_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:opencode_launch_bridge>"
         "${OPENCODE_PACKAGE_DIRECTORY}/helpers/opencode_launch_bridge${OPENCODE_EXECUTABLE_SUFFIX}"
-    COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${OPENCODE_PACKAGE_DIRECTORY}"
+    COMMAND ${package_index_command} "${OPENCODE_PACKAGE_DIRECTORY}"
         --third-party "assets/opencode.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
         --third-party "assets/opencode-white.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS opencode_adapter opencode_helper opencode_launch_bridge logonomic_cli_addon_index
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
+        ${package_files} ${package_index_dependencies}
     VERBATIM)
 add_custom_target(opencode_package ALL DEPENDS "${OPENCODE_PACKAGE_DIRECTORY}/package.files.json")
 logonomic_cli_addon_install_package("${OPENCODE_PACKAGE_DIRECTORY}" logonomic.cli.opencode TARGET opencode_package)
