@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { create_session_wake } from "./logonomic_opencode_wake.mjs"
 
 const maxMetadataCharacters = 256
+const maxRelayDiagnosticCharacters = 1024
 const maxPendingItems = 32
 const max_assistant_text_bytes = 2048
 const maxPendingTurnCandidates = 8
@@ -465,6 +466,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   let deliveryCutoffReached = false
   let workerPromise
   let cancelActiveDelivery
+  let lastRelayFailure
   let stopLookupsPromise
   let disposePromise
   let sessionDiffDisposalStarted = false
@@ -1203,18 +1205,13 @@ export const Logonomic = async ({ client }, options = {}) => {
       resolve()
       return
     }
-    if (!deliveryTimeoutMilliseconds) {
-      reportDeliveryFailure("the owned relay timeout is unavailable")
-      resolve()
-      return
-    }
-
     let child
     let deliveryTimer
     let settled = false
     let terminating = false
     let childFailure
     let terminationFailure
+    let relayDiagnostic = ""
     const finish = (failure) => {
       if (settled) return
       settled = true
@@ -1223,7 +1220,10 @@ export const Logonomic = async ({ client }, options = {}) => {
       if (cancelActiveDelivery === terminate) {
         cancelActiveDelivery = undefined
       }
-      if (failure) reportDeliveryFailure(failure)
+      const detail = relayDiagnostic.trim().replace(/\s+/g, " ").replace(/\.$/, "")
+      const message = failure && (detail ? `${failure}: ${detail}` : failure)
+      if (message && message !== lastRelayFailure) reportDeliveryFailure(message)
+      lastRelayFailure = message
       resolve()
     }
     const terminate = (
@@ -1238,16 +1238,26 @@ export const Logonomic = async ({ client }, options = {}) => {
       child.stdin.destroy()
     }
 
+    if (!deliveryTimeoutMilliseconds) {
+      finish("the owned relay timeout is unavailable")
+      return
+    }
     if (deliveryCutoffReached) {
       finish()
       return
     }
     try {
       child = spawn(relayPath, ["event", "--watch-parent"], {
-        stdio: ["pipe", "ignore", "inherit"],
+        stdio: ["pipe", "ignore", "pipe"],
         windowsHide: true,
       })
       cancelActiveDelivery = terminate
+      child.stderr.setEncoding("utf8")
+      child.stderr.on("data", (chunk) => {
+        relayDiagnostic += chunk.slice(
+          0, maxRelayDiagnosticCharacters - relayDiagnostic.length,
+        )
+      })
       child.once("error", () => {
         childFailure ??= "the relay could not be started"
       })
