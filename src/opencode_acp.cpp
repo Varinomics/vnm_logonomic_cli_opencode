@@ -555,13 +555,7 @@ std::string acp_initial_input()
 
 addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection& inspection)
 {
-    if (utf16_size(inspection.protocol_state) > 2 * 1024 * 1024) {
-        return failure("acp_invalid_state");
-    }
-    addon::Json_parse_limits state_limits;
-    state_limits.max_bytes        = 6 * 1024 * 1024;
-    state_limits.max_string_bytes = state_limits.max_bytes;
-    auto parsed_state = addon::parse_json(inspection.protocol_state, state_limits, nullptr);
+    auto parsed_state = addon::parse_exchange_protocol_state(inspection.protocol_state);
     if (!parsed_state ||
         !exact_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
                                   "working_directory", "provider_version", "result_base64",
