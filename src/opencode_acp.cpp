@@ -1,5 +1,6 @@
 #include "opencode_acp.h"
 
+#include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <algorithm>
@@ -18,16 +19,14 @@ namespace addon = logonomic::cli_addon;
 using Json = addon::Json_value;
 using Keys = std::initializer_list<std::string_view>;
 
+using addon::json::exact_keys;
+using addon::json::member;
+using addon::json::object;
+using addon::json::only_keys;
+
 constexpr std::size_t k_max_record_bytes = 256 * 1024;
 constexpr std::size_t k_max_result_bytes = 1024 * 1024;
 constexpr double k_max_exact_integer = 9007199254740991.0;
-
-const Json& member(const Json& value, std::string_view key)
-{
-    static const Json absent;
-    const auto* found = value.find(key);
-    return found ? *found : absent;
-}
 
 std::string text(const Json& value)
 {
@@ -37,19 +36,6 @@ std::string text(const Json& value)
 bool one_of(std::string_view value, Keys choices)
 {
     return std::find(choices.begin(), choices.end(), value) != choices.end();
-}
-
-bool only_keys(const Json& value, Keys keys)
-{
-    return value.is_object() && std::all_of(
-        value.as_object().begin(), value.as_object().end(), [&](const auto& entry) {
-            return one_of(entry.name, keys);
-        });
-}
-
-bool exact_keys(const Json& value, Keys keys)
-{
-    return only_keys(value, keys) && value.as_object().size() == keys.size();
 }
 
 bool valid_meta(const Json& value)
@@ -88,11 +74,6 @@ bool exact_integer(const Json& value)
     const double number = value.as_number();
     return std::isfinite(number) && number >= 0 &&
         number <= k_max_exact_integer && std::floor(number) == number;
-}
-
-Json object(std::initializer_list<addon::Json_member> members)
-{
-    return Json(Json::Object(members));
 }
 
 std::string json_line(const Json& value)
