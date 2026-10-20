@@ -234,4 +234,3 @@ export async function create_session_wake(client, registration_file) {
     },
   }
 }
-

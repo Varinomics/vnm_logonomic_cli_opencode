@@ -158,4 +158,3 @@ try {
   await wake?.dispose()
   await rm(root, { recursive: true, force: true })
 }
-
