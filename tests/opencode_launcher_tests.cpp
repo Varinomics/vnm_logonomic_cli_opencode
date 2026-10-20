@@ -5,6 +5,7 @@
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
@@ -109,7 +110,7 @@ int main(int argc, char** argv)
         environment->environment.back().second == "{\"theme\": \"dark\"}", "assignment preservation");
     const auto unattached = opencode::recognize_launcher("UNATTACHED=value; opencode");
     check(unattached && unattached->environment.empty(), "bare assignment stays unbound");
-    check(opencode::literal_launcher_argv("\"C:/a b/opencode.exe\" --model test") ==
+    check(addon::literal_argv("\"C:/a b/opencode.exe\" --model test") ==
         std::vector<std::string>{"C:/a b/opencode.exe", "--model", "test"}, "literal host argv");
 
     check(opencode::version_is_at_least("1.18.25", 1, 18, 25), "minimum admitted");
