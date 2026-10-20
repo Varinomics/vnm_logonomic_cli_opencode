@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { once } from "node:events"
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
@@ -32,6 +33,24 @@ try {
   assert(wake)
   const binding = JSON.parse(await readFile(registration, "utf8"))
   if (process.platform !== "win32") assert.equal((await stat(registration)).mode & 0o777, 0o600)
+  const incomplete = connect(binding.port, "127.0.0.1")
+  let progress
+  let deadline
+  try {
+    await once(incomplete, "connect")
+    const closed = once(incomplete, "close")
+    incomplete.write("{")
+    progress = setInterval(() => incomplete.write(" "), 250)
+    const completed = await Promise.race([
+      closed.then(() => true),
+      new Promise((resolve) => { deadline = setTimeout(() => resolve(false), 6500) }),
+    ])
+    assert.equal(completed, true, "partial request progress must not extend the connection deadline")
+  } finally {
+    clearInterval(progress)
+    clearTimeout(deadline)
+    incomplete.destroy()
+  }
   const send = (request) => new Promise((resolve, reject) => {
     const socket = connect(binding.port, "127.0.0.1")
     let response = ""

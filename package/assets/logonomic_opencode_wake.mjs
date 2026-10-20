@@ -132,9 +132,12 @@ export async function create_session_wake(client, registration_file) {
   const server = createServer((socket) => {
     if (disposed || sockets.size >= 8) { socket.destroy(); return }
     sockets.add(socket)
+    const deadline = setTimeout(() => socket.destroy(), operation_timeout_ms + 1000)
     socket.on("error", () => {})
-    socket.on("close", () => sockets.delete(socket))
-    socket.setTimeout(operation_timeout_ms + 1000, () => socket.destroy())
+    socket.on("close", () => {
+      clearTimeout(deadline)
+      sockets.delete(socket)
+    })
     let bytes = Buffer.alloc(0)
     let received = false
     socket.on("data", (chunk) => {
