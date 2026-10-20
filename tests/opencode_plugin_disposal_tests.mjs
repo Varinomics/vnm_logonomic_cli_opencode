@@ -1,10 +1,11 @@
-// Drive the unchanged public plugin disposal path at its production deadline.
-// The slow wrapper holds real SDK calls so the last delivery crosses the drain
-// cutoff; disposal must settle that owned descendant before returning.
+// Drive the public disposal cutoff while the real SDK wrapper is still alive.
+// Only the plugin's new deadline timers are expired by the fixture; process
+// cancellation and reaping still go through the production helper and SDK.
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { mock } from "node:test"
 import { pathToFileURL } from "node:url"
 
 const [pluginArgument, helperArgument, wrapperArgument] = process.argv.slice(2)
@@ -43,25 +44,43 @@ try {
   plugin.event({ event: { type: "message.updated", properties: { info: {
     id: "assistant-primary", sessionID: "session-primary", parentID: "turn-user", role: "assistant",
   } } } })
-  for (let index = 0; index < 6; ++index) {
-    plugin.event({ event: { type: "session.status", properties: {
-      sessionID: "session-primary", status: { type: "busy" },
-    } } })
-  }
+  plugin.event({ event: { type: "session.status", properties: {
+    sessionID: "session-primary", status: { type: "busy" },
+  } } })
   const deadline = Date.now() + 5000
   while (!existsSync(pidPath) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   assert(existsSync(pidPath), "plugin must start a wrapper descendant before disposal")
-  await plugin.dispose()
   wrapperPid = Number(readFileSync(pidPath, "utf8"))
   assert(Number.isInteger(wrapperPid) && wrapperPid > 0)
-  // The SDK owns a ten-second wrapper deadline. A younger final descendant
-  // could not have settled by that deadline; its absence proves cutoff cleanup
-  // rather than an ordinary fully drained delivery.
-  assert(Date.now() - statSync(pidPath).mtimeMs < 10_000,
-    "last wrapper must still be inside its own deadline when disposal completes")
+  const deadlines = []
+  let notifyDeadlineArmed
+  const deadlineArmed = new Promise((resolve) => { notifyDeadlineArmed = resolve })
+  const schedule = globalThis.setTimeout
+  const timers = mock.method(globalThis, "setTimeout", (callback, delay, ...arguments_) => {
+    const timer = schedule(callback, delay, ...arguments_)
+    deadlines.push(() => {
+      clearTimeout(timer)
+      callback(...arguments_)
+    })
+    notifyDeadlineArmed(true)
+    return timer
+  })
+  try {
+    const disposal = plugin.dispose()
+    assert.equal(await Promise.race([deadlineArmed, disposal.then(() => false)]), true,
+      "disposal must arm a deadline while delivery is pending")
+    assert(exists(wrapperPid), "disposal must reach its cutoff with a live wrapper")
+    for (const expire of deadlines) expire()
+    await disposal
+  } finally {
+    timers.mock.restore()
+  }
   assert(!exists(wrapperPid), "wrapper descendant survived plugin disposal")
+  const deliveries = readFileSync(process.env.OPENCODE_TEST_EVENT_CAPTURE, "utf8")
+    .trim().split("\n")
+  assert.equal(deliveries.length, 1, "the disposal cutoff must cancel the delivery without retrying")
 } finally {
   if (!wrapperPid && existsSync(pidPath)) wrapperPid = Number(readFileSync(pidPath, "utf8"))
   if (wrapperPid && exists(wrapperPid)) process.kill(wrapperPid, "SIGKILL")

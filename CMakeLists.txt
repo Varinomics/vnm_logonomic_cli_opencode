@@ -133,7 +133,7 @@ add_test(NAME opencode_plugin_disposal_tests COMMAND "${OPENCODE_NODE_EXECUTABLE
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_plugin_disposal_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"
     "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
-set_tests_properties(opencode_plugin_disposal_tests PROPERTIES TIMEOUT 125 LABELS slow)
+set_tests_properties(opencode_plugin_disposal_tests PROPERTIES TIMEOUT 125)
 add_test(NAME opencode_package_validation COMMAND logonomic_cli_addon_validate
     "${OPENCODE_PACKAGE_DIRECTORY}" --platform "${OPENCODE_PLATFORM}")
 add_test(NAME opencode_package_conformance COMMAND logonomic_cli_addon_conformance
