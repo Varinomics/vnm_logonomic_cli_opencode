@@ -141,51 +141,6 @@ bool equal_name(std::string_view left, std::string_view right)
 #endif
 }
 
-const std::string& semver_pattern()
-{
-    static const std::string pattern =
-        R"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
-        R"((?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?)"
-        R"((?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)";
-    return pattern;
-}
-
-bool semver(std::string_view value)
-{
-    static const std::regex pattern("^" + semver_pattern() + "$", std::regex::ECMAScript);
-    return std::regex_match(value.begin(), value.end(), pattern);
-}
-
-std::optional<std::string> stream_version(std::string_view value)
-{
-    if (value.size() > 65536 || value.find('\0') != std::string_view::npos ||
-        !addon::is_valid_utf8(value)) return std::nullopt;
-    static const std::regex labelled("^(?:OpenCode CLI|opencode)(?:\\s+version)?(?:\\s*[:=]\\s*|\\s+)v?(" +
-        semver_pattern() + ")(?:\\s+\\([^\\r\\n()]{1,128}\\))?\\s*$", std::regex::icase);
-    std::vector<std::string> lines;
-    std::string text(value);
-    std::replace(text.begin(), text.end(), '\r', '\n');
-    std::istringstream input(text);
-    std::string version;
-    for (std::string line; std::getline(input, line);) {
-        line = addon::trim(line, Launcher_whitespace::ASCII);
-        if (line.empty()) continue;
-        lines.push_back(line);
-        std::smatch match;
-        if (std::regex_match(line, match, labelled)) {
-            if (!version.empty() && version != match[1].str()) return std::nullopt;
-            version = match[1].str();
-        }
-    }
-    if (!version.empty()) return version;
-    if (lines.size() == 1) {
-        auto candidate = lines.front();
-        if (candidate.starts_with('v') || candidate.starts_with('V')) candidate.erase(0, 1);
-        if (semver(candidate)) return candidate;
-    }
-    return std::string{};
-}
-
 #ifdef _WIN32
 std::string powershell_quote(std::string_view text)
 {
@@ -219,28 +174,6 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     };
 }
 
-std::vector<std::string> literal_launcher_argv(std::string_view script)
-{
-    std::vector<std::string> result;
-    std::string current;
-    bool quoted = false;
-    int quotes = 0;
-    for (const char character : script) {
-        if (character == '"') {
-            if (++quotes == 3) { current += '"'; quotes = 0; }
-            continue;
-        }
-        if (quotes == 1) quoted = !quoted;
-        quotes = 0;
-        if (!quoted && std::isspace(static_cast<unsigned char>(character))) {
-            if (!current.empty()) { result.push_back(current); current.clear(); }
-        }
-        else current += character;
-    }
-    if (!current.empty()) result.push_back(current);
-    return result;
-}
-
 std::optional<std::vector<std::string>> resume_arguments(
     const addon::Launcher_request&  launcher,
     const std::vector<std::string>& launcher_argv,
@@ -249,7 +182,7 @@ std::optional<std::vector<std::string>> resume_arguments(
     std::string_view                session)
 {
     const auto command = recognize_launcher(launcher.script_body);
-    const auto literal = literal_launcher_argv(launcher.script_body);
+    const auto literal = addon::literal_argv(launcher.script_body);
     if (!command || !command->prefix_arguments.empty() || !command->environment.empty() ||
         literal.empty() || addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "opencode")
     {
@@ -335,7 +268,7 @@ std::optional<std::vector<std::string>> resume_arguments(
 
 bool version_is_at_least(std::string_view version, int major, int minor, int patch)
 {
-    if (!semver(version)) return false;
+    if (!addon::is_semantic_version(version)) return false;
     std::array<std::string_view, 3> components;
     auto remaining = version.substr(0, version.find_first_of("-+"));
     for (auto& component : components) {
@@ -355,8 +288,9 @@ bool version_is_at_least(std::string_view version, int major, int minor, int pat
 
 std::string parse_version_output(std::string_view output, std::string_view errors)
 {
-    const auto first  = stream_version(output);
-    const auto second = stream_version(errors);
+    constexpr std::string_view labels[] = {"OpenCode CLI", "opencode"};
+    const auto first  = addon::parse_version_stream(output, labels, Launcher_whitespace::ASCII);
+    const auto second = addon::parse_version_stream(errors, labels, Launcher_whitespace::ASCII);
     if (!first || !second || (!first->empty() && !second->empty() && *first != *second)) return {};
     return first->empty() ? *second : *first;
 }
@@ -368,7 +302,7 @@ std::optional<Verified_launch> verified_launch(
 {
     auto command = recognize_launcher(launcher.script_body);
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
-    const auto literal = literal_launcher_argv(launcher.script_body);
+    const auto literal = addon::literal_argv(launcher.script_body);
     if (literal.empty() || addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "opencode") return std::nullopt;
     if (delegated && literal.size() != 1) return std::nullopt;
     if (launcher.runner_key == "direct") {
@@ -424,7 +358,7 @@ std::optional<Verified_launch> verified_launch(
         const auto* bin     = package->find("bin");
         if (bin && bin->is_object()) bin = bin->find("opencode");
         if (!name || !name->is_string() || name->as_string() != "opencode-ai" ||
-            !version || !version->is_string() || !semver(version->as_string()) ||
+            !version || !version->is_string() || !addon::is_semantic_version(version->as_string()) ||
             !bin || !bin->is_string()) return std::nullopt;
         std::string bin_path = bin->as_string();
         std::replace(bin_path.begin(), bin_path.end(), '\\', '/');

@@ -30,10 +30,6 @@ struct Verified_launch
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
 std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request);
 
-// Literal argv follows the host's direct-launch grammar; it never evaluates a
-// shell expression. Recognition is deliberately separate from executable proof.
-std::vector<std::string> literal_launcher_argv(std::string_view script);
-
 // The launcher arguments after its program that reopen OpenCode session
 // `session` in `working_directory`: a direct launcher's own arguments, or its
 // PowerShell script, with the session selector added. nullopt when the
