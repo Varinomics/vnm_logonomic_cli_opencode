@@ -559,10 +559,10 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     {
         return failure("acp_invalid_state");
     }
-    auto pending_bytes = addon::decode_base64(text(member(state, "pending_base64")));
-    auto prompt_bytes  = addon::decode_base64(text(member(state, "prompt_base64")));
-    auto result_bytes  = addon::decode_base64(text(member(state, "result_base64")));
-    auto deferred_input = addon::decode_base64(text(member(state, "deferred_input_base64")));
+    auto pending_bytes = addon::decode_base64(member(state, "pending_base64").as_string());
+    auto prompt_bytes  = addon::decode_base64(member(state, "prompt_base64").as_string());
+    auto result_bytes  = addon::decode_base64(member(state, "result_base64").as_string());
+    auto deferred_input = addon::decode_base64(member(state, "deferred_input_base64").as_string());
     if (!pending_bytes || !prompt_bytes || !result_bytes || !deferred_input) {
         return failure("acp_invalid_state");
     }
@@ -577,16 +577,17 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     // Preserve the causal boundary while a record preceding these writes is partial.
     std::string next_input = std::move(*deferred_input);
     bool next_input_contains_request = member(state, "deferred_input_is_request").as_boolean();
+    std::string_view remaining = pending;
     for (;;) {
-        const auto line_end = pending.find('\n');
-        if (line_end == std::string::npos) {
+        const auto line_end = remaining.find('\n');
+        if (line_end == std::string_view::npos) {
             break;
         }
         if (line_end == 0 || line_end > k_max_record_bytes) {
             return failure("acp_invalid_record");
         }
-        const auto record = pending.substr(0, line_end);
-        pending.erase(0, line_end + 1);
+        const auto record = remaining.substr(0, line_end);
+        remaining.remove_prefix(line_end + 1);
         addon::Json_parse_limits record_limits;
         record_limits.max_bytes        = k_max_record_bytes;
         record_limits.max_string_bytes = k_max_record_bytes;
@@ -718,7 +719,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 return failure("acp_timed_out");
             }
             if (!next_input.empty() || !response(value, 4, &response_result) ||
-                !only_keys(response_result, {"_meta"}) || !valid_meta(response_result) || !pending.empty())
+                !only_keys(response_result, {"_meta"}) || !valid_meta(response_result) || !remaining.empty())
             {
                 return failure("acp_invalid_close");
             }
@@ -735,10 +736,10 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         }
         next_input_contains_request = true;
     }
-    state.set("pending_base64", Json(addon::encode_base64(pending)));
+    state.set("pending_base64", Json(addon::encode_base64(remaining)));
     state.set("result_base64", Json(addon::encode_base64(result)));
     state.set("result_message_id", Json(message_id));
-    const bool defer_input = !pending.empty() && !next_input.empty();
+    const bool defer_input = !remaining.empty() && !next_input.empty();
     state.set("deferred_input_base64", Json(defer_input ? addon::encode_base64(next_input) : ""));
     state.set("deferred_input_is_request", Json(defer_input && next_input_contains_request));
     if (!next_input.empty() && !defer_input) {
