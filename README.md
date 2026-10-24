@@ -2,8 +2,7 @@
 
 This standalone package supplies OpenCode launcher recognition, interactive
 configuration and tools, delegated ACP implementation, lifecycle delivery, and
-historical session identity conversion through the public Logonomic CLI add-on
-SDK. Its package identity is `logonomic.cli.opencode`.
+interactive resume through the public Logonomic CLI add-on SDK. Its package identity is `logonomic.cli.opencode`.
 
 OpenCode has no singular global account, authentication, quota, or usage model in
 this integration. Those capabilities are not advertised. Read-only structured

@@ -4,7 +4,6 @@
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -210,19 +209,6 @@ void adapter_tests(const fs::path& package, const fs::path& root)
             "only an OpenCode session identity is resumable");
     }
 
-    const addon::Legacy_resume_record historical{"opencode", "session-preserved-20260912"};
-    const auto imported = invoke(host, {"legacy-state-import", 1}, "import_record",
-        addon::encode_import_record_request("legacy-resume-record", addon::encode_legacy_resume_record(historical)));
-    require(imported.status == addon::Host_status::SUCCESS, "history import succeeds");
-    const auto conversion = addon::decode_import_record_result(imported.payload, &failure);
-    require(conversion && conversion->matched(), "native history is recognized");
-    const auto resume = addon::decode_legacy_resume_conversion(*conversion->conversion(), &failure);
-    require(resume && resume->find("provider_session_id")->as_string() == historical.provider_session_id,
-        "native history session identity is preserved exactly");
-    const auto foreign = invoke(host, {"legacy-state-import", 1}, "import_record",
-        addon::encode_import_record_request("legacy-resume-record", addon::encode_legacy_resume_record({"another-provider", "session-other"})));
-    const auto unmatched = addon::decode_import_record_result(foreign.payload, &failure);
-    require(unmatched && !unmatched->matched(), "foreign history never claims this package");
     int exit_code = -1;
     require(host.shutdown(3000, &exit_code) && exit_code == 0, "adapter shuts down cleanly");
 }

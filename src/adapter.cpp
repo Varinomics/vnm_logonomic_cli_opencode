@@ -6,7 +6,6 @@
 
 #include "logonomic_cli_addon/adapter_runtime.h"
 #include "logonomic_cli_addon/helper_ingress.h"
-#include "logonomic_cli_addon/legacy_state_import.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
 #include "logonomic_cli_addon/session_wake.h"
@@ -20,32 +19,6 @@
 namespace {
 
 namespace addon = logonomic::cli_addon;
-
-void import_history(addon::Invocation_context& context)
-{
-    addon::Contract_failure failure;
-    const auto request = addon::decode_import_record_request(context.request().payload, &failure);
-    if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-        return;
-    }
-    if (request->kind != addon::k_legacy_resume_record_kind) {
-        context.fail(addon::Result_status::UNAVAILABLE, "unknown_record_kind");
-        return;
-    }
-    const auto record = addon::decode_legacy_resume_record(request->record, &failure);
-    if (!record) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
-        return;
-    }
-    addon::Legacy_import_result result;
-    if (record->provider_id == "opencode") {
-        auto converted = addon::Json_value::object();
-        converted.set("provider_session_id", addon::Json_value(record->provider_session_id));
-        result = *addon::Legacy_import_result::from_conversion(addon::encode_legacy_resume_conversion(converted));
-    }
-    context.succeed(addon::encode_import_record_result(result));
-}
 
 void discover(addon::Invocation_context& context)
 {
@@ -100,10 +73,6 @@ void invoke(addon::Invocation_context& context)
             addon::acknowledge_profile_storage(context);
         }
         else
-        if (request.capability.capability_id == "legacy-state-import" && request.operation == "import_record") {
-            import_history(context);
-        }
-        else
         if (request.capability.capability_id == "lifecycle-events" ||
             request.capability.capability_id == "helper-ingress" ||
             request.capability.capability_id == addon::k_attention_kind_capability_id)
@@ -155,7 +124,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 2},
         {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
-        {"legacy-state-import", 1}, {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+        {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"interactive-resume", 2},
         {"session-wake", 1},
     };
