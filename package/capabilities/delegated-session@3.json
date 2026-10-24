@@ -1,6 +1,6 @@
 {
-  "capability_id": "structured-session",
-  "version": 2,
+  "capability_id": "delegated-session",
+  "version": 3,
   "payload": {
     "purposes": [
       "implementation"

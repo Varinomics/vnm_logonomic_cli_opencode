@@ -86,7 +86,7 @@ void invoke(addon::Invocation_context& context)
         else
         if (request.capability.capability_id == "structured-session" && request.operation == "inspect") {
             addon::Contract_failure failure;
-            const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 2);
+            const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
             if (!inspection) {
                 context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
                 return;
@@ -95,7 +95,7 @@ void invoke(addon::Invocation_context& context)
                 context.fail(addon::Result_status::UNAVAILABLE, "purpose_unavailable");
                 return;
             }
-            auto result = addon::encode_structured_inspect_result(opencode::inspect_acp(inspection->inspection), 2);
+            auto result = addon::encode_structured_inspect_result(opencode::inspect_acp(inspection->inspection));
             if (!addon::validate_session_exchange_payload(result, &failure)) {
                 context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
                 return;
@@ -122,8 +122,8 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
-        {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 2},
-        {"delegated-session", 2}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},
+        {"delegated-session", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"interactive-resume", 2},
         {"session-wake", 1},

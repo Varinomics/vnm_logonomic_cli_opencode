@@ -1,6 +1,6 @@
 {
   "capability_id": "lifecycle-events",
-  "version": 1,
+  "version": 2,
   "payload": {
     "profile_id": "opencode-events-v1-live-wire",
     "features": {

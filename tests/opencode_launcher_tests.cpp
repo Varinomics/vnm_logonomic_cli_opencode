@@ -199,12 +199,12 @@ int main(int argc, char** argv)
     delegated.control.servers.push_back({"control", program_text, {"task_status"},
         {{"VNM_CONTROL_TOKEN", "opencode-host-authority-canary"}}});
     Context prepared;
-    prepared.invocation = {"connection", {"delegated-session", 2}, "prepare",
-        addon::encode_delegated_prepare_request(delegated, 2)};
+    prepared.invocation = {"connection", {"delegated-session", 3}, "prepare",
+        addon::encode_delegated_prepare_request(delegated)};
     opencode::handle_preparation(prepared);
     addon::Contract_failure failure;
     const auto result = prepared.payload
-        ? addon::decode_delegated_prepare_result(*prepared.payload, &failure, 2) : std::nullopt;
+        ? addon::decode_delegated_prepare_result(*prepared.payload, &failure) : std::nullopt;
     if (!result) {
         std::cerr << "Delegated preparation: " << prepared.reason << ' ' << failure.reason_code << '\n';
     }
@@ -258,7 +258,7 @@ int main(int argc, char** argv)
     delegated.control.connection.reset();
     Context refused;
     refused.invocation = prepared.invocation;
-    refused.invocation.payload = addon::encode_delegated_prepare_request(delegated, 2);
+    refused.invocation.payload = addon::encode_delegated_prepare_request(delegated);
     opencode::handle_preparation(refused);
     check(!refused.payload && refused.reason == "task_server_connection_unavailable",
         "missing connection refuses delegation before native probing");
