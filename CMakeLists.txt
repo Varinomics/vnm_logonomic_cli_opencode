@@ -54,6 +54,7 @@ endfunction()
 add_library(opencode_provider STATIC
     src/opencode_acp.cpp
     src/opencode_launcher.cpp
+    src/opencode_launcher_approval.cpp
     src/opencode_lifecycle.cpp
     src/opencode_wake.cpp
     src/opencode_preparation.cpp)

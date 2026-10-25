@@ -1,10 +1,12 @@
 #include "opencode_acp.h"
 #include "opencode_launcher.h"
+#include "opencode_launcher_approval.h"
 #include "opencode_lifecycle.h"
 #include "opencode_preparation.h"
 #include "opencode_wake.h"
 
 #include "logonomic_cli_addon/adapter_runtime.h"
+#include "logonomic_cli_addon/capability_ids.h"
 #include "logonomic_cli_addon/helper_ingress.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
@@ -52,6 +54,10 @@ void invoke(addon::Invocation_context& context)
 {
     const auto& request = context.request();
     try {
+        if (request.capability.capability_id == addon::k_launcher_approval_capability_id) {
+            addon::handle_launcher_approval(context, opencode::launcher_approval_rules());
+        }
+        else
         if (request.capability.capability_id == "launcher-discovery") {
             if (request.operation == addon::k_discover_operation) {
                 discover(context);
@@ -121,6 +127,7 @@ int main()
     options.adapter_name    = "opencode-addon";
     options.adapter_version = "1.0.0";
     options.capabilities = {
+        {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},
         {"delegated-session", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},

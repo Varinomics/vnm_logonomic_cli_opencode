@@ -1,4 +1,5 @@
 #include "opencode_launcher.h"
+#include "opencode_launcher_approval.h"
 #include "opencode_preparation.h"
 #include "opencode_acp.h"
 
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <string>
 #include <thread>
 
 #ifndef _WIN32
@@ -33,6 +35,76 @@ int failures = 0;
 void check(bool condition, const char* name)
 {
     if (!condition) { std::cerr << "FAIL " << name << '\n'; ++failures; }
+}
+
+void launcher_approval_contract()
+{
+    const auto& rules = opencode::launcher_approval_rules();
+    const auto yolo = addon::Launcher_approval_action::YOLOFY;
+    const auto undo = addon::Launcher_approval_action::UNYOLOFY;
+    const auto changed = addon::Launcher_approval_disposition::CHANGED;
+    const auto windows = addon::transform_launcher_approval({
+        {"opencode", "powershell", ""}, "windows-x86_64", yolo}, rules);
+    check(windows.disposition == changed && windows.script_body == "opencode --auto",
+        "discovered Windows OpenCode launcher supports Yolofy");
+    const std::string options = R"( --agent build --prompt "keep --yolo and --auto as text")";
+    const std::string configured = "opencode" + options;
+    const auto comparison = addon::launcher_approval_comparison_key(
+        {{configured, "direct", "PROFILE=work"}, "linux-x86_64"}, rules);
+    for (const auto* alias : {"--yolo", "--dangerously-skip-permissions"}) {
+        const std::string source = std::string("opencode ") + alias + options;
+        const auto enabled = addon::transform_launcher_approval(
+            {{source, "direct", "PROFILE=work"}, "linux-x86_64", yolo}, rules);
+        check(enabled.disposition == changed && enabled.script_body == "opencode --auto" + options,
+            "OpenCode bypass aliases normalize while custom options survive");
+        const auto repeated = addon::transform_launcher_approval(
+            {{enabled.script_body, "direct", "PROFILE=work"}, "linux-x86_64", yolo}, rules);
+        check(repeated.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+            repeated.script_body == enabled.script_body, "OpenCode alias normalization is idempotent");
+        const auto disabled = addon::transform_launcher_approval(
+            {{source, "direct", "PROFILE=work"}, "linux-x86_64", undo}, rules);
+        check(disabled.disposition == changed && disabled.script_body == configured,
+            "Unyolofy removes the OpenCode bypass alias and preserves prompt text");
+        const auto removed_again = addon::transform_launcher_approval(
+            {{disabled.script_body, "direct", "PROFILE=work"}, "linux-x86_64", undo}, rules);
+        check(removed_again.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+            removed_again.script_body == configured, "OpenCode alias removal is idempotent");
+        const auto alias_comparison = addon::launcher_approval_comparison_key(
+            {{source, "direct", "PROFILE=work"}, "linux-x86_64"}, rules);
+        check(comparison.supported && alias_comparison.supported && comparison.key == alias_comparison.key,
+            "OpenCode aliases retain the same rescan identity");
+    }
+    for (const auto* negation : {"--no-auto", "--no-yolo", "--no-dangerously-skip-permissions"}) {
+        const std::string source = std::string("opencode ") + negation + options;
+        const auto enabled = addon::transform_launcher_approval(
+            {{source, "direct", ""}, "linux-x86_64", yolo}, rules);
+        check(enabled.disposition == changed && enabled.script_body == "opencode --auto" + options,
+            "Yolofy replaces the understood OpenCode bypass negation");
+        const auto disabled = addon::transform_launcher_approval(
+            {{source, "direct", ""}, "linux-x86_64", undo}, rules);
+        check(disabled.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+            disabled.script_body == source, "Unyolofy preserves an explicit OpenCode bypass negation");
+    }
+    const auto run = addon::transform_launcher_approval({
+        {R"(opencode run --model provider/model "explain --auto")", "direct", ""},
+        "linux-x86_64", yolo}, rules);
+    check(run.disposition == changed &&
+        run.script_body == R"(opencode run --auto --model provider/model "explain --auto")",
+        "OpenCode run receives auto mode while its model and prompt remain unchanged");
+    const auto removed = addon::transform_launcher_approval({
+        {run.script_body, "direct", ""}, "linux-x86_64", undo}, rules);
+    check(removed.disposition == changed &&
+        removed.script_body == R"(opencode run --model provider/model "explain --auto")",
+        "Unyolofy preserves flag-like text in an OpenCode prompt");
+    const std::string prompt = R"(opencode --prompt "--auto")";
+    const auto literal = addon::transform_launcher_approval({
+        {prompt, "direct", ""}, "linux-x86_64", undo}, rules);
+    check(literal.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
+        literal.script_body == prompt, "OpenCode prompt option operands are not flags");
+    const auto management = addon::transform_launcher_approval({
+        {"opencode auth login", "direct", ""}, "linux-x86_64", yolo}, rules);
+    check(management.disposition == addon::Launcher_approval_disposition::UNSUPPORTED,
+        "OpenCode account management remains unchanged");
 }
 
 class Context final : public addon::Invocation_context
@@ -87,6 +159,7 @@ int main(int argc, char** argv)
         std::cout << (version ? version : "1.18.25") << '\n';
         return 0;
     }
+    launcher_approval_contract();
     for (const char* script : {
             "opencode --model openai/gpt-5", "npx -y opencode-ai@latest --version",
             "bunx --bun opencode-ai", "call opencode.cmd", "exec opencode",
