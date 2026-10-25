@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -96,11 +97,61 @@ void launcher_approval_contract()
     check(removed.disposition == changed &&
         removed.script_body == R"(opencode run --model provider/model "explain --auto")",
         "Unyolofy preserves flag-like text in an OpenCode prompt");
-    const std::string prompt = R"(opencode --prompt "--auto")";
+    const std::string prompt = R"(opencode --prompt="--auto")";
     const auto literal = addon::transform_launcher_approval({
         {prompt, "direct", ""}, "linux-x86_64", undo}, rules);
     check(literal.disposition == addon::Launcher_approval_disposition::UNCHANGED &&
-        literal.script_body == prompt, "OpenCode prompt option operands are not flags");
+        literal.script_body == prompt, "OpenCode attached prompt option operands are not flags");
+    // Oracle: the standalone yargs parser embedded in OpenCode 1.18.33, with
+    // its TUI option declarations: --prompt --auto enables auto; --auto false disables it.
+    for (const auto* script : {
+            R"(opencode --prompt "--auto")", "opencode --auto false",
+            "opencode --yolo true", "opencode --continue false",
+            "opencode --continue --auto false", "opencode --session --auto session-id"})
+    {
+        for (const auto action : {yolo, undo}) {
+            const auto result = addon::transform_launcher_approval({
+                {script, "direct", ""}, "linux-x86_64", action}, rules);
+            const auto unsupported_key = addon::launcher_approval_comparison_key({
+                {script, "direct", ""}, "linux-x86_64"}, rules);
+            check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+                result.script_body.empty() && !unsupported_key.supported,
+                "ambiguous native OpenCode option operands are preserved as unsupported");
+        }
+    }
+    for (const auto* script : {"opencode false", "opencode run false"}) {
+        const auto result = addon::transform_launcher_approval({
+            {script, "direct", ""}, "linux-x86_64", yolo}, rules);
+        check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+            result.script_body.empty(), "Yolofy cannot turn an OpenCode positional prompt into a boolean operand");
+    }
+    const auto delimited = addon::transform_launcher_approval({
+        {"opencode -- false", "direct", ""}, "linux-x86_64", yolo}, rules);
+    check(delimited.disposition == changed && delimited.script_body == "opencode --auto -- false",
+        "an explicit delimiter preserves the OpenCode false prompt while enabling auto mode");
+    // OpenCode's run builder declares --title as a string with an optional
+    // value: removing the intervening approval flag would capture the prompt.
+    const auto title_prompt = addon::transform_launcher_approval({
+        {"opencode run --title --auto prompt", "direct", ""}, "linux-x86_64", undo}, rules);
+    check(title_prompt.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+        title_prompt.script_body.empty(), "Unyolofy cannot turn an OpenCode prompt into a title");
+    for (const auto action : {yolo, undo}) {
+        const auto result = addon::transform_launcher_approval({
+            {"opencode run --title --yolo prompt", "direct", ""}, "linux-x86_64", action}, rules);
+        check(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+            result.script_body.empty(), "replacing OpenCode approval aliases preserves title operand ownership");
+    }
+    const std::pair<const char*, const char*> title_cases[]{
+        {"opencode run --title --auto -- prompt", "opencode run --title -- prompt"},
+        {"opencode run --title=label --auto prompt", "opencode run --title=label prompt"},
+        {"opencode run --title label --auto prompt", "opencode run --title label prompt"},
+    };
+    for (const auto& [before, after] : title_cases) {
+        const auto result = addon::transform_launcher_approval({
+            {before, "direct", ""}, "linux-x86_64", undo}, rules);
+        check(result.disposition == changed && result.script_body == after,
+            "delimiters and bound OpenCode title values keep their native operand ownership");
+    }
     const auto management = addon::transform_launcher_approval({
         {"opencode auth login", "direct", ""}, "linux-x86_64", yolo}, rules);
     check(management.disposition == addon::Launcher_approval_disposition::UNSUPPORTED,

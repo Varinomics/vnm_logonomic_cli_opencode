@@ -23,6 +23,8 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
             "session", "stats", "export", "import", "web", "acp", "plugin", "pr", "db",
             "debug", "uninstall", "upgrade", "help",
         },
+        .value_arguments_consume_options = false,
+        .flag_arguments_consume_booleans = true,
     };
     return rules;
 }
