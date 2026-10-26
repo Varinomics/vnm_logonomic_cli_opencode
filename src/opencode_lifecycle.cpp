@@ -1,5 +1,7 @@
 #include "opencode_lifecycle.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
@@ -42,6 +44,25 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const auto body_name = metadata(body, "event");
     if (!body_name || *body_name != name) {
         return std::nullopt;
+    }
+    if (request.context_failure) {
+        result.context_failure = addon::Context_failure{
+            metadata(body, "session_id").value_or(""), *request.context_failure};
+    }
+    if (name == "message.updated" || name == "session.compacted") {
+        if (request.context_state_version != addon::k_context_state_capability_version ||
+            !request.ledger.current_transition)
+        {
+            return result;
+        }
+        addon::decode_context_updates(body, result.context_updates, result.context_failure);
+        for (const auto& update : result.context_updates) {
+            if (update.provider_session_id != request.ledger.current_transition->provider_session_id) {
+                result.context_updates.clear();
+                break;
+            }
+        }
+        return result;
     }
     if (name == "logonomic.delivery_overflow") {
         result.lifecycle_degradation = addon::Lifecycle_degradation{};

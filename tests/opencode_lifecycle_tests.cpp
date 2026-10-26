@@ -1,6 +1,7 @@
 #include "opencode_lifecycle.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
@@ -54,12 +55,14 @@ public:
         m_status   = addon::Result_status::SUCCESS;
         m_payload  = std::move(payload);
     }
-    void fail(addon::Result_status status, std::string, std::string) override
+    void fail(addon::Result_status status, std::string reason, std::string) override
     {
         m_finished = true;
         m_status   = status;
+        m_failure_reason = std::move(reason);
     }
     addon::Result_status status() const { return m_status; }
+    const std::string& failure_reason() const { return m_failure_reason; }
     std::optional<addon::Classify_event_result> result() const
     {
         addon::Contract_failure failure;
@@ -70,6 +73,7 @@ private:
     addon::Invoke_request m_request;
     addon::Json_value m_payload;
     addon::Result_status m_status = addon::Result_status::FAILED;
+    std::string m_failure_reason;
     bool m_finished  = false;
     bool m_cancelled = false;
 };
@@ -102,10 +106,108 @@ addon::Classify_event_result classify(const addon::Classify_event_request& reque
 {
     Classification_call call(request);
     opencode::handle_lifecycle(call);
+    if (call.status() != addon::Result_status::SUCCESS) {
+        std::cerr << request.event.name << ": " << call.failure_reason() << '\n';
+    }
     require(call.finished() && call.status() == addon::Result_status::SUCCESS, "classification must succeed");
     auto result = call.result();
     require(result.has_value(), "result must satisfy the public SDK codec");
     return *result;
+}
+
+void context_observations(const std::filesystem::path& package)
+{
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(
+        addon::sidecar_relative_path(addon::k_context_state_capability_id, addon::k_context_state_capability_version),
+        addon::limits::k_max_sidecar_bytes,
+        nullptr);
+    require(bytes && addon::parse_sidecar(*bytes, nullptr).has_value(),
+        "the package declares the negotiated context capability");
+
+    addon::Context_update usage;
+    usage.provider_session_id = "session-primary";
+    usage.event_id            = "evt-native-step";
+    usage.used_tokens         = 1330;
+    usage.context_window      = 4000;
+    auto request = event("message.updated");
+    addon::encode_context_updates(request.event.body, {usage});
+    require(classify(request).context_updates.empty(), "context telemetry requires explicit negotiation");
+    request.context_state_version = addon::k_context_state_capability_version;
+    const auto measured = classify(request);
+    require(measured.classification == addon::Classification::IGNORED && measured.observations.empty() &&
+            measured.context_updates.size() == 1 && measured.context_updates.front().used_tokens == 1330 &&
+            measured.context_updates.front().context_window == 4000,
+        "native context measurements supplement the existing helper result");
+    Classification_call attention(addon::Attention_classification_request{request, std::nullopt});
+    opencode::handle_lifecycle(attention);
+    require(attention.attention_result() && attention.attention_result()->base.context_updates.size() == 1,
+        "attention companion classification preserves negotiated context");
+
+    addon::Context_state state;
+    addon::apply_context_update(state, measured.context_updates.front());
+    addon::Context_update compacted;
+    compacted.provider_session_id = "session-primary";
+    compacted.event_id            = "evt-native-compaction";
+    compacted.compacted           = true;
+    request.event.name = "session.compacted";
+    request.event.body.set("event", addon::Json_value(request.event.name));
+    addon::encode_context_updates(request.event.body, {compacted});
+    const auto completion = classify(request);
+    require(completion.context_updates.size() == 1 && completion.context_updates.front().compacted &&
+            completion.context_updates.front().event_id == compacted.event_id,
+        "successful native compaction identity survives classification");
+    addon::apply_context_update(state, completion.context_updates.front());
+    require(state.compaction_count == 1 && !state.compaction_count_complete && !state.used_tokens,
+        "successful event clears occupancy without inventing complete history");
+    addon::apply_context_update(state, usage);
+    addon::apply_context_update(state, completion.context_updates.front());
+    require(state.compaction_count == 1 && state.used_tokens == 1330,
+        "redelivery after usage neither counts nor clears usage again");
+
+    request.ledger.current_transition->provider_session_id = "session-other";
+    require(classify(request).context_updates.empty(), "context belongs to the exact active provider session");
+    request.ledger.current_transition.reset();
+    request.ledger.current_epoch = 0;
+    require(classify(request).context_updates.empty(), "context cannot create a session transition");
+
+    auto malformed = event("message.updated");
+    malformed.context_state_version = addon::k_context_state_capability_version;
+    addon::encode_context_updates(malformed.event.body, {usage});
+    auto& invalid_update = malformed.event.body.find("context_updates")->as_array().front();
+    invalid_update.set("used_tokens", addon::Json_value((std::int64_t)-1));
+    const auto rejected_context = classify(malformed);
+    require(rejected_context.context_updates.empty() && rejected_context.context_failure &&
+            rejected_context.context_failure->provider_session_id == "session-primary",
+        "malformed optional context reports its own failure through the shared result codec");
+    invalid_update.set("provider_session_id", addon::Json_value("session-retired"));
+    const auto retired = classify(malformed);
+    require(retired.context_failure && retired.context_failure->provider_session_id == "session-retired",
+        "a malformed native event retains its source session instead of borrowing the active ledger");
+    invalid_update.erase("provider_session_id");
+    const auto unscoped = classify(malformed);
+    require(unscoped.context_failure && unscoped.context_failure->provider_session_id.empty(),
+        "a failure without native session evidence remains unscoped");
+    invalid_update.set("provider_session_id", addon::Json_value("session-primary"));
+    auto other_source = invalid_update;
+    other_source.set("provider_session_id", addon::Json_value("session-retired"));
+    malformed.event.body.find("context_updates")->push_back(std::move(other_source));
+    const auto mixed = classify(malformed);
+    require(mixed.context_failure && mixed.context_failure->provider_session_id.empty(),
+        "mixed update sources cannot borrow the outer native body's identity");
+    malformed.event.body.set("context_updates", addon::Json_value("invalid"));
+    const auto invalid_envelope = classify(malformed);
+    require(invalid_envelope.context_failure && invalid_envelope.context_failure->provider_session_id.empty(),
+        "a malformed optional envelope cannot acquire session authority");
+
+    auto status = event("session.status");
+    status.context_state_version = 999;
+    status.event.body.set("status_type", addon::Json_value("busy"));
+    status.event.body.set("context_updates", addon::Json_value("invalid"));
+    const auto unsupported = classify(status);
+    require(unsupported.observations.front().phase_transition == addon::Phase_transition::WORKING &&
+            unsupported.context_failure && unsupported.context_failure->provider_session_id == "session-primary",
+        "unsupported optional telemetry cannot discard a valid native lifecycle fact");
 }
 
 // Oracle: the host's feature gate. It rejects an observation carrying a fact
@@ -183,6 +285,7 @@ int main(int argc, char** argv)
 {
     require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
+    context_observations(addon::path_from_utf8(argv[1]));
     for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
         auto request = event(name);
         request.event.body.set("question_id", addon::Json_value("que_native_question"));

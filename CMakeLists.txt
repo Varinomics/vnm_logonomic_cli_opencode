@@ -124,6 +124,10 @@ add_test(NAME opencode_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"
     "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
+add_test(NAME opencode_context_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_context_plugin_tests.mjs"
+    "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"
+    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
 add_test(NAME opencode_helper_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_helper_tests.mjs"
     "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
@@ -141,7 +145,8 @@ add_test(NAME opencode_package_conformance COMMAND logonomic_cli_addon_conforman
     "${OPENCODE_PACKAGE_DIRECTORY}")
 set_tests_properties(
     opencode_preparation_tests opencode_acp_tests opencode_lifecycle_tests opencode_launcher_tests
-    opencode_plugin_tests opencode_helper_tests opencode_helper_cancellation_tests opencode_wake_plugin_tests
+    opencode_plugin_tests opencode_context_plugin_tests opencode_helper_tests
+    opencode_helper_cancellation_tests opencode_wake_plugin_tests
     opencode_package_validation opencode_package_conformance
     PROPERTIES TIMEOUT 120)
 

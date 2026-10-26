@@ -22,7 +22,7 @@ const sessionDiffCancellationHelperMilliseconds = 1000
 // five more seconds before its artifact guard runs.
 const sessionDiffCooperativeCancellationMilliseconds = 11000
 const sessionDiffTreeReapMilliseconds = 5000
-// session.deleted may emit degradation followed by deletion; no item emits more.
+// Deletion and assistant updates can each emit two independent deliveries.
 const maxProjectedDeliveriesPerItem = 2
 const clientLookupTimeoutMilliseconds = 250
 const deliveryReapTimeoutMilliseconds = 500
@@ -60,6 +60,41 @@ const metadata = (value) =>
   !/[\0\r\n]/.test(value)
     ? value
     : undefined
+
+const context_identity = (value) => {
+  const text = metadata(value)
+  return text && !/[\u0000-\u001f]/.test(text) &&
+    Buffer.byteLength(text, "utf8") <= maxMetadataCharacters
+    ? text : undefined
+}
+
+const context_count = (value) => Number.isSafeInteger(value) && value >= 0
+
+const context_sample = (event) => {
+  const info = event.properties?.info
+  const compacted = event.type === "session.compacted"
+  if (!compacted && (info?.role !== "assistant" || info.summary === true)) return
+  const provider_session_id = context_identity(compacted
+    ? event.properties?.sessionID : info.sessionID)
+  const event_id = context_identity(event.id)
+  if (!provider_session_id || !event_id) return
+  if (compacted) return { provider_session_id, event_id, compacted: true }
+
+  // Native assistant usage is replaced at each step. Its cache and reasoning
+  // components are disjoint from input/output; billing totals are unrelated.
+  const tokens = info.tokens
+  const components = [tokens?.input, tokens?.output, tokens?.reasoning,
+    tokens?.cache?.read, tokens?.cache?.write]
+  const used_tokens = components.every(context_count)
+    ? components.reduce((total, value) => total + value, 0) : undefined
+  if (used_tokens === 0) return
+  return {
+    provider_session_id, event_id,
+    provider_id: metadata(info.providerID),
+    model_id: metadata(info.modelID),
+    ...(context_count(used_tokens) ? { used_tokens } : { usage_unavailable: true }),
+  }
+}
 
 const millisecondsUntil = (deadline) =>
   Math.max(0, deadline - Date.now())
@@ -457,6 +492,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const sessionRecords = new Map()
   const activeChildRuns = new Map()
   const stoppedChildRuns = new Map()
+  const context_samples = new Map()
   const pendingItems = []
   const lookupControllers = new Set()
   const lookupPromises = new Set()
@@ -471,6 +507,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   let disposePromise
   let sessionDiffDisposalStarted = false
   let incompleteDrainReported = false
+  let context_model
 
   const evictInactiveChildSession = () => {
     for (const [childSessionID, record] of sessionRecords) {
@@ -533,6 +570,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     pendingRootTurns.delete(sessionID)
     degradedRootSessions.delete(sessionID)
     activeChildRuns.delete(sessionID)
+    context_samples.delete(sessionID)
   }
 
   const clearRootCorrelationState = (sessionID) => {
@@ -540,6 +578,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     degradedRootSessions.delete(sessionID)
+    context_samples.delete(sessionID)
   }
 
   const classifiedSessionKind = (sessionID) =>
@@ -614,8 +653,8 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
 
   // A null timeout waits until the lookup settles or disposal aborts it.
-  const sessionInfo = async (
-    sessionID,
+  const lookup_client = async (
+    lookup,
     timeoutMilliseconds = clientLookupTimeoutMilliseconds,
   ) => {
     if (!lookupsAllowed || deliveryCutoffReached) return
@@ -624,10 +663,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     let timeout
     let abort
     const settled = Promise.resolve()
-      .then(() => client.session.get({
-        path: { id: sessionID },
-        signal: controller.signal,
-      }))
+      .then(() => lookup(controller.signal))
       .then(
         (response) => ({ response }),
         () => ({}),
@@ -657,6 +693,50 @@ export const Logonomic = async ({ client }, options = {}) => {
       controller.signal.removeEventListener("abort", abort)
       lookupControllers.delete(controller)
       lookupPromises.delete(completion)
+    }
+  }
+
+  const sessionInfo = (sessionID, timeoutMilliseconds = clientLookupTimeoutMilliseconds) =>
+    lookup_client((signal) => client.session.get({
+      path: { id: sessionID }, signal,
+    }), timeoutMilliseconds)
+
+  const native_context_window = async ({ provider_id, model_id }) => {
+    if (!provider_id || !model_id) return
+    if (context_model?.provider_id === provider_id && context_model.model_id === model_id) {
+      return context_model.window
+    }
+    const providers = await lookup_client((signal) => client.provider.list({ signal }))
+    const provider = Array.isArray(providers?.all)
+      ? providers.all.find((item) => item?.id === provider_id) : undefined
+    const window = provider?.models?.[model_id]?.limit?.context
+    if (!context_count(window) || window === 0) return
+    context_model = { provider_id, model_id, window }
+    return window
+  }
+
+  const project_context = async (name, sample) => {
+    if (!sample || classifiedSessionKind(sample.provider_session_id) !== "root") return
+    if (sample.compacted) {
+      context_samples.delete(sample.provider_session_id)
+      return { event: name, session_id: sample.provider_session_id, context_updates: [sample] }
+    }
+    const window = sample.usage_unavailable ? undefined : await native_context_window(sample)
+    const previous = context_samples.get(sample.provider_session_id)
+    if (previous && previous.used_tokens === sample.used_tokens &&
+        previous.usage_unavailable === sample.usage_unavailable &&
+        previous.provider_id === sample.provider_id && previous.model_id === sample.model_id &&
+        previous.window === window) return
+    context_samples.set(sample.provider_session_id, { ...sample, window })
+    return {
+      event: name,
+      session_id: sample.provider_session_id,
+      context_updates: [{
+        provider_session_id: sample.provider_session_id,
+        event_id: sample.event_id,
+        ...(sample.usage_unavailable ? { usage_unavailable: true } : { used_tokens: sample.used_tokens }),
+        ...(window !== undefined ? { context_window: window } : {}),
+      }],
     }
   }
 
@@ -1298,6 +1378,14 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (item.kind === "chat.message") return projectChatMessage(item)
     if (item.kind === "completed_text") return project_completed_text(item)
     if (item.kind === "resumed") return projectResumedSession(item)
+    if (item.event.type === "session.compacted") {
+      return project_context(item.event.type, item.context_sample)
+    }
+    if (item.event.type === "message.updated") {
+      const lifecycle = await projectEvent(item.event)
+      const context = await project_context(item.event.type, item.context_sample)
+      return lifecycle && context ? [lifecycle, context] : lifecycle ?? context
+    }
     return projectEvent(item.event)
   }
 
@@ -1474,6 +1562,7 @@ export const Logonomic = async ({ client }, options = {}) => {
         activeChildRuns.clear()
         stoppedChildRuns.clear()
         sessionRecords.clear()
+        context_samples.clear()
       }
     })()
     return disposePromise
@@ -1483,6 +1572,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     "session.created",
     "session.updated",
     "session.deleted",
+    "session.compacted",
     "message.updated",
     "session.status",
     "session.idle",
@@ -1526,7 +1616,10 @@ export const Logonomic = async ({ client }, options = {}) => {
             } : {}),
           } }
         }
-        enqueue({ kind: "event", event })
+        enqueue({ kind: "event", event,
+          ...(["message.updated", "session.compacted"].includes(event.type)
+            ? { context_sample: context_sample(event) } : {}),
+        })
       }
     } catch {
       // The editor lifecycle must not depend on Logonomic availability.

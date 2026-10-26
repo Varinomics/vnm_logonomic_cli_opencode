@@ -132,6 +132,7 @@ int main()
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},
         {"delegated-session", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+        {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {"interactive-resume", 2},
         {"session-wake", 1},
     };
