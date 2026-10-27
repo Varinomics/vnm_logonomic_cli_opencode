@@ -150,6 +150,18 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));
     request.launcher_argv = {"opencode"};
     request.session_wake = addon::Session_wake_offer{};
+    const auto valid_environment = request.launch_environment->effective_environment;
+    for (const char* invalid : {"[]", "{/*", "{\"instructions\":false}",
+             "{\"instructions\":[3]}", "{\"plugin\":false}", "{\"plugin\":[[\"private-sentinel\",false]]}"})
+    {
+        request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(invalid));
+        const auto rejected = invoke(host, {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3));
+        require(rejected.status == addon::Host_status::FAILED && rejected.reason_code == "opencode_settings_invalid",
+            "invalid inline settings retain their category through the adapter privacy boundary");
+        require(rejected.message.find("private-sentinel") == std::string::npos,
+            "invalid configuration contents remain private");
+    }
+    request.launch_environment->effective_environment = valid_environment;
     const auto discovered = invoke(host, {"launcher-discovery", 1}, "discover", addon::encode_discover_request(
         request.launch_environment->effective_environment, path_text(root), request.launch_environment->platform_id));
     const auto candidates = addon::decode_discover_result(discovered.payload, request.launch_environment->platform_id, &failure);

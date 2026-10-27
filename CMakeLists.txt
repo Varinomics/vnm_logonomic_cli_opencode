@@ -180,3 +180,8 @@ endif()
 # Contract and recipe tests must not be confused with real native qualification.
 get_directory_property(_provider_tests TESTS)
 set_property(TEST ${_provider_tests} APPEND PROPERTY LABELS "cli-addon;provider-contract")
+
+add_executable(opencode_error_boundary_tests tests/opencode_error_boundary_tests.cpp)
+target_link_libraries(opencode_error_boundary_tests PRIVATE opencode_provider logonomic_cli_addon_sdk::test_support)
+opencode_target(opencode_error_boundary_tests)
+add_test(NAME opencode_error_boundary_tests COMMAND opencode_error_boundary_tests)
