@@ -43,6 +43,17 @@ std::optional<std::vector<std::string>> resume_arguments(
     std::string_view                working_directory,
     std::string_view                session);
 
+// OpenCode 2 uses a shared service by default. A managed TUI owns a private
+// server so its model tools retain this launch's Logonomic mailbox authority.
+std::optional<std::vector<std::string>> tui_invocation(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    std::string_view                resume_session = {});
+
+bool uses_tui_plugin(std::string_view version);
+
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
 

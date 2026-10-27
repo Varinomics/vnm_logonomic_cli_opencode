@@ -286,6 +286,47 @@ int main(int argc, char** argv)
     require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     context_observations(addon::path_from_utf8(argv[1]));
+    auto selected = event("logonomic.session.selected", false);
+    selected.event.body.erase("turn_id");
+    selected.event.body.set("api_generation", addon::Json_value(2));
+    selected.event.body.set("status_type", addon::Json_value("running"));
+    const auto selected_observation = classify(selected).observations.front();
+    require(selected_observation.session_transition == addon::Session_transition::STARTED &&
+        selected_observation.phase_transition == addon::Phase_transition::WORKING &&
+        selected_observation.provider_turn_id.empty(),
+        "selecting an already-running native session observes its phase without inventing a turn");
+    selected.ledger.current_epoch = 2;
+    selected.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-other", std::string(32, 'f')};
+    const auto reselected = classify(selected);
+    require(reselected.classification == addon::Classification::TRANSITION &&
+        reselected.transition == addon::Transition_kind::RESUME &&
+        reselected.observations.front().provider_session_id == "session-primary",
+        "explicit native re-selection resumes a session that the host may have retired");
+    for (const auto* name : {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}) {
+        auto terminal = event(name);
+        terminal.event.body.set("api_generation", addon::Json_value(2));
+        const auto completed = classify(terminal).observations.front();
+        require(completed.phase_transition == addon::Phase_transition::AWAITING_INPUT &&
+            completed.outcome_transition != addon::Outcome_transition::NONE && completed.provider_turn_id == "turn-user",
+            "native execution outcome belongs to its observed start identity");
+        terminal.event.body.erase("turn_id");
+        const auto attached = classify(terminal).observations.front();
+        require(attached.phase_transition == addon::Phase_transition::AWAITING_INPUT &&
+            attached.outcome_transition == addon::Outcome_transition::NONE && attached.provider_turn_id.empty(),
+            "terminal events after attaching retain phase but cannot assert an outcome for an unknown turn");
+    }
+    for (const auto* name : {"form.created", "form.replied", "form.cancelled"}) {
+        auto request = event(name);
+        request.event.body.set("api_generation", addon::Json_value(2));
+        request.event.body.set("question_id", addon::Json_value("frm_native_question"));
+        request.event.body.set("answer_nonempty", addon::Json_value(true));
+        const auto observation = classify(request).observations.front();
+        require(observation.attention_request_id == "frm_native_question" &&
+            observation.attention_transition == (std::string_view(name) == "form.created"
+                ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED),
+            "native form events preserve attention identity without answer prose");
+    }
     for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
         auto request = event(name);
         request.event.body.set("question_id", addon::Json_value("que_native_question"));

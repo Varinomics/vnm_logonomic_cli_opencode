@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <thread>
@@ -206,6 +207,11 @@ int main(int argc, char** argv)
         if (mode && std::string_view(mode) == "overflow") { std::cout << std::string(70000, 'a'); return 0; }
         if (mode && std::string_view(mode) == "failed") return 1;
         if (mode && std::string_view(mode) == "frozen" && std::getenv("TEMP")) return 1;
+        if (mode && std::string_view(mode) == "installed-version") {
+            std::ifstream version(addon::path_from_utf8(argv[0]).parent_path() / "fixture.version");
+            std::cout << version.rdbuf();
+            return version ? 0 : 1;
+        }
         const char* version = std::getenv("OPENCODE_FIXTURE_VERSION");
         std::cout << (version ? version : "1.18.25") << '\n';
         return 0;
@@ -213,6 +219,7 @@ int main(int argc, char** argv)
     launcher_approval_contract();
     for (const char* script : {
             "opencode --model openai/gpt-5", "npx -y opencode-ai@latest --version",
+            "opencode2 --standalone", "npx --yes @opencode/cli@2.1.4", "bunx @opencode/cli",
             "bunx --bun opencode-ai", "call opencode.cmd", "exec opencode",
             "\"C:/Program Files/OpenCode/opencode.exe\"", "pwsh -Command \"opencode\"",
             "# comment\nopencode", "echo preparing && opencode"})
@@ -253,6 +260,30 @@ int main(int argc, char** argv)
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = fs::temp_directory_path() / ("opencode-launcher-" + std::to_string(unique));
     fs::create_directories(root);
+    const auto empty_environment = addon::Json_value::object();
+    const auto native_tui = opencode::tui_invocation({"opencode2 --auto", "direct", ""},
+        {"/opt/opencode2", "--auto"}, empty_environment, path_string(root));
+    check(native_tui == std::optional(std::vector<std::string>{"/opt/opencode2", "--auto", "--standalone"}),
+        "native TUI preparation isolates the server without changing approval policy");
+    const auto private_tui = opencode::tui_invocation({"opencode --standalone", "direct", ""},
+        {"opencode", "--standalone"}, empty_environment, path_string(root));
+    check(private_tui == std::optional(std::vector<std::string>{"opencode", "--standalone"}),
+        "an explicitly private native TUI is not rewritten twice");
+    const auto shell_tui = opencode::tui_invocation({"opencode --auto", "powershell", ""},
+        {"powershell.exe", "-NoLogo", "-Command", "opencode --auto"}, empty_environment, path_string(root));
+    check(shell_tui == std::optional(std::vector<std::string>{
+            "powershell.exe", "-NoLogo", "-Command", "opencode --auto --standalone"}),
+        "PowerShell keeps its invocation boundary while selecting the private native server");
+    for (const auto* script : {
+            "opencode run", "opencode serve", "opencode --server https://example.org", "opencode --help",
+            "opencode --wizard", "opencode --model provider/model", "opencode .."})
+    {
+        check(!opencode::tui_invocation({script, "direct", ""}, addon::literal_argv(script),
+            empty_environment, path_string(root)), "unsupported native interfaces stay unchanged");
+    }
+    check(!opencode::tui_invocation({"opencode; echo changed", "powershell", ""},
+        {"powershell.exe", "-NoLogo", "-Command", "opencode; echo changed"}, empty_environment, path_string(root)),
+        "native preparation never reconstructs a compound shell command");
 #ifdef _WIN32
     const auto program = root / "opencode.exe";
 #else
@@ -547,14 +578,19 @@ int main(int argc, char** argv)
     check(!opencode::verified_launch({quoted_script, "powershell", ""},
             {"powershell.exe", "-NoLogo", "-Command", quoted_script}, shell_environment, path_string(root), false, context),
         "PowerShell evaluates a quoted path as a string, not a launch");
-    // An npm installation of OpenCode 1.18.25 whose shim prints `shim_version`.
+    // An npm installation of OpenCode 1.18.25 whose selected shim runs
+    // the native fixture with `shim_version`, exercising shell-owned evidence.
+    const auto npm_script = [](const char* version) {
+        return std::string("@echo off\r\nset OPENCODE_FIXTURE_VERSION=") + version +
+            "\r\n\"%~dp0\\node_modules\\opencode-ai\\bin\\opencode.exe\" %*\r\n";
+    };
     const auto npm_installation = [&](const char* name, const char* shim_version) {
         const auto directory = root / name;
         fs::create_directories(directory / "node_modules" / "opencode-ai" / "bin");
         fs::copy_file(program, directory / "node_modules" / "opencode-ai" / "bin" / "opencode.exe");
         std::ofstream(directory / "node_modules" / "opencode-ai" / "package.json", std::ios::binary)
             << R"({"name":"opencode-ai","version":"1.18.25","bin":{"opencode":"bin/opencode.exe"}})";
-        std::ofstream(directory / "opencode.cmd", std::ios::binary) << "@echo " << shim_version << "\r\n";
+        std::ofstream(directory / "opencode.cmd", std::ios::binary) << npm_script(shim_version);
         auto environment = shell_environment;
         environment.set("PATH", addon::Json_value(path_string(directory) + ";" + powershell_directory));
         return environment;
@@ -570,7 +606,7 @@ int main(int argc, char** argv)
         "a PowerShell shim that runs the located installation");
     const auto cached_shim = root / "cached" / "opencode.cmd";
     const auto written = fs::last_write_time(cached_shim);
-    std::ofstream(cached_shim, std::ios::binary | std::ios::trunc) << "@echo 1.18.10\r\n";
+    std::ofstream(cached_shim, std::ios::binary | std::ios::trunc) << npm_script("1.18.10");
     fs::last_write_time(cached_shim, written);
     check(!opencode::verified_launch(shell_launcher, shell_argv, cached_environment, path_string(root), false, context),
         "PowerShell evidence is probed again for every launch");
@@ -635,6 +671,132 @@ int main(int argc, char** argv)
     else unsetenv("TEMP");
 #endif
     effective.erase("OPENCODE_FIXTURE_MODE");
+    // Oracle: OpenCode 2.1.4's public CLI, plugin directory and synthetic inbox
+    // contracts. Its server and TUI configuration arrays have different folds.
+    interactive.launcher = launcher;
+    interactive.launcher_argv = {program_text};
+    interactive.launch_environment->effective_environment = launch_environment;
+    interactive.launch_environment->effective_environment.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("2.1.4"));
+    interactive.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(
+        R"({"plugins":[{"package":"existing-server-plugin","options":{"enabled":true}}],"instructions":["user.md"]})"));
+    interactive.launch_environment->effective_environment.set("OPENCODE_CLI_CONFIG_CONTENT", addon::Json_value(
+        R"({"plugins":["existing-tui-plugin"],"theme":"user-theme"})"));
+    interactive.declared_assets.push_back("assets/opencode_tui/tui.mjs");
+    interactive.session_wake = addon::Session_wake_offer{};
+    const char* package_root = std::getenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
+    const std::optional<std::string> saved_package_root = package_root ? std::optional(std::string(package_root)) : std::nullopt;
+#ifdef _WIN32
+    _putenv_s("LOGONOMIC_ADDON_PACKAGE_ROOT", path_string(root).c_str());
+#else
+    setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", path_string(root).c_str(), 1);
+#endif
+    const auto tui_patch = prepare_interactive();
+    check(tui_patch && tui_patch->argv == std::optional(std::vector<std::string>{program_text, "--standalone"}) &&
+        tui_patch->session_wake && tui_patch->session_wake->available && lifecycle_reported(tui_patch) == true,
+        "verified OpenCode 2 prepares live TUI wake in a private native server");
+    if (tui_patch) {
+        check(std::none_of(tui_patch->set.begin(), tui_patch->set.end(),
+                [](const auto& value) { return value.first == "OPENCODE_CLI_CONFIG_CONTENT"; }),
+            "native TUI discovery preserves the user's cli.json and inline plugin list");
+        const auto configured = std::find_if(tui_patch->set.begin(), tui_patch->set.end(),
+            [](const auto& value) { return value.first == "OPENCODE_CONFIG_CONTENT"; });
+        const auto config = configured == tui_patch->set.end() ? std::nullopt : addon::parse_json(configured->second, {}, nullptr);
+        check(config && config->find("plugins")->as_array().size() == 2 &&
+            config->find("plugins")->as_array().front().find("package")->as_string() == "existing-server-plugin" &&
+            config->find("instructions")->as_array().front().as_string() == "user.md" && !config->find("plugin"),
+            "native server configuration appends the managed directory and preserves existing configuration");
+        if (config) {
+            std::ifstream instruction(addon::path_from_utf8(config->find("instructions")->as_array().back().as_string()));
+            const std::string text{std::istreambuf_iterator<char>(instruction), {}};
+            check(text == interactive.title_instruction, "native TUI instructions do not advertise unadapted tools");
+        }
+    }
+    resume.context.launcher = interactive.launcher;
+    resume.context.launcher_argv = interactive.launcher_argv;
+    resume.context.launch_environment = interactive.launch_environment;
+    resume.context.declared_assets = interactive.declared_assets;
+    resume.context.session_wake = addon::Session_wake_offer{};
+    const auto native_resume = prepare_resume(nullptr);
+    check(native_resume && native_resume->process.argv ==
+        std::vector<std::string>{"--standalone", "--session", resumed_session} &&
+        native_resume->patch.session_wake && native_resume->patch.session_wake->available,
+        "native TUI resume owns a fresh private bridge and the exact stored session");
+    interactive.launcher.script_body += " --server https://example.org";
+    interactive.launcher_argv.insert(interactive.launcher_argv.end(), {"--server", "https://example.org"});
+    const auto unmanaged = prepare_interactive();
+    check(unmanaged && unmanaged->set.empty() && !unmanaged->argv && unmanaged->disposition &&
+        !unmanaged->disposition->prepared && unmanaged->session_wake && !unmanaged->session_wake->available,
+        "an attached native server stays an unchanged ordinary launch without wake authority");
+    const auto npm_root = root / "npm";
+    const auto npm_package = npm_root / "node_modules" / "@opencode" / "cli";
+    fs::create_directories(npm_package / "bin");
+    fs::copy_file(program, npm_package / "bin" / "opencode.exe");
+    std::ofstream(npm_package / "package.json", std::ios::binary) <<
+        R"({"name":"@opencode/cli","version":"2.1.4","bin":{"opencode":"./bin/opencode.exe","opencode2":"./bin/opencode.exe"}})";
+    const auto npm_shim = npm_root / "opencode.cmd";
+    std::ofstream(npm_shim, std::ios::binary) <<
+        "@echo off\r\n\"%~dp0\\node_modules\\@opencode\\cli\\bin\\opencode.exe\" %*\r\n";
+#ifndef _WIN32
+    fs::permissions(npm_shim, fs::perms::owner_all, fs::perm_options::replace);
+#endif
+    auto npm_environment = launch_environment;
+    npm_environment.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("2.1.4"));
+    const auto npm_launch = opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
+        {path_string(npm_shim)}, npm_environment, path_string(root), false, context);
+    check(npm_launch && npm_launch->version == "2.1.4",
+        "published native @opencode/cli bin metadata is recognized through its stock npm shim");
+    // The selected npm link, not another installed package, owns the version.
+    const auto classic_package = npm_root / "node_modules" / "opencode-ai";
+    fs::create_directories(classic_package / "bin");
+    fs::copy_file(program, classic_package / "bin" / "opencode.exe");
+    std::ofstream(classic_package / "package.json", std::ios::binary) <<
+        R"({"name":"opencode-ai","version":"1.18.25","bin":{"opencode":"./bin/opencode.exe"}})";
+    std::ofstream(classic_package / "bin" / "fixture.version") << "1.18.25\n";
+    std::ofstream(npm_package / "bin" / "fixture.version") << "2.1.4\n";
+    npm_environment.set("OPENCODE_FIXTURE_MODE", addon::Json_value("installed-version"));
+    const auto mixed_launch = opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
+        {path_string(npm_shim)}, npm_environment, path_string(root), false, context);
+    if (mixed_launch && mixed_launch->version != "2.1.4") {
+        std::cerr << "Mixed installation selected native shim but probed " << mixed_launch->version << '\n';
+    }
+    check(mixed_launch && mixed_launch->version == "2.1.4" &&
+        mixed_launch->argv.front() == path_string(npm_package / "bin" / "opencode.exe"),
+        "a native npm shim retains its selected package when both OpenCode families are installed");
+    interactive.launcher = {"\"" + path_string(npm_shim) + "\"", "direct", ""};
+    interactive.launcher_argv = {path_string(npm_shim)};
+    interactive.launch_environment->effective_environment = npm_environment;
+    const auto mixed_patch = prepare_interactive();
+    check(mixed_patch && mixed_patch->argv == std::optional(std::vector<std::string>{path_string(npm_shim), "--standalone"}) &&
+        mixed_patch->session_wake && mixed_patch->session_wake->available,
+        "mixed installed families prepare the selected native TUI with its own server");
+    const auto ps_shim = npm_root / "opencode2.ps1";
+    std::ofstream(ps_shim, std::ios::binary) <<
+        "$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n"
+        "& \"$basedir/node_modules/@opencode/cli/bin/opencode.exe\" $args\n";
+#ifndef _WIN32
+    fs::permissions(ps_shim, fs::perms::owner_all, fs::perm_options::replace);
+#endif
+    const auto ps_launch = opencode::verified_launch({"\"" + path_string(ps_shim) + "\"", "direct", ""},
+        {path_string(ps_shim)}, npm_environment, path_string(root), false, context);
+    check(ps_launch && ps_launch->version == "2.1.4",
+        "the opencode2 PowerShell npm link resolves its published shared native bin");
+    std::ofstream(npm_shim, std::ios::binary | std::ios::trunc) <<
+        "@echo off\r\n\"%~dp0\\node_modules\\opencode-ai\\bin\\opencode.exe\" %*\r\n";
+    const auto classic_launch = opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
+        {path_string(npm_shim)}, npm_environment, path_string(root), false, context);
+    check(classic_launch && classic_launch->version == "1.18.25",
+        "the selected classic npm link remains classic with native OpenCode also installed");
+    std::ofstream(npm_shim, std::ios::binary | std::ios::app) <<
+        "\"%~dp0\\node_modules\\@opencode\\cli\\bin\\opencode.exe\" %*\r\n";
+    check(!opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
+        {path_string(npm_shim)}, npm_environment, path_string(root), false, context),
+        "a wrapper with multiple different native targets cannot establish launch identity");
+#ifdef _WIN32
+    _putenv_s("LOGONOMIC_ADDON_PACKAGE_ROOT", saved_package_root ? saved_package_root->c_str() : "");
+#else
+    if (saved_package_root) setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", saved_package_root->c_str(), 1);
+    else unsetenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
+#endif
     launcher.script_body += " --model selected";
     check(!opencode::verified_launch(launcher, {program_text, "--model", "selected"}, effective,
         path_string(root), true, context), "delegation refuses changed stock argv");

@@ -47,6 +47,12 @@ bool package_flag(std::string_view value)
         value == "--silent" || value == "--no-install" || value == "--bun";
 }
 
+bool opencode_program(std::string_view program)
+{
+    const auto name = addon::base_name(program, Launcher_whitespace::ASCII);
+    return name == "opencode" || name == "opencode2";
+}
+
 std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
@@ -90,7 +96,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
             if (index == words.size()) continue;
             const std::string program = addon::unquote(words[index], Launcher_whitespace::ASCII);
             const std::string base = addon::base_name(program, Launcher_whitespace::ASCII);
-            if (base == "opencode") return Launcher_command{program, {}, environment};
+            if (opencode_program(program)) return Launcher_command{program, {}, environment};
             if (base == "npx" || base == "bunx") {
                 std::vector<std::string> arguments;
                 for (++index; index < words.size(); ++index) {
@@ -101,7 +107,8 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                     }
                     else {
                         const auto package = lower(argument);
-                        if (package == "opencode-ai" || package.starts_with("opencode-ai@")) {
+                        if (package == "opencode-ai" || package.starts_with("opencode-ai@") ||
+                            package == "@opencode/cli" || package.starts_with("@opencode/cli@")) {
                             return Launcher_command{program, arguments, environment};
                         }
                         break;
@@ -141,6 +148,31 @@ bool equal_name(std::string_view left, std::string_view right)
 #endif
 }
 
+std::optional<fs::path> npm_shim_target(const fs::path& shim)
+{
+    // npm/read-cmd-shim treats these stock target statements as the Windows
+    // equivalent of a symlink. Package-directory presence cannot select it.
+    std::ifstream input(shim, std::ios::binary);
+    std::string bytes(65537, '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (input.bad() || input.gcount() > 65536) return std::nullopt;
+    bytes.resize(static_cast<std::size_t>(input.gcount()));
+    static const std::regex batch(R"re("%(?:~dp0|dp0%)\\([^"]+)"\s+%\*)re");
+    static const std::regex powershell(R"re("\$basedir/([^"]+)"\s+\$args)re");
+    const auto& pattern = lower(shim.extension().string()) == ".cmd" ? batch : powershell;
+    std::optional<fs::path> target;
+    for (auto match = std::sregex_iterator(bytes.begin(), bytes.end(), pattern);
+         match != std::sregex_iterator(); ++match)
+    {
+        std::string text = (*match)[1].str();
+        std::replace(text.begin(), text.end(), '\\', '/');
+        const auto path = addon::path_from_utf8(text).lexically_normal();
+        if (target && *target != path) return std::nullopt;
+        target = path;
+    }
+    return target;
+}
+
 #ifdef _WIN32
 std::string powershell_quote(std::string_view text)
 {
@@ -166,12 +198,82 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    if (!resolve_program("opencode", environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
+    const auto program = resolve_program("opencode", environment, {}, Launcher_whitespace::ASCII) ? "opencode" : "opencode2";
+    if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
     return addon::Launcher_candidate{
-        "interactive", "OpenCode", "opencode",
+        "interactive", "OpenCode", program,
         request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
         "", true, addon::Json_value::object(),
     };
+}
+
+bool uses_tui_plugin(std::string_view version)
+{
+    const auto major = version.substr(0, version.find('.'));
+    return addon::is_semantic_version(version) && major != "0" && major != "1";
+}
+
+std::optional<std::vector<std::string>> tui_invocation(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    std::string_view                resume_session)
+{
+    const auto literal = addon::literal_argv(launcher.script_body);
+    if (literal.empty() || !opencode_program(literal.front())) return std::nullopt;
+    const auto directory = addon::path_from_utf8(working_directory);
+    const auto pwd = addon::environment_value(addon::environment_pairs(effective_environment), "PWD");
+    const auto base = pwd.empty() ? directory : addon::path_from_utf8(pwd);
+    bool project = false;
+    bool standalone = false;
+    for (std::size_t index = 1; index < literal.size(); ++index) {
+        const std::string_view argument = literal[index];
+        if (argument == "--standalone") { standalone = true; continue; }
+        if (argument == "--auto" || argument == "--print-logs") continue;
+        if (argument == "--continue" || argument == "-c") {
+            if (!resume_session.empty()) return std::nullopt;
+            continue;
+        }
+        const auto equals = argument.find('=');
+        const auto name = argument.substr(0, equals);
+        if (name == "--session" || name == "-s" || name == "--prompt" || name == "--log-level") {
+            if (!resume_session.empty() && name != "--log-level") return std::nullopt;
+            if (equals != std::string_view::npos) {
+                if (equals + 1 == argument.size()) return std::nullopt;
+            }
+            else {
+                if (++index == literal.size() || literal[index].starts_with('-')) return std::nullopt;
+            }
+            continue;
+        }
+        if (argument.starts_with('-') || project) return std::nullopt;
+        const auto path = addon::path_from_utf8(argument);
+        std::error_code selected_error;
+        std::error_code directory_error;
+        const auto selected = fs::weakly_canonical(path.is_absolute() ? path : base / path, selected_error);
+        const auto expected = fs::weakly_canonical(directory, directory_error);
+        if (selected_error || directory_error || selected != expected) return std::nullopt;
+        project = true;
+    }
+    std::vector<std::string> addition;
+    if (!standalone) addition.emplace_back("--standalone");
+    if (!resume_session.empty()) addition.insert(addition.end(), {"--session", std::string(resume_session)});
+    auto invocation = launcher_argv;
+    if (launcher.runner_key == "direct" && invocation.size() == literal.size() &&
+        std::equal(literal.begin() + 1, literal.end(), invocation.begin() + 1))
+    {
+        invocation.insert(invocation.end(), addition.begin(), addition.end());
+        return invocation;
+    }
+    if (launcher.runner_key == "powershell" && plain_powershell_command(launcher.script_body) &&
+        invocation.size() == 4 && addon::base_name(invocation[0], Launcher_whitespace::ASCII) == "powershell" &&
+        invocation[1] == "-NoLogo" && invocation[2] == "-Command" && invocation[3] == launcher.script_body)
+    {
+        for (const auto& argument : addition) invocation[3] += " " + argument;
+        return invocation;
+    }
+    return std::nullopt;
 }
 
 std::optional<std::vector<std::string>> resume_arguments(
@@ -303,7 +405,7 @@ std::optional<Verified_launch> verified_launch(
     auto command = recognize_launcher(launcher.script_body);
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
     const auto literal = addon::literal_argv(launcher.script_body);
-    if (literal.empty() || addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "opencode") return std::nullopt;
+    if (literal.empty() || !opencode_program(literal.front())) return std::nullopt;
     if (delegated && literal.size() != 1) return std::nullopt;
     if (launcher.runner_key == "direct") {
         if (launcher_argv.size() != literal.size() ||
@@ -342,8 +444,25 @@ std::optional<Verified_launch> verified_launch(
     std::string package_version;
     std::vector<fs::path> files{*selected};
     const auto extension = lower(selected->extension().string());
-    if (extension == ".cmd" || extension == ".ps1") {
-        const auto root = selected->parent_path() / "node_modules" / "opencode-ai";
+    const auto command_name = addon::base_name(command->program, Launcher_whitespace::ASCII);
+    std::optional<fs::path> node_script;
+    if (extension == ".cmd" || extension == ".ps1" || extension == ".cjs") {
+        const bool script_module = extension == ".cjs";
+        auto root = selected->parent_path().parent_path();
+        std::optional<fs::path> shim_target;
+        if (!script_module) {
+            shim_target = npm_shim_target(*selected);
+            const auto classic = fs::path("node_modules/opencode-ai");
+            const auto native = fs::path("node_modules/@opencode/cli");
+            if (shim_target == classic / "bin/opencode.exe") {
+                root = selected->parent_path() / classic;
+            }
+            else if (shim_target == native / "bin/opencode.exe" ||
+                     shim_target == native / "bin" / (command_name + ".cjs")) {
+                root = selected->parent_path() / native;
+            }
+            else return std::nullopt;
+        }
         const auto manifest = regular_file(root / "package.json");
         if (!manifest) return std::nullopt;
         std::error_code error;
@@ -356,25 +475,51 @@ std::optional<Verified_launch> verified_launch(
         const auto* name    = package->find("name");
         const auto* version = package->find("version");
         const auto* bin     = package->find("bin");
-        if (bin && bin->is_object()) bin = bin->find("opencode");
-        if (!name || !name->is_string() || name->as_string() != "opencode-ai" ||
+        if (bin && bin->is_object()) bin = bin->find(command_name);
+        if (!name || !name->is_string() || (name->as_string() != "opencode-ai" && name->as_string() != "@opencode/cli") ||
             !version || !version->is_string() || !addon::is_semantic_version(version->as_string()) ||
             !bin || !bin->is_string()) return std::nullopt;
         std::string bin_path = bin->as_string();
         std::replace(bin_path.begin(), bin_path.end(), '\\', '/');
-        if (addon::path_from_utf8(bin_path).lexically_normal() != fs::path("bin/opencode.exe")) return std::nullopt;
+        const bool tui_package = name->as_string() == "@opencode/cli";
+        const auto relative_bin = addon::path_from_utf8(bin_path).lexically_normal();
+        // @opencode/cli postinstall replaces both command mappings with the
+        // selected native image. An unmodified source launcher still uses Node.
+        const bool source_launcher = tui_package && relative_bin == fs::path("bin") / (command_name + ".cjs");
+        if ((!source_launcher && relative_bin != fs::path("bin/opencode.exe")) ||
+            (script_module && !source_launcher)) {
+            return std::nullopt;
+        }
         const auto image = regular_file(root / addon::path_from_utf8(bin_path));
-        if (!image) return std::nullopt;
+        if (!image || (shim_target && regular_file(selected->parent_path() / *shim_target) != image)) {
+            return std::nullopt;
+        }
         executable      = *image;
         package_version = version->as_string();
         files.push_back(*manifest);
         files.push_back(executable);
+        if (source_launcher) {
+            if (script_module && *image != *selected) return std::nullopt;
+            const auto local_node = regular_file(selected->parent_path() / "node.exe");
+            const auto node = local_node ? local_node : resolve_program(
+                "node", environment, working_directory, Launcher_whitespace::ASCII);
+            if (!node || !native_image(*node)) return std::nullopt;
+            node_script = executable;
+            executable = *node;
+            files.push_back(executable);
+        }
     }
     if (!native_image(executable)) return std::nullopt;
     std::vector<std::string> probe_argv{path_to_utf8(executable), "--version"};
     std::vector<std::string> launch_argv{path_to_utf8(executable)};
+    if (node_script) {
+        probe_argv.insert(probe_argv.begin() + 1, path_to_utf8(*node_script));
+        launch_argv.emplace_back(path_to_utf8(*node_script));
+    }
     int timeout_ms = 3000;
-    bool cacheable = true;
+    // The stock Node launcher selects a platform package at runtime, so its
+    // selected native image cannot participate in our file-identity cache.
+    bool cacheable = !node_script;
     if (delegated) {
         launch_argv = {path_to_utf8(*selected), "acp", "--cwd", std::string(working_directory)};
         probe_argv  = {path_to_utf8(*selected), "--version"};

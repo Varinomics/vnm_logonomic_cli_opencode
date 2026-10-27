@@ -18,19 +18,36 @@ nobody can approve in a headless run; it never chooses `always`. OpenCode fails
 a rejected tool call and continues the turn. A task that needs other tools
 therefore needs a configuration that allows them.
 
-Lifecycle integration requires a verified OpenCode version at least 1.18.11;
-delegated ACP requires at least 1.18.25. Newer versions remain eligible and their
-actual protocol messages are validated. The selected stock launcher chain is
+The `opencode-ai` lifecycle contract requires a verified version at least 1.18.11;
+its delegated ACP contract requires at least 1.18.25. The `@opencode/cli` 2.x
+integration uses the native TUI plugin and synthetic inbox contracts, qualified
+against 2.1.4. Newer versions remain eligible and their actual native methods and
+protocol messages are validated. The selected stock launcher chain is
 verified before delegation. An interactive launch reports its lifecycle only when
 the host's complete invocation, a direct launcher or `powershell -NoLogo -Command`
 running the recognized script, starts a verified OpenCode; otherwise the launch is
 prepared without lifecycle. User configuration is merged, and package writes use
 the exact host-acknowledged profile storage allocation.
 
+For a verified OpenCode 2 TUI invocation, preparation adds the native
+`--standalone` option when absent. Its private server keeps model tools in the
+recipient launch's Logonomic environment, including its mailbox authority.
+Direct launches and the verified PowerShell invocation retain their original
+arguments and permission settings. An explicit remote server, management command,
+unknown interface or unverifiable package-runner launch remains an ordinary launch
+without wake authority. The combined native plugin directory is added to server
+configuration; OpenCode discovers its TUI entrypoint alongside the user's existing
+`cli.json` plugins, without replacing that list or modifying the configuration file.
+
+| Native contract | Integrated behavior |
+| --- | --- |
+| `opencode-ai` hooks and SDK | Lifecycle, native questions and permissions, context telemetry, changed-file tools, resume, delegated ACP and idle wake |
+| `@opencode/cli` 2.x TUI and inbox | Selected root session, execution outcomes, native forms and permissions, resume and idle wake; delegated ACP, context telemetry and changed-file tools are not advertised through this contract |
+
 A stored session resumes through the same verified launcher with
-`--session <id>` added. OpenCode opens that session without emitting an event, so
-the managed plugin reports it as resumed once the resumed OpenCode's own store
-has it, which lets Logonomic confirm the resume before the first turn. A launcher
+`--session <id>` added. The hooks plugin confirms the native store identity;
+the OpenCode 2 plugin observes the TUI's selected root session through its public
+reactive API. This lets Logonomic confirm the resume before the first turn. A launcher
 that cannot report lifecycle, or whose options could select another session,
 directory or interface or leave out plugins, cannot resume.
 
@@ -38,7 +55,9 @@ The optional `session-wake@1` capability wakes an idle existing interactive
 session through its managed plugin's own native SDK client. A private, launch-owned
 loopback bridge binds delivery to that live plugin instance, native session, and
 launch correlation. The plugin requires a completed normal turn and preserves
-its actual agent, model and variant. Busy sessions and pending native permissions
+its actual agent, model and variant. The hooks SDK submits the observed selection
+explicitly; OpenCode 2 synthetic input retains the session's persisted selection.
+Busy sessions and pending native permissions
 or questions defer delivery; interrupted sessions remain unavailable. It never
 submits terminal input or edits the TUI draft. A retained notification receipt
 prevents a repeated accepted or uncertain delivery from creating another turn;
@@ -51,12 +70,18 @@ the mailbox message remains stored. Repeated notification IDs for the same sessi
 still return their retained result. Deleting a session does not free receipts;
 restarting OpenCode creates a fresh plugin instance and receipt table.
 
-This route uses the current `opencode-ai` plugin and SDK contracts. The separate
-`@opencode/cli` 2.x generation exposes a native inbox API but changed its launcher
-and plugin module contracts; this package has not adapted those contracts. Such
-a launch cannot establish this bridge and reports unavailable. No version ceiling
-is imposed on compatible launchers: the live plugin checks the required methods
-and validates native session state before submission.
+Switching to another root conversation revokes the previous native wake binding.
+Returning requires inspection under the new Logonomic transition; retired
+transition nonces cannot submit notifications. Temporarily showing the home,
+child-session or plugin page suppresses wake readiness without inventing a new
+root conversation. The bridge retains at most 256 retired correlations before
+refusing fresh bindings with `provider_session_capacity`.
+
+OpenCode 2 uses `session.synthetic` with queue delivery and execution enabled.
+A concurrent user turn can therefore retain the notification in the native inbox
+without steering or interrupting that turn. Readiness is checked again against
+native session, execution, permission, form and pending-input APIs before admission.
+No version ceiling is imposed on compatible launchers.
 
 ## Building and local qualification
 
@@ -92,6 +117,15 @@ or draft preservation visually and never uses the user's provider credentials.
 The optional seed directory supplies only `node_modules`, `package.json` and
 `package-lock.json` to avoid a first-run dependency download; no native profile
 configuration, authentication or history is copied.
+
+`node tests/opencode2_wake_native_tests.mjs <opencode-executable> <package-directory> <opencode2_native_prepare>`
+qualifies the OpenCode 2 route using the packaged adapter's actual launch
+preparation. It runs an isolated native TUI and fake model, verifies native queue
+admission, duplicate suppression, Plan/model/variant preservation and the
+recipient's test mailbox environment, then submits a pre-existing test draft
+through normal terminal input to check that wake preserved it exactly. A separate
+observer loaded from the existing `cli.json` verifies that user plugins remain
+active. This fixture creates no real mailbox messages and uses no user credentials.
 
 The project is C++20 and uses only the standalone SDK, the standard library and
 platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK

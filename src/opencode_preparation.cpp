@@ -3,6 +3,7 @@
 #include "opencode_launcher.h"
 
 #include "logonomic_cli_addon/ids.h"
+#include "logonomic_cli_addon/launcher_utilities.h"
 #include "logonomic_cli_addon/profile_storage.h"
 #include "logonomic_cli_addon/session_contracts.h"
 #include "logonomic_cli_addon/sha256.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -28,6 +30,7 @@ namespace fs = std::filesystem;
 
 constexpr char k_instruction_name[] = "logonomic-title-instruction.md";
 constexpr char k_plugin_asset[] = "assets/logonomic_opencode_plugin.mjs";
+constexpr char k_tui_plugin_asset[] = "assets/opencode_tui/tui.mjs";
 constexpr char k_changed_files_instruction[] =
     "When the user asks to bring up, open, show, or inspect files changed in "
     "this Session and the conversation already supplies repository-relative "
@@ -177,9 +180,10 @@ std::string read_instruction(const fs::path& path, std::size_t expected_size)
 
 } // namespace
 
-Inline_config inline_config(const addon::Json_value& environment)
+Inline_config inline_config(const addon::Json_value& environment, std::string_view environment_name)
 {
     Inline_config config;
+    config.environment_name = environment_name;
     const addon::Json_value* selected = nullptr;
     for (const auto& member : environment.as_object()) {
         if (environment_name_equal(member.name, config.environment_name)) {
@@ -223,10 +227,26 @@ Inline_config inline_config(const addon::Json_value& environment)
             throw std::runtime_error("OpenCode plugin entries must be names or name/options pairs.");
         }
     }
+    if (const auto* plugins = config.value.find("plugins")) {
+        if (!plugins->is_array()) {
+            throw std::runtime_error("OpenCode plugins must be an array.");
+        }
+        for (const auto& plugin : plugins->as_array()) {
+            if (plugin.is_string() && !blank(plugin.as_string())) continue;
+            const auto* package = plugin.find("package");
+            const auto* options = plugin.find("options");
+            if (!package || !package->is_string() || blank(package->as_string()) ||
+                (options && !options->is_object()))
+            {
+                throw std::runtime_error("OpenCode plugins must be names or package/options objects.");
+            }
+        }
+    }
     return config;
 }
 
-std::string materialize_instruction(std::string_view profile_root, std::string_view instruction)
+std::string materialize_instruction(std::string_view profile_root, std::string_view instruction,
+    bool changed_files_tools)
 {
     if (blank(instruction) || instruction.find('\0') != std::string_view::npos) {
         throw std::runtime_error("OpenCode title instruction must be nonempty text.");
@@ -235,8 +255,10 @@ std::string materialize_instruction(std::string_view profile_root, std::string_v
     while (!body.empty() && (body.back() == '\r' || body.back() == '\n')) {
         body.pop_back();
     }
-    body += "\n\n";
-    body += k_changed_files_instruction;
+    if (changed_files_tools) {
+        body += "\n\n";
+        body += k_changed_files_instruction;
+    }
     const std::string digest = addon::to_hex(addon::Sha256::digest(body));
     const fs::path root = native_path(profile_root);
     const fs::path store = root / "instructions";
@@ -329,6 +351,44 @@ addon::Session_wake_preparation prepare_wake(std::string_view profile_root, bool
     return result;
 }
 
+bool configure_tui(
+    addon::Launch_patch& patch,
+    const addon::Json_value& environment,
+    const std::vector<std::string>& declared_assets,
+    std::string_view title_instruction,
+    bool session_wake,
+    addon::Invocation_context& context)
+{
+    if (std::find(declared_assets.begin(), declared_assets.end(), k_tui_plugin_asset) == declared_assets.end()) {
+        context.fail(addon::Result_status::FAILED, "asset_undeclared");
+        return false;
+    }
+    // TUI plugins are directory entrypoints. The host owns this immutable
+    // package directory for the lifetime of the launched native process.
+    const char* package_root = std::getenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
+    if (!package_root || !native_path(package_root).is_absolute()) {
+        context.fail(addon::Result_status::UNAVAILABLE, "package_root_unavailable");
+        return false;
+    }
+    const auto instruction = materialize_instruction(patch.profile_storage->root, title_instruction, false);
+    auto server = inline_config(environment);
+    auto instructions = server.value.find("instructions") ? *server.value.find("instructions") : addon::Json_value::array();
+    instructions.push_back(addon::Json_value(instruction));
+    server.value.set("instructions", std::move(instructions));
+    auto plugins = server.value.find("plugins") ? *server.value.find("plugins") : addon::Json_value::array();
+    plugins.push_back(addon::Json_value(path_text(native_path(package_root) / "assets" / "opencode_tui")));
+    server.value.set("plugins", std::move(plugins));
+    if (session_wake) {
+        patch.session_wake = prepare_wake(patch.profile_storage->root, true);
+        patch.set.emplace_back("OPENCODE_LOGONOMIC_WAKE_REGISTRATION",
+            patch.session_wake->binding.find("registration_file")->as_string());
+    }
+    patch.set.emplace_back(server.environment_name, addon::serialize_json(server.value));
+    patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", "1");
+    patch.disposition = addon::Launch_disposition{true, true, false};
+    return true;
+}
+
 // Refuses, on `context`, a launcher that an interactive launch or resume
 // cannot prepare: one that is not OpenCode, lacks profile storage or the
 // managed plugin, or assigns the inline configuration the package merges into.
@@ -379,6 +439,39 @@ void prepare_interactive(addon::Invocation_context& context)
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
+    if (launch && uses_tui_plugin(launch->version)) {
+        addon::Launch_patch patch;
+        patch.profile_storage = request->profile_storage;
+        patch.argv = tui_invocation(request->launcher, request->launcher_argv,
+            request->launch_environment->effective_environment, request->working_directory);
+        if (!patch.argv) {
+            patch.disposition = addon::Launch_disposition{false, false, false};
+            if (request->session_wake) {
+                patch.session_wake = addon::Session_wake_preparation{};
+                patch.session_wake->reason = "opencode_tui_launcher_unavailable";
+            }
+        }
+        else
+        if (!configure_tui(patch, request->launch_environment->effective_environment, request->declared_assets,
+                request->title_instruction, request->session_wake.has_value(), context))
+        {
+            return;
+        }
+        context.succeed(addon::encode_launch_patch(patch, 3));
+        return;
+    }
+    const auto command = recognize_launcher(request->launcher.script_body);
+    if (!launch && (addon::base_name(command->program, addon::Launcher_whitespace::ASCII) == "opencode2" ||
+        std::any_of(command->prefix_arguments.begin(), command->prefix_arguments.end(),
+            [](const auto& value) { return value == "@opencode/cli" || value.starts_with("@opencode/cli@"); })))
+    {
+        addon::Launch_patch patch;
+        patch.profile_storage = request->profile_storage;
+        patch.disposition = addon::Launch_disposition{false, false, false};
+        if (request->session_wake) patch.session_wake = prepare_wake(request->profile_storage->root, false);
+        context.succeed(addon::encode_launch_patch(patch, 3));
+        return;
+    }
     const auto instruction = materialize_instruction(request->profile_storage->root, request->title_instruction);
     addon::Launch_patch patch;
     patch.profile_storage = request->profile_storage;
@@ -421,13 +514,6 @@ void prepare_resume(addon::Invocation_context& context)
     {
         return;
     }
-    const auto arguments = resume_arguments(
-        launch.launcher, launch.launcher_argv, launch.launch_environment->effective_environment,
-        launch.working_directory, session->as_string());
-    if (!arguments) {
-        context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
-        return;
-    }
     auto config = inline_config(launch.launch_environment->effective_environment);
     // The resumed session confirms its identity through its lifecycle, so a
     // launch that cannot report lifecycle cannot resume.
@@ -436,6 +522,34 @@ void prepare_resume(addon::Invocation_context& context)
     if (!verified) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
+        return;
+    }
+    if (uses_tui_plugin(verified->version)) {
+        const auto invocation = tui_invocation(launch.launcher, launch.launcher_argv,
+            launch.launch_environment->effective_environment, launch.working_directory, session->as_string());
+        if (!invocation) {
+            context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
+            return;
+        }
+        addon::Resume_prepare_result result;
+        result.process.executable = addon::Process_executable::launcher_program();
+        result.process.argv.assign(invocation->begin() + 1, invocation->end());
+        result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
+        result.patch.profile_storage = launch.profile_storage;
+        if (!configure_tui(result.patch, launch.launch_environment->effective_environment, launch.declared_assets,
+                request->title_instruction, launch.session_wake.has_value(), context))
+        {
+            return;
+        }
+        result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(record);
+        context.succeed(addon::encode_resume_prepare_result(result, 2));
+        return;
+    }
+    const auto arguments = resume_arguments(
+        launch.launcher, launch.launcher_argv, launch.launch_environment->effective_environment,
+        launch.working_directory, session->as_string());
+    if (!arguments) {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_launcher_unavailable");
         return;
     }
     const auto instruction = materialize_instruction(launch.profile_storage->root, request->title_instruction);
@@ -481,6 +595,10 @@ void prepare_delegated(addon::Invocation_context& context)
     if (!launch) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
+        return;
+    }
+    if (uses_tui_plugin(launch->version)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "opencode_acp_generation_unavailable");
         return;
     }
     auto config = inline_config(request->context.launch_environment->effective_environment);

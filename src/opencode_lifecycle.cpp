@@ -100,6 +100,37 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.observations.push_back(std::move(observation));
         return result;
     }
+    const auto* api_generation = body.find("api_generation");
+    const bool native_inbox = api_generation && api_generation->is_integer() && api_generation->as_integer() == 2;
+    if (name == "logonomic.session.selected") {
+        const auto session = metadata(body, "session_id");
+        const auto status  = metadata(body, "status_type");
+        if (!native_inbox || !session || !status || (*status != "running" && *status != "idle")) {
+            return std::nullopt;
+        }
+        addon::Lifecycle_observation observation;
+        observation.provider_event_name = name;
+        observation.provider_session_id = *session;
+        observation.phase_transition = *status == "running"
+            ? addon::Phase_transition::WORKING : addon::Phase_transition::AWAITING_INPUT;
+        observation.phase_evidence = addon::Evidence::CONFIRMED;
+        result.classification = addon::Classification::EVENT;
+        if (!request.ledger.current_transition || request.ledger.current_transition->provider_session_id != *session) {
+            observation.session_transition = addon::Session_transition::STARTED;
+            result.classification = addon::Classification::TRANSITION;
+            // Explicit native selection can return to a session retired by an
+            // earlier selection. The host requires RESUME to re-admit that ID.
+            result.transition = request.ledger.current_transition
+                ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
+        }
+        result.observations.push_back(std::move(observation));
+        return result;
+    }
+    const bool execution_started     = native_inbox && name == "session.execution.started";
+    const bool execution_succeeded   = native_inbox && name == "session.execution.succeeded";
+    const bool execution_failed      = native_inbox && name == "session.execution.failed";
+    const bool execution_interrupted = native_inbox && name == "session.execution.interrupted";
+    const bool execution = execution_started || execution_succeeded || execution_failed || execution_interrupted;
     const bool child_start = name == "logonomic.subagent.started";
     const bool child_stop  = name == "logonomic.subagent.stopped";
     const bool deleted    = name == "session.deleted";
@@ -108,12 +139,12 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const bool error      = name == "session.error";
     const bool asked      = name == "permission.asked";
     const bool replied    = name == "permission.replied";
-    const bool question_asked    = name == "question.asked";
-    const bool question_replied  = name == "question.replied";
-    const bool question_rejected = name == "question.rejected";
+    const bool question_asked    = name == "question.asked" || (native_inbox && name == "form.created");
+    const bool question_replied  = name == "question.replied" || (native_inbox && name == "form.replied");
+    const bool question_rejected = name == "question.rejected" || (native_inbox && name == "form.cancelled");
     const bool submitted        = name == "chat.message";
     if (!(child_start || child_stop || deleted || status || idle || error || asked || replied ||
-          question_asked || question_replied || question_rejected || submitted))
+          question_asked || question_replied || question_rejected || submitted || execution))
     {
         return result;
     }
@@ -149,10 +180,12 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         return result;
     }
     const auto turn = metadata(body, "turn_id");
-    if (!turn) {
+    if (!turn && (!native_inbox || body.find("turn_id"))) {
         return std::nullopt;
     }
-    observation.provider_turn_id = *turn;
+    // OpenCode 2 terminal events can be observed after attaching to a run.
+    // They identify the session, but do not invent a missing execution start ID.
+    if (turn) observation.provider_turn_id = *turn;
     // Native OpenCode reports session identity on each root fact. The host's
     // ledger, rather than adapter process memory, decides whether it starts a
     // new Session; repeated facts must not manufacture fresh host epochs.
@@ -161,6 +194,17 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.classification = addon::Classification::TRANSITION;
         result.transition = addon::Transition_kind::START;
     }
+    if (execution) {
+        observation.phase_transition = execution_started
+            ? addon::Phase_transition::WORKING : addon::Phase_transition::AWAITING_INPUT;
+        observation.phase_evidence = addon::Evidence::CONFIRMED;
+        if (!execution_started && turn) {
+            observation.outcome_transition = execution_succeeded ? addon::Outcome_transition::SUCCEEDED :
+                execution_failed ? addon::Outcome_transition::FAILED : addon::Outcome_transition::INTERRUPTED;
+            observation.outcome_evidence = addon::Evidence::CONFIRMED;
+        }
+    }
+    else
     if (status) {
         const auto type = metadata(body, "status_type");
         if (!type || (*type != "busy" && *type != "retry" && *type != "idle")) {
