@@ -15,6 +15,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -112,7 +113,18 @@ void invoke(addon::Invocation_context& context)
             opencode::handle_preparation(context);
         }
     }
-    catch (const std::exception&) {
+    catch (const std::exception& error) {
+        const std::string_view reason = error.what();
+        if (reason == "OpenCode configuration contains an unterminated comment." ||
+            reason == "OpenCode configuration has multiple environment case variants." ||
+            reason == "OpenCode configuration must be a JSON object." ||
+            reason == "OpenCode instructions must be an array of strings." ||
+            reason == "OpenCode plugin configuration must be an array." ||
+            reason == "OpenCode plugin entries must be names or name/options pairs.")
+        {
+            context.fail(addon::Result_status::FAILED, "opencode_settings_invalid", "OpenCode settings are invalid.");
+            return;
+        }
         // Vendor configuration and private filesystem values never become diagnostics.
         context.fail(addon::Result_status::FAILED, "opencode_preparation_failed",
             "OpenCode preparation could not preserve the supplied configuration or owned storage.");
