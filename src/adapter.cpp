@@ -1,4 +1,5 @@
 #include "opencode_acp.h"
+#include "opencode_conversation.h"
 #include "opencode_launcher.h"
 #include "opencode_launcher_approval.h"
 #include "opencode_lifecycle.h"
@@ -54,6 +55,10 @@ void invoke(addon::Invocation_context& context)
 {
     const auto& request = context.request();
     try {
+        if (request.capability.capability_id == addon::k_conversation_export_capability_id) {
+            addon::handle_conversation_export(context, opencode::export_conversation);
+        }
+        else
         if (request.capability.capability_id == addon::k_launcher_approval_capability_id) {
             addon::handle_launcher_approval(context, opencode::launcher_approval_rules());
         }
@@ -127,6 +132,7 @@ int main()
     options.adapter_name    = "opencode-addon";
     options.adapter_version = "1.0.0";
     options.capabilities = {
+        {addon::k_conversation_export_capability_id, addon::k_conversation_export_prepared_source_version},
         {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},

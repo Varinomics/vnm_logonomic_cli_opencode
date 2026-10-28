@@ -1,0 +1,7 @@
+{
+  "capability_id": "conversation-export",
+  "version": 2,
+  "payload": {
+    "environment_names": ["VNM_OPENCODE_EXPORT_SOURCE"]
+  }
+}

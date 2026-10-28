@@ -1,5 +1,6 @@
 #include "opencode_preparation.h"
 #include "opencode_acp.h"
+#include "opencode_conversation.h"
 #include "opencode_launcher.h"
 
 #include "logonomic_cli_addon/ids.h"
@@ -442,7 +443,9 @@ std::optional<std::vector<std::string>> prepare_initial_prompt(
     }
     const auto help = addon::probe(probe, environment, request.working_directory, 3000, context);
     static const std::regex prompt_option(R"((^|\n)[^\n]*[ \t]--prompt([ \t=<]|$))");
-    if (!help || !std::regex_search(help->output, prompt_option)) {
+    if (!help || (!std::regex_search(help->output, prompt_option) &&
+                 !std::regex_search(help->errors, prompt_option)))
+    {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
         return std::nullopt;
@@ -450,12 +453,30 @@ std::optional<std::vector<std::string>> prepare_initial_prompt(
     return invocation;
 }
 
+void bind_conversation_source(addon::Launch_patch& patch, const std::optional<std::string>& source)
+{
+    std::erase_if(patch.set, [](const auto& entry) {
+        return environment_name_equal(entry.first, k_export_source_environment);
+    });
+    std::erase_if(patch.unset, [](const auto& name) {
+        return environment_name_equal(name, k_export_source_environment);
+    });
+    if (source) {
+        patch.set.emplace_back(k_export_source_environment, *source);
+    }
+    else {
+        patch.unset.emplace_back(k_export_source_environment);
+    }
+}
+
 void finish_interactive(
     addon::Launch_patch                    patch,
     const addon::Prepare_request&          request,
     std::optional<std::vector<std::string>> initial_invocation,
+    const std::optional<std::string>&       conversation_source,
     addon::Invocation_context&             context)
 {
+    bind_conversation_source(patch, conversation_source);
     if (request.initial_prompt) {
         patch.argv = std::move(initial_invocation);
         patch.initial_prompt = addon::Initial_prompt_acknowledgment{
@@ -491,6 +512,8 @@ void prepare_interactive(addon::Invocation_context& context)
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
     }
+    const auto conversation_source = prepare_conversation_source(request->launcher, request->launcher_argv,
+        request->launch_environment->effective_environment, request->working_directory, launch ? &*launch : nullptr);
     std::optional<std::vector<std::string>> initial_invocation;
     if (request->initial_prompt) {
         if (!launch) {
@@ -520,7 +543,7 @@ void prepare_interactive(addon::Invocation_context& context)
         {
             return;
         }
-        finish_interactive(std::move(patch), *request, std::move(initial_invocation), context);
+        finish_interactive(std::move(patch), *request, std::move(initial_invocation), conversation_source, context);
         return;
     }
     const auto command = recognize_launcher(request->launcher.script_body);
@@ -532,7 +555,7 @@ void prepare_interactive(addon::Invocation_context& context)
         patch.profile_storage = request->profile_storage;
         patch.disposition = addon::Launch_disposition{false, false, false};
         if (request->session_wake) patch.session_wake = prepare_wake(request->profile_storage->root, false);
-        context.succeed(addon::encode_launch_patch(patch, 3));
+        finish_interactive(std::move(patch), *request, {}, conversation_source, context);
         return;
     }
     const auto instruction = materialize_instruction(request->profile_storage->root, request->title_instruction);
@@ -542,7 +565,7 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, patch.session_wake));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
     patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
-    finish_interactive(std::move(patch), *request, std::move(initial_invocation), context);
+    finish_interactive(std::move(patch), *request, std::move(initial_invocation), conversation_source, context);
 }
 
 // OpenCode's own session identifiers: `ses_` and ASCII letters and digits.
@@ -587,6 +610,8 @@ void prepare_resume(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
         return;
     }
+    const auto conversation_source = prepare_conversation_source(launch.launcher, launch.launcher_argv,
+        launch.launch_environment->effective_environment, launch.working_directory, &*verified);
     if (uses_tui_plugin(verified->version)) {
         const auto invocation = tui_invocation(launch.launcher, launch.launcher_argv,
             launch.launch_environment->effective_environment, launch.working_directory, session->as_string());
@@ -604,6 +629,7 @@ void prepare_resume(addon::Invocation_context& context)
         {
             return;
         }
+        bind_conversation_source(result.patch, conversation_source);
         result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(record);
         context.succeed(addon::encode_resume_prepare_result(result, 2));
         return;
@@ -627,6 +653,7 @@ void prepare_resume(addon::Invocation_context& context)
     // The managed plugin reports this session as resumed once the resumed
     // OpenCode has it in its own store.
     result.patch.set.emplace_back("OPENCODE_LOGONOMIC_RESUME_SESSION", session->as_string());
+    bind_conversation_source(result.patch, conversation_source);
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(record);
     context.succeed(addon::encode_resume_prepare_result(result, 2));
 }

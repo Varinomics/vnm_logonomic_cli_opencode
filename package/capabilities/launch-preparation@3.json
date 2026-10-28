@@ -4,6 +4,10 @@
   "payload": {
     "environment_names": [
       "OPENCODE_CONFIG_CONTENT",
+      "OPENCODE_DB",
+      "HOME",
+      "USERPROFILE",
+      "XDG_DATA_HOME",
       "SystemRoot",
       "WINDIR",
       "TEMP",

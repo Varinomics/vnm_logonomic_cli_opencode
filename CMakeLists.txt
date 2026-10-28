@@ -53,6 +53,10 @@ endfunction()
 
 add_library(opencode_provider STATIC
     src/opencode_acp.cpp
+    src/opencode_conversation.cpp
+    src/opencode_conversation_legacy.cpp
+    src/opencode_conversation_source.cpp
+    src/opencode_conversation_tui.cpp
     src/opencode_launcher.cpp
     src/opencode_launcher_approval.cpp
     src/opencode_lifecycle.cpp
@@ -63,6 +67,75 @@ target_include_directories(opencode_provider PUBLIC src)
 target_link_libraries(opencode_provider PUBLIC logonomic_cli_addon_sdk::sdk)
 if(WIN32)
     target_link_libraries(opencode_provider PRIVATE ws2_32)
+    if(MINGW)
+        string(TOLOWER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" opencode_sdk_arch)
+        if(opencode_sdk_arch MATCHES "^(x64|x86_64|amd64)$")
+            set(opencode_sdk_arch x64)
+        elseif(opencode_sdk_arch MATCHES "^(x86|i[3-6]86)$")
+            set(opencode_sdk_arch x86)
+        elseif(opencode_sdk_arch MATCHES "^(arm64|aarch64)$")
+            set(opencode_sdk_arch arm64)
+        elseif(opencode_sdk_arch MATCHES "^(arm|armv7.*)$")
+            set(opencode_sdk_arch arm)
+        else()
+            message(FATAL_ERROR
+                "Cannot select the Windows SQLite import library for target "
+                "architecture '${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}'.")
+        endif()
+
+        set(opencode_sdk_roots "$ENV{WindowsSdkDir}")
+        foreach(opencode_registry_view IN ITEMS 64 32)
+            cmake_host_system_information(RESULT opencode_sdk_root
+                QUERY WINDOWS_REGISTRY
+                    "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots"
+                VALUE KitsRoot10 VIEW ${opencode_registry_view})
+            list(APPEND opencode_sdk_roots "${opencode_sdk_root}")
+        endforeach()
+        list(REMOVE_DUPLICATES opencode_sdk_roots)
+        set(opencode_sqlite_header "")
+        set(opencode_sqlite_library "")
+        foreach(opencode_sdk_root IN LISTS opencode_sdk_roots)
+            if(NOT opencode_sdk_root)
+                continue()
+            endif()
+            cmake_path(CONVERT "${opencode_sdk_root}" TO_CMAKE_PATH_LIST opencode_sdk_root NORMALIZE)
+            file(GLOB opencode_sdk_versions RELATIVE "${opencode_sdk_root}/Include"
+                "${opencode_sdk_root}/Include/*")
+            list(SORT opencode_sdk_versions COMPARE NATURAL ORDER DESCENDING)
+            foreach(opencode_sdk_version IN LISTS opencode_sdk_versions)
+                set(opencode_sdk_include "${opencode_sdk_root}/Include/${opencode_sdk_version}/um")
+                set(opencode_sdk_library
+                    "${opencode_sdk_root}/Lib/${opencode_sdk_version}/um/${opencode_sdk_arch}/winsqlite3.lib")
+                if(EXISTS "${opencode_sdk_include}/winsqlite/winsqlite3.h" AND
+                   EXISTS "${opencode_sdk_library}")
+                    set(opencode_sqlite_header "${opencode_sdk_include}/winsqlite/winsqlite3.h")
+                    set(opencode_sqlite_library "${opencode_sdk_library}")
+                    break()
+                endif()
+            endforeach()
+            if(opencode_sqlite_header)
+                break()
+            endif()
+        endforeach()
+        if(NOT opencode_sqlite_header)
+            message(FATAL_ERROR
+                "OpenCode conversation extraction requires a Windows SDK with "
+                "winsqlite/winsqlite3.h and the ${opencode_sdk_arch} winsqlite3.lib.")
+        endif()
+
+        # Keep the SDK's C API header without replacing MinGW's system headers.
+        set(opencode_sqlite_include "${CMAKE_CURRENT_BINARY_DIR}/windows_sqlite/include")
+        file(MAKE_DIRECTORY "${opencode_sqlite_include}/winsqlite")
+        configure_file("${opencode_sqlite_header}"
+            "${opencode_sqlite_include}/winsqlite/winsqlite3.h" COPYONLY)
+        target_include_directories(opencode_provider PRIVATE "${opencode_sqlite_include}")
+        target_link_libraries(opencode_provider PRIVATE "${opencode_sqlite_library}")
+    else()
+        target_link_libraries(opencode_provider PRIVATE winsqlite3)
+    endif()
+else()
+    find_package(SQLite3 REQUIRED)
+    target_link_libraries(opencode_provider PRIVATE SQLite::SQLite3)
 endif()
 
 add_executable(opencode_adapter src/adapter.cpp)

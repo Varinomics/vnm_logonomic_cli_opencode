@@ -407,6 +407,14 @@ std::optional<std::vector<std::string>> session_launcher_arguments(
 
 } // namespace
 
+bool local_interactive_launcher(const addon::Launcher_request& launcher,
+    const std::vector<std::string>& launcher_argv, const addon::Json_value& effective_environment,
+    std::string_view working_directory)
+{
+    return session_launcher_arguments(
+        launcher, launcher_argv, effective_environment, working_directory, false).has_value();
+}
+
 std::optional<std::vector<std::string>> resume_arguments(
     const addon::Launcher_request&  launcher,
     const std::vector<std::string>& launcher_argv,

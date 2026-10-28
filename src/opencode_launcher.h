@@ -64,6 +64,10 @@ std::optional<std::vector<std::string>> tui_invocation(
 
 bool uses_tui_plugin(std::string_view version);
 
+bool local_interactive_launcher(const addon::Launcher_request& launcher,
+    const std::vector<std::string>& launcher_argv, const addon::Json_value& effective_environment,
+    std::string_view working_directory);
+
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
 
