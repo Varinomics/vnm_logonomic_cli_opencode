@@ -327,6 +327,30 @@ int main(int argc, char** argv)
                 ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED),
             "native form events preserve attention identity without answer prose");
     }
+
+    for (const auto* name : {"logonomic.permission.resolved", "logonomic.form.resolved"}) {
+        const bool permission = std::string_view(name) == "logonomic.permission.resolved";
+        auto request = event(name);
+        request.event.body.erase("turn_id");
+        request.event.body.set("api_generation", addon::Json_value(2));
+        request.event.body.set(permission ? "permission_id" : "question_id", addon::Json_value("request-removed"));
+        const auto observation = classify(request).observations.front();
+        require(observation.provider_event_name == name && observation.provider_turn_id.empty() &&
+                observation.attention_request_id == "request-removed" &&
+                observation.attention_transition == addon::Attention_transition::RESOLVED &&
+                observation.attention_evidence == addon::Evidence::CONFIRMED &&
+                observation.phase_transition == addon::Phase_transition::NONE &&
+                observation.outcome_transition == addon::Outcome_transition::NONE,
+            "native pending-list absence resolves its exact request without inventing a reply or execution outcome");
+        Classification_call call(addon::Attention_classification_request{request, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind &&
+                result->attention_kind->kind == (permission ? "permission" : "interactive_question"),
+            "snapshot resolution preserves the native prompt kind");
+        request.event.body.erase("api_generation");
+        require(classify(request).observations.empty(), "snapshot resolution belongs only to the native TUI contract");
+    }
     for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
         auto request = event(name);
         request.event.body.set("question_id", addon::Json_value("que_native_question"));

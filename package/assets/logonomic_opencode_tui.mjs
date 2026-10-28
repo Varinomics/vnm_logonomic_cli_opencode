@@ -76,12 +76,72 @@ export async function create_tui_integration(context) {
 
   const relay = create_lifecycle_relay()
   const attention = new Map()
+  const settled = new Map()
   let selected
   let visible = false
   let turn_id
+  let latest_turn_id
   let generation = 0
   let disposed = false
   let bridge
+  let pending_snapshot
+
+  function attention_event(event, request, correlated = true) {
+    return {
+      event, session_id: selected, api_generation: 2,
+      ...(correlated && request.turn_id ? { turn_id: request.turn_id } : {}),
+      [request.kind === "permission" ? "permission_id" : "question_id"]: request.id,
+    }
+  }
+
+  function remember_settled(key, request, replied) {
+    attention.delete(key)
+    settled.delete(key)
+    settled.set(key, { request, replied })
+    if (settled.size > max_pending_events) settled.delete(settled.keys().next().value)
+  }
+
+  function request_attention(kind, id, correlated = false) {
+    const key = `${kind}:${id}`
+    if (attention.has(key) || settled.has(key)) return
+    if (attention.size >= max_pending_events) {
+      relay.enqueue({ event: "logonomic.delivery_overflow" })
+      return
+    }
+    const request = { kind, id, turn_id: correlated ? turn_id : undefined }
+    attention.set(key, request)
+    ++generation
+    relay.enqueue(attention_event(kind === "permission" ? "permission.asked" : "form.created", request))
+  }
+
+  function reconcile_attention(kind, ids) {
+    // Undefined means this native collection has not hydrated, not that its
+    // previously observed requests have been answered.
+    if (!ids) return
+    for (const [key, request] of attention) {
+      if (request.kind !== kind || ids.has(request.id)) continue
+      remember_settled(key, request, false)
+      ++generation
+      // Absence proves the request is no longer pending, but neither its
+      // answer nor cancellation. Keep that distinct from native reply events.
+      relay.enqueue(attention_event(`logonomic.${kind}.resolved`, request, false))
+    }
+    for (const id of ids) request_attention(kind, id)
+  }
+
+  function snapshot_ids(requests) {
+    if (!Array.isArray(requests)) return
+    const ids = new Set()
+    for (const request of requests) {
+      if (request?.sessionID !== selected || !wake_identity(request.id)) continue
+      ids.add(request.id)
+      if (ids.size > max_pending_events) {
+        relay.enqueue({ event: "logonomic.delivery_overflow" })
+        return
+      }
+    }
+    return ids
+  }
 
   function current_session() {
     const route = ui.router.current()
@@ -91,24 +151,46 @@ export async function create_tui_integration(context) {
   }
 
   function select() {
+    if (disposed) return
     const session = current_session()
     // Home, child and plugin pages hide the conversation without changing the
     // host's admitted native session. Readiness still requires its visible root.
     if (!session) { visible = false; return }
-    if (session.id === selected && visible) return
+    const changed = session.id !== selected || !visible
     visible = true
     if (session.id !== selected) {
       if (selected) bridge?.revoke(selected)
       selected = session.id
       turn_id = undefined
+      latest_turn_id = undefined
       ++generation
       attention.clear()
+      settled.clear()
     }
     // Returning from a hidden route is new readiness evidence. Its helper
     // commit lets the host retry unread messages without changing the nonce.
-    relay.enqueue({
+    if (changed) relay.enqueue({
       event: "logonomic.session.selected", session_id: selected,
       status_type: data.session.status(selected), api_generation: 2,
+    })
+    // Read every pending identity inside the TUI's reactive selection effect,
+    // including when the same selected session finishes hydrating or refreshes.
+    const snapshot = {
+      session_id: selected,
+      permissions: snapshot_ids(data.session.permission.list(selected)),
+      forms: snapshot_ids(data.session.form.list(selected)),
+    }
+    const queued = pending_snapshot !== undefined
+    pending_snapshot = snapshot
+    if (queued) return
+    queueMicrotask(() => {
+      const snapshot = pending_snapshot
+      pending_snapshot = undefined
+      if (disposed || !visible || snapshot.session_id !== selected) return
+      // The native store updates before its event listeners. Give the native
+      // ask/reply its original turn and answer evidence before reconciling.
+      reconcile_attention("permission", snapshot.permissions)
+      reconcile_attention("form", snapshot.forms)
     })
   }
 
@@ -133,25 +215,26 @@ export async function create_tui_integration(context) {
 
   const stop_events = data.listen(({ details: event }) => {
     if (disposed) return
-    const previous = selected
     select()
     const value = event.data
     const session_id = value?.sessionID ?? value?.form?.sessionID
-    if (session_id !== selected && !(event.type === "session.deleted" && session_id === previous)) return
+    if (session_id !== selected) return
     const type = event.type
     if (type.startsWith("session.execution.") || type.startsWith("session.inbox.") ||
         type.startsWith("permission.") || type.startsWith("form.") ||
         type === "session.agent.selected" || type === "session.model.selected" || type === "session.deleted") {
       ++generation
     }
-    if (type === "session.execution.started") turn_id = wake_identity(event.id) ? event.id : undefined
+    if (type === "session.execution.started") {
+      turn_id = wake_identity(event.id) ? event.id : undefined
+      latest_turn_id = turn_id
+    }
     const projected = { event: type, session_id, api_generation: 2, ...(turn_id ? { turn_id } : {}) }
     if (type === "session.execution.started" || type === "session.execution.succeeded" ||
         type === "session.execution.failed" || type === "session.execution.interrupted") {
       relay.enqueue(projected)
       if (type !== "session.execution.started") {
         turn_id = undefined
-        attention.clear()
       }
       return
     }
@@ -161,7 +244,9 @@ export async function create_tui_integration(context) {
       selected = undefined
       visible = false
       turn_id = undefined
+      latest_turn_id = undefined
       attention.clear()
+      settled.clear()
       return
     }
     const asked = type === "permission.asked" || type === "form.created"
@@ -169,28 +254,30 @@ export async function create_tui_integration(context) {
     if (!asked && !replied) return
     const request_id = type === "form.created" ? value.form.id : value.requestID ?? value.id
     if (!wake_identity(request_id)) return
+    const kind = type.startsWith("permission.") ? "permission" : "form"
+    const key = `${kind}:${request_id}`
     if (asked) {
-      if (attention.size >= max_pending_events) {
-        relay.enqueue({ event: "logonomic.delivery_overflow" })
-        return
-      }
-      attention.set(request_id, turn_id)
-    } else {
-      if (!attention.has(request_id)) return
-      const original_turn = attention.get(request_id)
-      if (original_turn) projected.turn_id = original_turn
-      attention.delete(request_id)
+      request_attention(kind, request_id, true)
+      return
     }
-    if (type.startsWith("permission.")) projected.permission_id = request_id
-    else projected.question_id = request_id
+    // A refreshed snapshot or a local reply response can remove the request
+    // before its native reply arrives. Retain bounded correlation for that reply
+    // and prevent an older snapshot from reopening a settled identity.
+    const prior = settled.get(key)
+    const request = attention.get(key) ?? prior?.request
+    if (!request || prior?.replied) return
+    remember_settled(key, request, true)
+    // A request may outlive its execution. Its native identity still pairs the
+    // reply, but a superseded turn would prevent the host from resolving it.
+    const response = attention_event(type, request, request.turn_id === latest_turn_id)
     if (type === "form.replied") {
       // Form answer prose stays in OpenCode. False and zero are meaningful
       // answers, while an empty text field is not a confirmed reply.
-      projected.answer_nonempty = Object.values(value.answer).some((answer) =>
+      response.answer_nonempty = Object.values(value.answer).some((answer) =>
         typeof answer === "string" ? answer.trim().length > 0 :
           Array.isArray(answer) ? answer.some((text) => text.trim().length > 0) : true)
     }
-    relay.enqueue(projected)
+    relay.enqueue(response)
   })
 
   bridge = await create_wake_bridge({
@@ -247,6 +334,7 @@ export async function create_tui_integration(context) {
       await bridge?.dispose()
       await relay.dispose()
       attention.clear()
+      settled.clear()
     },
   }
 }

@@ -86,13 +86,23 @@ No version ceiling is imposed on compatible launchers.
 ## Building and local qualification
 
 Interactive native question events retain `question.asked`, `question.replied`,
-and `question.rejected`, the native question identity, and its original root
-turn. Replies carry a boolean `answer_nonempty` in the projected provider event:
+and `question.rejected` and the native question identity. Root questions retain
+their original root turn; child questions retain their native child and request
+identities without borrowing a root turn. Replies carry a boolean
+`answer_nonempty` in the projected provider event:
 true means at least one returned answer string contains non-whitespace text.
 Question and answer prose are omitted. A reply is distinct from a rejection;
 disposal or session termination clears pending correlation without fabricating
 either event. A native qualification gate must require a correlated reply with
 `answer_nonempty: true`, not merely disappearance of attention.
+
+The OpenCode 2 TUI restores pending permissions and forms from the selected
+session's native data, including after hydration and reselection. Restored
+requests have no invented execution turn. A request removed from a refreshed
+pending list resolves attention without claiming a native reply or cancellation;
+only an observed native form reply supplies `answer_nonempty`. A native reply
+keeps its request identity and answer evidence when the request outlives its
+execution; after a newer execution starts, it omits the superseded turn.
 
 The optional `attention-kind@1` companion distinguishes confirmed native
 questions from permissions and inferred conversational hints. The plugin retains
