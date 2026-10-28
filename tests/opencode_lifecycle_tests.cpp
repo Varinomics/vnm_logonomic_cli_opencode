@@ -249,7 +249,7 @@ void declared_profile_admits_every_shape(const std::filesystem::path& package)
     }
     request = event("session.idle");
     request.event.body.set("normal_completion", addon::Json_value(true));
-    request.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+    request.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target should I use?"));
     const auto hint = admitted(request, "the declaration refuses a completion that ends in a question");
     pending = hint.base.observations.front().attention_request_id;
     admitted(event("chat.message"), "the declaration refuses the reply that resolves a conversational hint");
@@ -426,7 +426,7 @@ int main(int argc, char** argv)
         auto completed = event(name);
         completed.event.body.set("status_type", addon::Json_value("idle"));
         completed.event.body.set("normal_completion", addon::Json_value(true));
-        completed.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+        completed.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target should I use?"));
         require(classify(completed).observations.front().attention_transition == addon::Attention_transition::NONE,
             "base helper ingress does not acquire optional hint semantics");
         Classification_call call(addon::Attention_classification_request{completed, std::nullopt});
@@ -442,14 +442,16 @@ int main(int argc, char** argv)
                 resolved.attention_result()->base.observations.front().attention_request_id == hint_id &&
                 resolved.attention_result()->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED,
             "new user input resolves only the host-selected hint identity");
-        for (const auto& text : {std::string("Completed."), std::string(2048, 'x') + "?"}) {
-            completed.event.body.set("assistant_text", addon::Json_value(text));
+        for (const auto& evidence : {addon::assistant_reply_evidence("Completed."),
+            addon::assistant_reply_evidence("```\nWhich target?\n```"), addon::Json_value("malformed")})
+        {
+            completed.event.body.set("assistant_reply_evidence", evidence);
             Classification_call ignored(addon::Attention_classification_request{completed, std::nullopt});
             opencode::handle_lifecycle(ignored);
             require(ignored.attention_result() && !ignored.attention_result()->attention_kind,
-                "nonquestion or overlong text does not request inferred attention");
+                "nonquestion, excluded or malformed evidence does not request inferred attention");
         }
-        completed.event.body.set("assistant_text", addon::Json_value("Which target?"));
+        completed.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target?"));
         completed.event.body.set("normal_completion", addon::Json_value(false));
         Classification_call interrupted(addon::Attention_classification_request{completed, std::nullopt});
         opencode::handle_lifecycle(interrupted);

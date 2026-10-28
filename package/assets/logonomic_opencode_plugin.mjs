@@ -5,10 +5,10 @@ import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { create_session_wake } from "./logonomic_opencode_wake.mjs"
 import { create_event_delivery } from "./logonomic_opencode_relay.mjs"
+import { Assistant_reply_evidence } from "./logonomic_opencode_reply.mjs"
 
 const maxMetadataCharacters = 256
 const maxPendingItems = 32
-const max_assistant_text_bytes = 2048
 const maxPendingTurnCandidates = 8
 const maxChildSessions = 128
 const maxChildParentDepth = 16
@@ -487,6 +487,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const pending_questions = new Map()
   const pending_permissions = new Map()
   const assistant_replies = new Map()
+  const reply_text = new Map()
   const hint_candidates = new Set()
   const pendingRootTurns = new Map()
   const degradedRootSessions = new Set()
@@ -557,10 +558,10 @@ export const Logonomic = async ({ client }, options = {}) => {
       .some((question) => question.session_id === session_id)
     clear_attention_state(session_id, true)
     if (reply?.turn_id === turn_id && reply.normal &&
-        reply.text !== undefined && !pending_question) {
+        reply.evidence !== undefined && !pending_question) {
       if (hint_candidates.size >= maxPendingItems) return childObservationLoss()
       projected.normal_completion = true
-      projected.assistant_text = reply.text
+      projected.assistant_reply_evidence = reply.evidence
       hint_candidates.add(session_id)
     }
     return projected
@@ -1057,7 +1058,7 @@ export const Logonomic = async ({ client }, options = {}) => {
           return childObservationLoss()
         }
         const reply = retained?.message_id === messageID
-          ? retained : { message_id: messageID, turn_id: parentID, text: "", part_id: undefined }
+          ? retained : { message_id: messageID, turn_id: parentID }
         reply.normal = info.finish === "stop" && !info.error &&
           Number.isFinite(info.time?.completed) && info.time.completed > 0
         assistant_replies.set(sessionID, reply)
@@ -1240,16 +1241,9 @@ export const Logonomic = async ({ client }, options = {}) => {
     return submitted
   }
 
-  const project_completed_text = ({ session_id, message_id, part_id, text }) => {
+  const project_completed_text = ({ session_id, message_id, evidence }) => {
     const reply = assistant_replies.get(session_id)
-    if (!reply || reply.message_id !== message_id || reply.part_id === part_id) return
-    reply.part_id = part_id
-    if (text === undefined || reply.text === undefined ||
-        Buffer.byteLength(reply.text, "utf8") + Buffer.byteLength(text, "utf8") > max_assistant_text_bytes) {
-      reply.text = undefined
-      return
-    }
-    reply.text += text
+    if (reply?.message_id === message_id) reply.evidence = evidence
   }
 
   // Logonomic resumes a session by relaunching OpenCode with --session, which
@@ -1459,6 +1453,7 @@ export const Logonomic = async ({ client }, options = {}) => {
         rootTurnIDs.clear()
         pending_questions.clear()
         assistant_replies.clear()
+        reply_text.clear()
         hint_candidates.clear()
         pendingRootTurns.clear()
         degradedRootSessions.clear()
@@ -1500,6 +1495,18 @@ export const Logonomic = async ({ client }, options = {}) => {
   hooks.event = ({ event }) => {
     try {
       session_wake?.event(event)
+      // Release native text state at native event order, before queued helper
+      // delivery. An older queued completion must not erase a newer reply.
+      const info = event?.properties?.info
+      if (event?.type === "message.updated" && Number.isFinite(info?.time?.completed) &&
+          info.time.completed > 0 && reply_text.get(info.sessionID)?.message_id === info.id) {
+        reply_text.delete(info.sessionID)
+      } else if (event?.type === "session.deleted") {
+        reply_text.delete(info?.id)
+      } else if (["session.error", "session.idle"].includes(event?.type) ||
+          (event?.type === "session.status" && event.properties?.status?.type === "idle")) {
+        reply_text.delete(event.properties?.sessionID)
+      }
       if (relevantEvents.has(event?.type)) {
         if (event.type.startsWith("question.")) {
           const properties = event.properties
@@ -1540,14 +1547,21 @@ export const Logonomic = async ({ client }, options = {}) => {
     const session_id = metadata(input?.sessionID)
     const message_id = metadata(input?.messageID)
     const part_id = metadata(input?.partID)
-    if (!session_id || !message_id || !part_id) return
-    const text = output?.text
-    enqueue({ kind: "completed_text", session_id, message_id, part_id,
-      // A UTF-8 round trip rejects lone surrogates without requiring newer
-      // String APIs. Bound the input before allocating the encoded copy.
-      text: typeof text === "string" && text.length <= max_assistant_text_bytes && !text.includes("\0") &&
-        Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes &&
-        Buffer.from(text, "utf8").toString("utf8") === text ? text : undefined })
+    if (!accepting || !session_id || !message_id || !part_id) return
+    let retained = reply_text.get(session_id)
+    if (retained?.message_id !== message_id) {
+      if (!retained && reply_text.size >= maxPendingItems) {
+        enqueue({ kind: "overflow" })
+        return
+      }
+      retained = { message_id, scan: new Assistant_reply_evidence() }
+      reply_text.set(session_id, retained)
+    }
+    if (retained.part_id === part_id) return
+    retained.part_id = part_id
+    retained.scan.append(output?.text)
+    enqueue({ kind: "completed_text", session_id, message_id,
+      evidence: retained.scan.snapshot() })
   }
   const resumedSessionID = metadata(
     process.env.OPENCODE_LOGONOMIC_RESUME_SESSION,

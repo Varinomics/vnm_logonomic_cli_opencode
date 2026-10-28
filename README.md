@@ -105,12 +105,15 @@ keeps its request identity and answer evidence when the request outlives its
 execution; after a newer execution starts, it omits the superseded turn.
 
 The optional `attention-kind@1` companion distinguishes confirmed native
-questions from permissions and inferred conversational hints. The plugin retains
-at most 2048 UTF-8 bytes of completed assistant text per correlated message and
-supplies it only on normal root completion (`finish: stop`, completed timestamp,
-no error), before the first idle event clears turn identity. Overlong or invalid
-text is unavailable, not truncated into a different question. This bounded text
-is private classifier input, never copied into lifecycle observation fields.
+questions from permissions and inferred conversational hints. The OpenCode 1
+plugin scans complete native assistant text parts while retaining bounded
+Markdown context and the final prose paragraph's first and last 128 UTF-8 bytes.
+It supplies those explicitly scoped edges only on normal root completion
+(`finish: stop`, completed timestamp, no error), before the first idle event
+clears turn identity. Long explanations retain their closing question; invalid,
+quoted or code evidence is omitted. Part boundaries preserve fence, quote and
+paragraph context. These edges are private classifier input, never a claimed
+complete message or copied into lifecycle observation fields.
 The existing SDK local heuristic classifies hints; genuine subsequent user input
 can resolve only the host-selected conversational hint. No transcript hydration
 or external classification is used. Pending question, reply, and hint tracking

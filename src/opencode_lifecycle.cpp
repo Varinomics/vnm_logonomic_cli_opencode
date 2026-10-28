@@ -303,9 +303,9 @@ std::optional<addon::Attention_classification_result> classify_attention(
         (name == "session.status" && metadata(body, "status_type") == "idle"))
     {
         const auto* normal = body.find("normal_completion");
-        const auto* text = body.find("assistant_text");
-        if (normal && normal->is_boolean() && normal->as_boolean() && text && text->is_string() &&
-            text->as_string().size() <= 2048 && addon::looks_like_reply_request(text->as_string()))
+        const auto* evidence = body.find("assistant_reply_evidence");
+        if (normal && normal->is_boolean() && normal->as_boolean() && evidence &&
+            addon::looks_like_reply_request_evidence(*evidence))
         {
             observation.attention_transition = addon::Attention_transition::REQUESTED;
             observation.attention_evidence = addon::Evidence::INFERRED;

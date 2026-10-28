@@ -1,14 +1,16 @@
 // Native event fixtures preserve the adopted root/child correlation and bounded
 // projection contract while exercising the packaged SDK helper subprocess.
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const [pluginPath, helperPath, wrapperPath] = process.argv.slice(2)
-assert(pluginPath && helperPath && wrapperPath,
-  "Expected plugin, packaged helper and test vnmctl executable paths")
+const [pluginPath, helperPath, wrapperPath, verifierPath, packagePath] = process.argv.slice(2)
+assert(pluginPath && helperPath && wrapperPath && verifierPath && packagePath,
+  "Expected plugin, packaged helper, test vnmctl, reply verifier and package paths")
+const reply_cases = []
 const scratch = mkdtempSync(join(tmpdir(), "opencode-plugin-"))
 const capturePath = join(scratch, "events.jsonl")
 process.once("exit", () => rmSync(scratch, { recursive: true, force: true }))
@@ -830,6 +832,75 @@ resetCapture()
   assert.deepEqual(captured(), observed)
 }
 
+// A normal attributed reply still carries its final question after a long
+// explanation; the native text-complete hook supplies the complete text part.
+resetCapture()
+{
+  const session_id = "long-reply-question"
+  const turn_id = `published-turn-${session_id}`
+  const message_id = `assistant-${turn_id}`
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  const text = privateCanary + "An explanation. ".repeat(400) + "\n\nWhich target should I use?"
+  await plugin["experimental.text.complete"](
+    { sessionID: session_id, messageID: message_id, partID: "part-long" }, { text })
+  event(plugin, "message.updated", { info: {
+    id: message_id, sessionID: session_id, parentID: turn_id, role: "assistant",
+    finish: "stop", time: { completed: 1234 },
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  await settle(plugin)
+  const body = captured().find((item) => item.event === "session.status")
+  assert.equal(body.normal_completion, true, "a long normal reply lost its closing conversational question")
+  assert.equal(body.assistant_reply_evidence.suffix, "Which target should I use?")
+  reply_cases.push({ text, body, hint: true })
+}
+
+
+// Text parts can split a Markdown opener, a CRLF boundary, or a long paragraph.
+// The complete attributed reply remains the oracle, regardless of that split.
+const long_text = "A complete explanation. ".repeat(350)
+const stream_cases = [
+  { parts: [long_text, " Which target?"], hint: true },
+  { parts: ["Please provide ", long_text, "."], hint: true },
+  { parts: ["Which target?", " ".repeat(5000)], hint: true },
+  { parts: ["``", "`text\n", long_text, "\n\nWhich target?"], hint: false },
+  { parts: ["~~~~text\r", "\n", long_text, "\n~~~\nWhich target?"], hint: false },
+  { parts: ["```text\n", long_text, "\n```\n\nWhich target?"], hint: true },
+  { parts: ["~~~text\n", long_text, "\n~~~ trailing text\nWhich target?"], hint: false },
+  { parts: ["> ", long_text, "\nWhich target?"], hint: false },
+  { parts: ["Prose\n> Quoted text", "\nWhich target?"], hint: false },
+  { parts: ["> Quote\n", "\nWhich target?"], hint: true },
+  { parts: ["Complete.\r", "\n \t\r", "\nWhich target?"], hint: true },
+  { parts: ["Which target?\n\n", "    code question?"], hint: false },
+  { parts: ["Which target?\n\n", "> quoted question?"], hint: false },
+  { parts: ["界".repeat(750), "选择哪个目标？"], hint: true },
+  { parts: [long_text, "\n\nComplete."], hint: false },
+]
+for (const [index, { parts, hint }] of stream_cases.entries()) {
+  resetCapture()
+  const session_id = `stream-reply-${index}`
+  const turn_id = `published-turn-${session_id}`
+  const message_id = `assistant-${turn_id}`
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  for (const [part, text] of parts.entries()) {
+    const input = { sessionID: session_id, messageID: message_id, partID: `part-${part}` }
+    await plugin["experimental.text.complete"](input, { text })
+    // Repeated delivery of the same complete part must not duplicate its bytes.
+    await plugin["experimental.text.complete"](input, { text })
+  }
+  event(plugin, "message.updated", { info: {
+    id: message_id, sessionID: session_id, parentID: turn_id, role: "assistant",
+    finish: "stop", time: { completed: 1234 },
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  await settle(plugin)
+  const body = captured().find((item) => item.event === "session.status")
+  assert(body, "normal completion was lost while scanning text parts")
+  reply_cases.push({ text: parts.join(""), body, hint })
+}
+
 for (const disposition of ["normal", "intermediate", "aborted", "oversized", "unicode", "pending-question",
   "lone-high", "lone-low", "surrogate-pair", "replacement-character", "nul"]) {
   resetCapture()
@@ -867,13 +938,18 @@ for (const disposition of ["normal", "intermediate", "aborted", "oversized", "un
   await settle(plugin)
   const observed = captured()
   const completion = observed.find((item) => item.event === "session.status")
-  if (["normal", "unicode", "surrogate-pair", "replacement-character"].includes(disposition)) {
-    assert.equal(completion.assistant_text, text)
+  if (["normal", "oversized", "unicode", "surrogate-pair", "replacement-character"].includes(disposition)) {
+    assert.equal(completion.assistant_reply_evidence.scope, "final_paragraph_edges")
+    assert.equal(completion.assistant_reply_evidence.context, "prose")
+    for (const edge of ["prefix", "suffix"]) {
+      assert(Buffer.byteLength(completion.assistant_reply_evidence[edge], "utf8") <= 128)
+    }
+    reply_cases.push({ text, body: completion, hint: true })
     assert.equal(completion.normal_completion, true)
     assert.equal(observed.filter((item) => item.event === "session.status").length, 1)
     assert.equal(observed.at(-1).event, "chat.message")
   } else {
-    assert(observed.every((item) => item.assistant_text === undefined))
+    assert(observed.every((item) => item.assistant_reply_evidence === undefined))
     assert(observed.every((item) => item.event !== "chat.message"))
   }
 }
@@ -994,4 +1070,10 @@ resetCapture()
   assert.equal(captured()[1].turn_id, "turn-after-resume")
 }
 
+const reply_cases_path = join(scratch, "reply-cases.json")
+writeFileSync(reply_cases_path, JSON.stringify(reply_cases))
+const reply_verification = spawnSync(verifierPath, [packagePath, reply_cases_path], { encoding: "utf8" })
+assert.equal(reply_verification.status, 0,
+  `packaged reply evidence failed: ${reply_verification.stdout}${reply_verification.stderr}`)
+process.stdout.write(reply_verification.stdout)
 console.log("native-agent-plugin-passed")
