@@ -42,6 +42,10 @@ imported into another generation. OpenCode 2 reads `session_v2` and projected
 `session_message` rows in `seq` order. Generation selection comes from the
 verified native launch, rather than the presence of a table.
 
+Legacy user-message summaries are objects holding change titles, bodies and
+diffs, retained as labelled full-export metadata after the original parts.
+Only an assistant's Boolean summary flag identifies a compaction summary.
+
 Both generations copy a fork's prefix into the child. Export never follows a
 parent or adds subagent histories. Staged reverts use the native cleanup
 prefix: legacy supports a message and optional part boundary; OpenCode 2 keeps

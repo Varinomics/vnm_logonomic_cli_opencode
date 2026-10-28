@@ -183,6 +183,23 @@ add_executable(opencode_launcher_tests tests/opencode_launcher_tests.cpp)
 target_link_libraries(opencode_launcher_tests PRIVATE opencode_provider)
 opencode_target(opencode_launcher_tests)
 add_test(NAME opencode_launcher_tests COMMAND opencode_launcher_tests)
+add_executable(opencode_conversation_tests
+    tests/opencode_conversation_tests.cpp
+    tests/opencode_conversation_tui_tests.cpp)
+target_link_libraries(opencode_conversation_tests PRIVATE opencode_provider)
+opencode_target(opencode_conversation_tests)
+if(MINGW)
+    target_include_directories(opencode_conversation_tests PRIVATE "${opencode_sqlite_include}")
+elseif(NOT WIN32)
+    target_link_libraries(opencode_conversation_tests PRIVATE SQLite::SQLite3)
+endif()
+add_dependencies(opencode_conversation_tests opencode_package)
+add_test(NAME opencode_conversation_tests COMMAND opencode_conversation_tests)
+add_executable(opencode_conversation_source_tests tests/opencode_conversation_source_tests.cpp)
+target_link_libraries(opencode_conversation_source_tests PRIVATE opencode_provider)
+opencode_target(opencode_conversation_source_tests)
+add_dependencies(opencode_conversation_source_tests opencode_package)
+add_test(NAME opencode_conversation_source_tests COMMAND opencode_conversation_source_tests)
 add_executable(opencode_fake_vnmctl tests/opencode_fake_vnmctl.cpp)
 opencode_target(opencode_fake_vnmctl)
 add_executable(opencode2_native_prepare tests/opencode2_native_prepare.cpp)
@@ -225,6 +242,7 @@ add_test(NAME opencode_package_conformance COMMAND logonomic_cli_addon_conforman
     "${OPENCODE_PACKAGE_DIRECTORY}")
 set_tests_properties(
     opencode_preparation_tests opencode_acp_tests opencode_lifecycle_tests opencode_launcher_tests
+    opencode_conversation_tests opencode_conversation_source_tests
     opencode_plugin_tests opencode_context_plugin_tests opencode_helper_tests
     opencode_helper_cancellation_tests opencode_wake_plugin_tests opencode_tui_plugin_tests
     opencode_package_validation opencode_package_conformance

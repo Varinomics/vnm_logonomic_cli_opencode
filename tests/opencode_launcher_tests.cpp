@@ -199,7 +199,9 @@ int main(int argc, char** argv)
     // vendor CLI or network access.
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         if (!std::getenv("OPENCODE_FIXTURE_NO_PROMPT")) {
-            std::cout << "Options:\n  --prompt <text>  Initial interactive message\n";
+            // Native OpenCode 1.18.33 writes successful --help output to stderr.
+            auto& output = std::getenv("OPENCODE_FIXTURE_HELP_STDOUT") ? std::cout : std::cerr;
+            output << "Options:\n  --prompt <text>  Initial interactive message\n";
         }
         return 0;
     }
@@ -538,7 +540,12 @@ int main(int argc, char** argv)
     interactive.initial_prompt = first_message;
     const auto initial_patch = prepare_interactive();
     check(initial_message_delivered(initial_patch) && lifecycle_reported(initial_patch) == true,
-        "hooks-generation native invocation receives the exact first message once");
+        "native stderr help permits delivery of the exact first message once");
+    interactive.launch_environment->effective_environment.set("OPENCODE_FIXTURE_HELP_STDOUT", addon::Json_value("1"));
+    const auto stdout_initial = prepare_interactive();
+    check(initial_message_delivered(stdout_initial) && lifecycle_reported(stdout_initial) == true,
+        "native stdout help remains compatible with delivery of the exact first message once");
+    interactive.launch_environment->effective_environment.erase("OPENCODE_FIXTURE_HELP_STDOUT");
     interactive.launcher.script_body += " --model provider/model --auto";
     interactive.launcher_argv.insert(interactive.launcher_argv.end(), {"--model", "provider/model", "--auto"});
     const auto configured_initial = prepare_interactive();

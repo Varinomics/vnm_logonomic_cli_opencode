@@ -2,6 +2,7 @@
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/managed_assets.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/profile_storage.h>
@@ -66,7 +67,7 @@ int prepare(int argc, char** argv)
     addon::Simulator_invocation_options invocation;
     invocation.profile_storage = request->profile_storage;
     const auto id = host.invoke({"launch-preparation", 3}, "prepare",
-        addon::encode_prepare_request(*request, 3), 15000, invocation);
+        addon::encode_prepare_request(*request, 3), addon::limits::k_launch_prepare_deadline_ms, invocation);
     const auto outcome = host.wait_outcome(id, 18000);
     require(outcome.has_value(), "packaged native preparation did not complete");
     require(outcome->status == addon::Host_status::SUCCESS,

@@ -1,10 +1,12 @@
 #include "opencode_preparation.h"
+#include "opencode_conversation.h"
 
 #include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
@@ -102,7 +104,8 @@ void instruction_tests(const fs::path& root)
 addon::Host_outcome invoke(addon::Host_simulator& host, const addon::Capability_pair& capability,
     std::string operation, addon::Json_value payload)
 {
-    const auto id = host.invoke(capability, std::move(operation), std::move(payload), 15000);
+    const auto id = host.invoke(capability, std::move(operation), std::move(payload),
+        addon::limits::k_launch_prepare_deadline_ms);
     const auto result = host.wait_outcome(id, 18000);
     require(result.has_value(), "adapter invocation completed");
     return *result;
@@ -122,6 +125,10 @@ void adapter_tests(const fs::path& package, const fs::path& root)
             return capability.capability_id == addon::k_interactive_initial_prompt_capability_id &&
                 capability.version == addon::k_interactive_initial_prompt_version;
         }), "packaged first-message declaration and live handshake agree");
+    require(std::any_of(capabilities.begin(), capabilities.end(), [](const auto& capability) {
+            return capability.capability_id == addon::k_conversation_export_capability_id &&
+                capability.version == addon::k_conversation_export_prepared_source_version;
+        }), "packaged prepared-source export declaration and live handshake agree");
     addon::Attention_classification_request attention;
     attention.base.event.name = "question.replied";
     attention.base.event.body.set("event", addon::Json_value("question.replied"));
@@ -157,6 +164,8 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));
     request.launcher_argv = {"opencode"};
     request.session_wake = addon::Session_wake_offer{};
+    request.launch_environment->effective_environment.set(opencode::k_export_source_environment,
+        addon::Json_value("v1|inherited-source.db"));
     const auto valid_environment = request.launch_environment->effective_environment;
     for (const char* invalid : {"[]", "{/*", "{\"instructions\":false}",
              "{\"instructions\":[3]}", "{\"plugin\":false}", "{\"plugin\":[[\"private-sentinel\",false]]}"})
@@ -178,6 +187,10 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     require(prepared.status == addon::Host_status::SUCCESS, "interactive prepare remains available without verified lifecycle");
     const auto patch = addon::decode_launch_patch(prepared.payload, &failure, 3);
     require(patch.has_value(), "prepared patch decodes");
+    require(std::find(patch->unset.begin(), patch->unset.end(), opencode::k_export_source_environment) !=
+            patch->unset.end() && std::none_of(patch->set.begin(), patch->set.end(), [](const auto& entry) {
+                return entry.first == opencode::k_export_source_environment;
+            }), "an unverified ordinary launch unsets its inherited export source without blocking launch");
     require(patch->session_wake && !patch->session_wake->available &&
             patch->session_wake->reason == "opencode_launcher_unverified",
         "an offered wake reports the unavailable launcher without inventing a live binding");
