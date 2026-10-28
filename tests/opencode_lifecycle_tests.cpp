@@ -364,6 +364,40 @@ int main(int argc, char** argv)
             permission_call.attention_result()->attention_kind->kind == "permission",
         "permissions are not classified as questions");
 
+    for (const auto* name : {"permission.asked", "permission.replied",
+        "question.asked", "question.replied", "question.rejected"})
+    {
+        const bool is_permission = std::string_view(name).starts_with("permission.");
+        auto request = event(name);
+        request.event.body.erase("turn_id");
+        request.event.body.set("agent_id", addon::Json_value("background-child"));
+        request.event.body.set(is_permission ? "permission_id" : "question_id",
+            addon::Json_value("background-request"));
+        if (std::string_view(name) == "question.replied") {
+            request.event.body.set("answer_nonempty", addon::Json_value(true));
+        }
+        const auto observation = classify(request).observations.front();
+        require(observation.provider_session_id == "session-primary" &&
+                observation.agent_id == "background-child" && observation.provider_turn_id.empty() &&
+                observation.attention_request_id == "background-request" &&
+                observation.attention_transition == (std::string_view(name).ends_with(".asked")
+                    ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED) &&
+                observation.phase_transition == addon::Phase_transition::NONE &&
+                observation.outcome_transition == addon::Outcome_transition::NONE,
+            "background child attention retains ownership without claiming a root turn or phase");
+        Classification_call call(addon::Attention_classification_request{request, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind &&
+                result->attention_kind->kind == (is_permission ? "permission" : "interactive_question"),
+            "background child prompts retain their confirmed attention kind");
+        request.event.body.set("agent_id", addon::Json_value(""));
+        Classification_call malformed_child(request);
+        opencode::handle_lifecycle(malformed_child);
+        require(malformed_child.status() == addon::Result_status::FAILED,
+            "missing child identity cannot bypass root turn correlation");
+    }
+
     for (const auto* name : {"session.idle", "session.status"}) {
         auto completed = event(name);
         completed.event.body.set("status_type", addon::Json_value("idle"));

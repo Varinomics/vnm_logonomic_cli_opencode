@@ -179,8 +179,18 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.observations.push_back(std::move(observation));
         return result;
     }
+    const bool attention = asked || replied || question_asked || question_replied || question_rejected;
+    const auto agent     = attention ? metadata(body, "agent_id") : std::nullopt;
+    if (attention && body.find("agent_id") && !agent) {
+        return std::nullopt;
+    }
+    if (agent) {
+        observation.agent_id = *agent;
+    }
+    // A child prompt can outlive or overlap root turns. Its session and request
+    // identities establish attention without attributing it to a root turn.
     const auto turn = metadata(body, "turn_id");
-    if (!turn && (!native_inbox || body.find("turn_id"))) {
+    if (!turn && ((!native_inbox && !agent) || body.find("turn_id"))) {
         return std::nullopt;
     }
     // OpenCode 2 terminal events can be observed after attaching to a run.
