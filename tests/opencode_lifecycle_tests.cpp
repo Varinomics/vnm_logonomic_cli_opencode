@@ -422,8 +422,10 @@ int main(int argc, char** argv)
             "missing child identity cannot bypass root turn correlation");
     }
 
-    for (const auto* name : {"session.idle", "session.status"}) {
+    for (const auto* name : {"session.idle", "session.status", "session.execution.succeeded"}) {
         auto completed = event(name);
+        const bool native_inbox = std::string_view(name) == "session.execution.succeeded";
+        if (native_inbox) completed.event.body.set("api_generation", addon::Json_value(2));
         completed.event.body.set("status_type", addon::Json_value("idle"));
         completed.event.body.set("normal_completion", addon::Json_value(true));
         completed.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target should I use?"));
@@ -436,12 +438,34 @@ int main(int argc, char** argv)
                 result->base.observations.front().attention_evidence == addon::Evidence::INFERRED,
             "normal completed text uses the local SDK heuristic as inferred evidence");
         const auto hint_id = result->base.observations.front().attention_request_id;
-        Classification_call resolved(addon::Attention_classification_request{event("chat.message"), hint_id});
+        auto submitted = event(native_inbox ? "session.inbox.enqueued" : "chat.message");
+        if (native_inbox) {
+            submitted.event.body.erase("turn_id");
+            submitted.event.body.set("api_generation", addon::Json_value(2));
+            submitted.event.body.set("input_type", addon::Json_value("user"));
+        }
+        Classification_call resolved(addon::Attention_classification_request{submitted, hint_id});
         opencode::handle_lifecycle(resolved);
         require(resolved.attention_result() &&
                 resolved.attention_result()->base.observations.front().attention_request_id == hint_id &&
                 resolved.attention_result()->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED,
             "new user input resolves only the host-selected hint identity");
+        if (native_inbox) {
+            for (const auto* input_type : {"synthetic", "compaction", "move"}) {
+                submitted.event.body.set("input_type", addon::Json_value(input_type));
+                Classification_call unrelated(addon::Attention_classification_request{submitted, hint_id});
+                opencode::handle_lifecycle(unrelated);
+                require(unrelated.attention_result() && unrelated.attention_result()->base.observations.empty() &&
+                        !unrelated.attention_result()->attention_kind,
+                    "native synthetic or housekeeping input cannot answer a conversational hint");
+            }
+            auto attached = completed;
+            attached.event.body.erase("turn_id");
+            Classification_call unknown_turn(addon::Attention_classification_request{attached, std::nullopt});
+            opencode::handle_lifecycle(unknown_turn);
+            require(unknown_turn.attention_result() && !unknown_turn.attention_result()->attention_kind,
+                "a terminal event without its observed start cannot infer a completed reply");
+        }
         for (const auto& evidence : {addon::assistant_reply_evidence("Completed."),
             addon::assistant_reply_evidence("```\nWhich target?\n```"), addon::Json_value("malformed")})
         {

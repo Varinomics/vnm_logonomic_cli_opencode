@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
@@ -376,6 +377,84 @@ try {
     assert.equal(refreshed_events.some((event) => event.event === "session.deleted" || event.event === "session.execution.failed"),
       false, "background terminal events cannot end the newly selected session or clear its pending prompts")
 
+    const completed_cases = []
+    for (const [parts, hint] of [
+      [["A detailed explanation. ".repeat(250), "\n\nWhich target should I use?"], true],
+      [["Which ", "é𝛼 ".repeat(600), "target should I use?"], true],
+      [["Completed."], false],
+      [["```\n", "Which target?\n", "```"], false],
+      [["> Which ", "target?"], false],
+      [["```\nexample\n```\n\nWhich target?"], true],
+    ]) {
+      const events = await attention_events(async ({ permissions, forms, event, select }) => {
+        permissions.set("ses_root", [])
+        forms.set("ses_root", [])
+        await select()
+        await event("session.execution.started", { sessionID: "ses_root" }, "evt_prose")
+        const owner = { sessionID: "ses_root", assistantMessageID: "msg_reply" }
+        await event("session.step.started", owner)
+        await event("session.reasoning.ended", { ...owner, ordinal: 0, text: "Which private reasoning?" })
+        for (const [ordinal, text] of parts.entries()) {
+          await event("session.text.started", { ...owner, ordinal })
+          await event("session.text.delta", { ...owner, ordinal, delta: "not the complete native text" })
+          await event("session.text.ended", { ...owner, ordinal, text })
+        }
+        await event("session.step.ended", { ...owner, finish: "stop" })
+        await event("session.execution.succeeded", { sessionID: "ses_root" })
+      })
+      const body = events.find((value) => value.event === "session.execution.succeeded")
+      assert(body, "normal root completion must survive reply processing")
+      if (hint) {
+        assert.equal(body.normal_completion, true, "complete attributed native reply must reach the classifier")
+        assert(Buffer.byteLength(JSON.stringify(body)) < 1024, "long complete native prose must remain bounded at ingress")
+      }
+      assert.equal(JSON.stringify(events).includes("private reasoning"), false)
+      completed_cases.push({ text: parts.join(""), body, hint })
+    }
+    if (process.argv[5] && process.argv[6]) {
+      const cases_path = join(root, "native-replies.json")
+      await writeFile(cases_path, JSON.stringify(completed_cases))
+      const checked = spawnSync(resolve(process.argv[5]), [resolve(process.argv[6]), cases_path], { encoding: "utf8" })
+      assert.equal(checked.status, 0, checked.stdout + checked.stderr)
+      process.stdout.write(checked.stdout)
+    }
+
+    for (const missing of ["start", "text_start", "text_end", "ordinal", "step_end", "tool_finish", "later_step",
+      "reconnect", "new_input", "pending_form", "failed", "interrupted"]) {
+      const events = await attention_events(async ({ permissions, forms, event, select }) => {
+        permissions.set("ses_root", [])
+        forms.set("ses_root", [])
+        await select()
+        if (missing !== "start") await event("session.execution.started", { sessionID: "ses_root" }, "evt_incomplete")
+        const owner = { sessionID: "ses_root", assistantMessageID: "msg_reply" }
+        await event("session.step.started", owner)
+        const part = { ...owner, ordinal: missing === "ordinal" ? 1 : 0 }
+        if (missing !== "text_start") await event("session.text.started", part)
+        if (missing !== "text_end") await event("session.text.ended", { ...part, text: "Which target?" })
+        if (missing !== "step_end") await event("session.step.ended", { ...owner, finish: missing === "tool_finish" ? "tool-calls" : "stop" })
+        if (missing === "later_step") await event("session.step.started", { ...owner, assistantMessageID: "msg_tool_result" })
+        if (missing === "reconnect") await event("server.connected", {})
+        if (missing === "new_input") await event("session.inbox.enqueued", { sessionID: "ses_root", item: { type: "user" } })
+        if (missing === "pending_form") {
+          forms.set("ses_root", [form("frm_pending")])
+          await event("form.created", { form: form("frm_pending") })
+        }
+        await event(`session.execution.${["failed", "interrupted"].includes(missing) ? missing : "succeeded"}`,
+          { sessionID: "ses_root" })
+      })
+      assert.equal(events.some((value) => value.assistant_reply_evidence), false,
+        `${missing} cannot establish a complete normal attributed reply`)
+    }
+    const input_events = await attention_events(async ({ event, select }) => {
+      await select()
+      await event("session.inbox.enqueued", { sessionID: "ses_root", item: { type: "synthetic", text: private_canary } })
+      await event("session.inbox.enqueued", { sessionID: "ses_other", item: { type: "user", text: private_canary } })
+      await event("session.inbox.enqueued", { sessionID: "ses_root", item: { type: "user", text: private_canary } })
+    })
+    assert.deepEqual(input_events.filter((value) => value.event === "session.inbox.enqueued"), [{
+      event: "session.inbox.enqueued", session_id: "ses_root", api_generation: 2, input_type: "user",
+    }], "only genuine selected-root user input can resolve its conversational hint, without forwarding input prose")
+
     const overflow_events = await attention_events(async ({ permissions, select }) => {
       permissions.set("ses_root", Array.from({ length: 33 }, (_, index) => permission(`per_${index}`)))
       await select()
@@ -384,7 +463,7 @@ try {
       ["logonomic.session.selected", "logonomic.delivery_overflow"],
       "an oversized native snapshot degrades lifecycle instead of claiming that a truncated list is complete")
   }
-  console.log("OpenCode TUI contract: selection, pending reconciliation, native replies, wake policy and cleanup passed")
+  console.log("OpenCode TUI contract: selection, complete replies, pending reconciliation, wake policy and cleanup passed")
 } finally {
   await integration?.dispose()
   await rm(root, { recursive: true, force: true })

@@ -129,7 +129,8 @@ add_test(NAME opencode_wake_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
 add_test(NAME opencode_tui_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_tui_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_tui.mjs"
-    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
+    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>"
+    "$<TARGET_FILE:opencode_reply_evidence_tests>" "${OPENCODE_PACKAGE_DIRECTORY}")
 add_test(NAME opencode_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"

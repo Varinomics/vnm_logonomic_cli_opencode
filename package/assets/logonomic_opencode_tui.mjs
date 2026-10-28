@@ -1,5 +1,6 @@
 import { create_wake_bridge, wake_identity, wake_unavailable } from "./logonomic_opencode_bridge.mjs"
 import { create_event_delivery } from "./logonomic_opencode_relay.mjs"
+import { Assistant_reply_evidence } from "./logonomic_opencode_reply.mjs"
 
 const max_pending_events = 32
 const delivery_timeout_ms = 47000
@@ -85,6 +86,7 @@ export async function create_tui_integration(context) {
   let disposed = false
   let bridge
   let pending_snapshot
+  let assistant_reply
 
   function attention_event(event, request, correlated = true) {
     return {
@@ -143,6 +145,39 @@ export async function create_tui_integration(context) {
     return ids
   }
 
+  function observe_reply(type, value) {
+    if (type === "session.step.started") {
+      assistant_reply = turn_id && wake_identity(value.assistantMessageID) ? {
+        message_id: value.assistantMessageID, ordinal: 0, pending: false,
+        scan: new Assistant_reply_evidence(),
+      } : undefined
+      return
+    }
+    const reply = assistant_reply
+    if (!reply || value.assistantMessageID !== reply.message_id) return
+    if (type === "session.text.started") {
+      if (reply.pending || reply.complete || value.ordinal !== reply.ordinal) {
+        assistant_reply = undefined
+      } else {
+        reply.pending = true
+      }
+    } else if (type === "session.text.ended") {
+      // Text.Ended is the native complete-value boundary; deltas never prove
+      // completeness. Text ordinals are sequential within each assistant step.
+      if (!reply.pending || value.ordinal !== reply.ordinal) {
+        assistant_reply = undefined
+      } else {
+        reply.scan.append(value.text)
+        reply.pending = false
+        ++reply.ordinal
+      }
+    } else if (type === "session.step.ended") {
+      reply.complete = !reply.pending && value.finish === "stop"
+    } else if (type === "session.step.failed") {
+      assistant_reply = undefined
+    }
+  }
+
   function current_session() {
     const route = ui.router.current()
     if (route.type !== "session" || !wake_identity(route.sessionID)) return
@@ -163,6 +198,7 @@ export async function create_tui_integration(context) {
       selected = session.id
       turn_id = undefined
       latest_turn_id = undefined
+      assistant_reply = undefined
       ++generation
       attention.clear()
       settled.clear()
@@ -217,9 +253,18 @@ export async function create_tui_integration(context) {
     if (disposed) return
     select()
     const value = event.data
+    const type = event.type
+    if (type === "server.connected") {
+      // A disconnected interval may contain an unseen execution boundary.
+      // Keep paired requests, but require a fresh observed start for prose.
+      turn_id = undefined
+      latest_turn_id = undefined
+      assistant_reply = undefined
+      ++generation
+      return
+    }
     const session_id = value?.sessionID ?? value?.form?.sessionID
     if (session_id !== selected) return
-    const type = event.type
     if (type.startsWith("session.execution.") || type.startsWith("session.inbox.") ||
         type.startsWith("permission.") || type.startsWith("form.") ||
         type === "session.agent.selected" || type === "session.model.selected" || type === "session.deleted") {
@@ -228,14 +273,29 @@ export async function create_tui_integration(context) {
     if (type === "session.execution.started") {
       turn_id = wake_identity(event.id) ? event.id : undefined
       latest_turn_id = turn_id
+      assistant_reply = undefined
     }
+    observe_reply(type, value)
     const projected = { event: type, session_id, api_generation: 2, ...(turn_id ? { turn_id } : {}) }
     if (type === "session.execution.started" || type === "session.execution.succeeded" ||
         type === "session.execution.failed" || type === "session.execution.interrupted") {
+      if (type === "session.execution.succeeded" && turn_id && assistant_reply?.complete && !attention.size) {
+        const evidence = assistant_reply.scan.snapshot()
+        if (evidence) {
+          projected.normal_completion = true
+          projected.assistant_reply_evidence = evidence
+        }
+      }
       relay.enqueue(projected)
       if (type !== "session.execution.started") {
         turn_id = undefined
+        assistant_reply = undefined
       }
+      return
+    }
+    if (type === "session.inbox.enqueued" && value.item?.type === "user") {
+      assistant_reply = undefined
+      relay.enqueue({ event: type, session_id: selected, api_generation: 2, input_type: "user" })
       return
     }
     if (type === "session.deleted") {
@@ -245,6 +305,7 @@ export async function create_tui_integration(context) {
       visible = false
       turn_id = undefined
       latest_turn_id = undefined
+      assistant_reply = undefined
       attention.clear()
       settled.clear()
       return
@@ -335,6 +396,7 @@ export async function create_tui_integration(context) {
       await relay.dispose()
       attention.clear()
       settled.clear()
+      assistant_reply = undefined
     },
   }
 }

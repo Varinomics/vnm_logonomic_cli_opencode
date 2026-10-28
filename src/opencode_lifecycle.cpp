@@ -144,7 +144,8 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const bool question_replied  = name == "question.replied" || (native_inbox && name == "form.replied");
     const bool question_resolved = name == "question.rejected" ||
         (native_inbox && (name == "form.cancelled" || name == "logonomic.form.resolved"));
-    const bool submitted        = name == "chat.message";
+    const bool submitted        = name == "chat.message" ||
+        (native_inbox && name == "session.inbox.enqueued" && metadata(body, "input_type") == "user");
     if (!(child_start || child_stop || deleted || status || idle || error || asked || replied ||
           question_asked || question_replied || question_resolved || submitted || execution))
     {
@@ -292,7 +293,9 @@ std::optional<addon::Attention_classification_result> classify_attention(
         result.attention_kind = addon::Attention_kind{0, permission ? "permission" : "interactive_question"};
     }
     else
-    if (name == "chat.message" && request.pending_conversational_request_id) {
+    if ((name == "chat.message" || name == "session.inbox.enqueued") &&
+        request.pending_conversational_request_id)
+    {
         observation.attention_transition = addon::Attention_transition::RESOLVED;
         observation.attention_evidence = addon::Evidence::INFERRED;
         observation.attention_request_id = *request.pending_conversational_request_id;
@@ -300,7 +303,9 @@ std::optional<addon::Attention_classification_result> classify_attention(
     }
     else
     if (name == "session.idle" ||
-        (name == "session.status" && metadata(body, "status_type") == "idle"))
+        (name == "session.status" && metadata(body, "status_type") == "idle") ||
+        (name == "session.execution.succeeded" &&
+            observation.outcome_transition == addon::Outcome_transition::SUCCEEDED))
     {
         const auto* normal = body.find("normal_completion");
         const auto* evidence = body.find("assistant_reply_evidence");

@@ -114,6 +114,14 @@ clears turn identity. Long explanations retain their closing question; invalid,
 quoted or code evidence is omitted. Part boundaries preserve fence, quote and
 paragraph context. These edges are private classifier input, never a claimed
 complete message or copied into lifecycle observation fields.
+The OpenCode 2 TUI uses the same bounded scanner on native `session.text.ended`
+complete values, following contiguous text ordinals within an observed assistant
+step. It emits evidence only after that step ends with `finish: stop` and its
+observed root execution succeeds. Missing starts, incomplete text, failed or
+interrupted executions, reconnects and later assistant steps invalidate earlier
+reply evidence. Reasoning and streaming deltas do not supply reply text. A genuine
+native user inbox item can resolve a conversational hint; synthetic notifications
+and housekeeping items cannot.
 The existing SDK local heuristic classifies hints; genuine subsequent user input
 can resolve only the host-selected conversational hint. No transcript hydration
 or external classification is used. Pending question, reply, and hint tracking
