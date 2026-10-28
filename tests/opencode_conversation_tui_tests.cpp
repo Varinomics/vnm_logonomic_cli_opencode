@@ -121,12 +121,17 @@ void projected_history(const fs::path& root)
         for (const auto* retained : {
                 "Frozen system instructions.", "Frozen synthetic instructions.", "Native skill instructions.",
                 "Retained reasoning about the repository.", "Progress text before the tool result.",
-                "Native tool result keeps the inspected source.", "src/project.cpp", "inspect_repository",
+                "Native tool result keeps the inspected source.", "src/project.cpp",
                 "file:///workspace/result.txt", "file:///workspace/notes.md", "Referenced project instructions."})
         {
             require(exported.text.find(retained) != std::string::npos,
-                "Full projected export must retain native text, tool data and attachment references.");
+                std::string("Full ") + addon::conversation_export_format_name(format) + " export lost: " + retained);
         }
+        // Markdown escapes the underscore in this structured tool label;
+        // plain and conversation text retain the literal native identifier.
+        const std::string_view tool_name = format == Format::MARKDOWN ? "inspect\\_repository" : "inspect_repository";
+        require(exported.text.find(tool_name) != std::string::npos,
+            "The native tool identity must survive the requested format's label encoding.");
         require(exported.result->attachment_count == 4 &&
                 exported.text.find("YXR0YWNobWVudC1iaW5hcnktYnl0ZXM=") == std::string::npos &&
                 exported.text.find("dG9vbC1iaW5hcnktYnl0ZXM=") == std::string::npos &&
