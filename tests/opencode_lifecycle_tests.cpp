@@ -389,22 +389,26 @@ int main(int argc, char** argv)
         "permissions are not classified as questions");
 
     for (const auto* name : {"permission.asked", "permission.replied",
-        "question.asked", "question.replied", "question.rejected"})
+        "question.asked", "question.replied", "question.rejected", "form.created", "form.replied",
+        "form.cancelled", "logonomic.permission.resolved", "logonomic.form.resolved"})
     {
-        const bool is_permission = std::string_view(name).starts_with("permission.");
+        const bool is_permission = std::string_view(name).starts_with("permission.") ||
+            std::string_view(name) == "logonomic.permission.resolved";
         auto request = event(name);
+        request.event.body.set("api_generation", addon::Json_value(2));
         request.event.body.erase("turn_id");
         request.event.body.set("agent_id", addon::Json_value("background-child"));
         request.event.body.set(is_permission ? "permission_id" : "question_id",
             addon::Json_value("background-request"));
-        if (std::string_view(name) == "question.replied") {
+        if (std::string_view(name) == "question.replied" || std::string_view(name) == "form.replied") {
             request.event.body.set("answer_nonempty", addon::Json_value(true));
         }
         const auto observation = classify(request).observations.front();
         require(observation.provider_session_id == "session-primary" &&
                 observation.agent_id == "background-child" && observation.provider_turn_id.empty() &&
                 observation.attention_request_id == "background-request" &&
-                observation.attention_transition == (std::string_view(name).ends_with(".asked")
+                observation.attention_transition == (std::string_view(name).ends_with(".asked") ||
+                    std::string_view(name) == "form.created"
                     ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED) &&
                 observation.phase_transition == addon::Phase_transition::NONE &&
                 observation.outcome_transition == addon::Outcome_transition::NONE,

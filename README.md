@@ -97,8 +97,13 @@ either event. A native qualification gate must require a correlated reply with
 `answer_nonempty: true`, not merely disappearance of attention.
 
 The OpenCode 2 TUI restores pending permissions and forms from the selected
-session's native data, including after hydration and reselection. Restored
-requests have no invented execution turn. A request removed from a refreshed
+root and its native session family, including after hydration and reselection.
+Descendant requests retain their source session as `agent_id` without acquiring
+the parent's execution turn. Unhydrated descendant collections do not resolve
+pending requests; root completion does not resolve them either. A deleted child
+resolves only that child's retained requests. Global forms have no root-session
+ownership and are not projected onto the selected root.
+Restored requests have no invented execution turn. A request removed from a refreshed
 pending list resolves attention without claiming a native reply or cancellation;
 only an observed native form reply supplies `answer_nonempty`. A native reply
 keeps its request identity and answer evidence when the request outlives its

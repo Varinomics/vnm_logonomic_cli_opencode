@@ -41,12 +41,14 @@ async function attention_events(scenario) {
   const sessions = new Map([["ses_root", { id: "ses_root" }], ["ses_other", { id: "ses_other" }]])
   const permissions = new Map()
   const forms = new Map()
+  const families = new Map()
   integration = await create_tui_integration({
     ui: { router: { current: () => route } },
     data: {
       listen(callback) { listener = callback; return () => { listener = undefined } },
       session: {
         get: (id) => sessions.get(id), status: () => "running", pending: { list: () => [] },
+        family: (id) => families.get(id) ?? [id],
         permission: { list: (id) => permissions.get(id) }, form: { list: (id) => forms.get(id) },
       },
     },
@@ -59,7 +61,7 @@ async function attention_events(scenario) {
     },
   })
   await scenario({
-    sessions, permissions, forms,
+    sessions, permissions, forms, families,
     route(value) { route = value },
     async select(sessionID) {
       if (sessionID) route = { type: "session", sessionID }
@@ -377,6 +379,59 @@ try {
     assert.equal(refreshed_events.some((event) => event.event === "session.deleted" || event.event === "session.execution.failed"),
       false, "background terminal events cannot end the newly selected session or clear its pending prompts")
 
+    const child_events = await attention_events(async ({ sessions, permissions, forms, families, select, event }) => {
+      permissions.set("ses_root", [])
+      forms.set("ses_root", [])
+      for (const id of ["ses_child", "ses_sibling", "ses_grandchild"]) {
+        sessions.set(id, { id, parentID: id === "ses_grandchild" ? "ses_child" : "ses_root" })
+      }
+      families.set("ses_root", ["ses_root", "ses_child", "ses_sibling", "ses_grandchild"])
+      permissions.set("ses_child", [permission("per_restored", "ses_child")])
+      forms.set("ses_child", [])
+      await select()
+      // A descendant's collection can hydrate after the root is already visible.
+      forms.set("ses_grandchild", [form("frm_restored", "ses_grandchild")])
+      await select()
+      await event("session.execution.started", { sessionID: "ses_root" }, "evt_parent")
+      await event("session.execution.succeeded", { sessionID: "ses_root" })
+      permissions.set("ses_sibling", [permission("per_live", "ses_sibling")])
+      await event("permission.asked", permission("per_live", "ses_sibling"))
+      forms.set("ses_sibling", [form("frm_live", "ses_sibling")])
+      await event("form.created", { form: form("frm_live", "ses_sibling") })
+      await event("session.execution.started", { sessionID: "ses_root" }, "evt_parent_next")
+      await event("session.execution.failed", { sessionID: "ses_root" })
+      await event("form.replied", { sessionID: "ses_child", id: "frm_live", answer: { value: private_canary } })
+      permissions.set("ses_child", undefined)
+      await select()
+      permissions.set("ses_child", [])
+      await select()
+      permissions.set("ses_sibling", [])
+      await event("permission.replied", { sessionID: "ses_sibling", requestID: "per_live", reply: "once" })
+      forms.set("ses_sibling", [])
+      // A paired reply remains attributable if the family view refreshed first.
+      families.set("ses_root", ["ses_root", "ses_child", "ses_grandchild"])
+      await event("form.replied", { sessionID: "ses_sibling", id: "frm_live", answer: { value: private_canary } })
+      families.set("ses_root", ["ses_root", "ses_child"])
+      await event("session.deleted", { sessionID: "ses_grandchild" })
+      await event("permission.asked", permission("per_foreign", "ses_other"))
+      await event("form.created", { form: form("frm_global", "global") })
+      await select("ses_other")
+      await event("form.created", { form: form("frm_old_root", "ses_child") })
+    })
+    assert.deepEqual(child_events.filter((value) => value.permission_id || value.question_id)
+      .map((value) => [value.event, value.session_id, value.agent_id, value.permission_id ?? value.question_id, value.turn_id]), [
+      ["permission.asked", "ses_root", "ses_child", "per_restored", undefined],
+      ["form.created", "ses_root", "ses_grandchild", "frm_restored", undefined],
+      ["permission.asked", "ses_root", "ses_sibling", "per_live", undefined],
+      ["form.created", "ses_root", "ses_sibling", "frm_live", undefined],
+      ["logonomic.permission.resolved", "ses_root", "ses_child", "per_restored", undefined],
+      ["permission.replied", "ses_root", "ses_sibling", "per_live", undefined],
+      ["form.replied", "ses_root", "ses_sibling", "frm_live", undefined],
+      ["logonomic.form.resolved", "ses_root", "ses_grandchild", "frm_restored", undefined],
+    ], "root-visible descendant requests preserve exact ownership and independent settlement across parent executions")
+    assert.equal(child_events.some((value) => value.event === "session.deleted"), false,
+      "deleting a descendant cannot end its root session")
+
     const completed_cases = []
     for (const [parts, hint] of [
       [["A detailed explanation. ".repeat(250), "\n\nWhich target should I use?"], true],
@@ -463,7 +518,7 @@ try {
       ["logonomic.session.selected", "logonomic.delivery_overflow"],
       "an oversized native snapshot degrades lifecycle instead of claiming that a truncated list is complete")
   }
-  console.log("OpenCode TUI contract: selection, complete replies, pending reconciliation, wake policy and cleanup passed")
+  console.log("OpenCode TUI contract: selection, descendant attention, complete replies, pending reconciliation, wake policy and cleanup passed")
 } finally {
   await integration?.dispose()
   await rm(root, { recursive: true, force: true })

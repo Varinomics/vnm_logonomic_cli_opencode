@@ -88,9 +88,14 @@ export async function create_tui_integration(context) {
   let pending_snapshot
   let assistant_reply
 
+  function session_family() {
+    return new Set([selected, ...(data.session.family?.(selected) ?? [])])
+  }
+
   function attention_event(event, request, correlated = true) {
     return {
       event, session_id: selected, api_generation: 2,
+      ...(request.source_session_id !== selected ? { agent_id: request.source_session_id } : {}),
       ...(correlated && request.turn_id ? { turn_id: request.turn_id } : {}),
       [request.kind === "permission" ? "permission_id" : "question_id"]: request.id,
     }
@@ -103,46 +108,58 @@ export async function create_tui_integration(context) {
     if (settled.size > max_pending_events) settled.delete(settled.keys().next().value)
   }
 
-  function request_attention(kind, id, correlated = false) {
+  function request_attention(kind, id, correlated = false, source_session_id = selected) {
     const key = `${kind}:${id}`
     if (attention.has(key) || settled.has(key)) return
     if (attention.size >= max_pending_events) {
       relay.enqueue({ event: "logonomic.delivery_overflow" })
       return
     }
-    const request = { kind, id, turn_id: correlated ? turn_id : undefined }
+    const request = {
+      kind, id, source_session_id,
+      turn_id: correlated && source_session_id === selected ? turn_id : undefined,
+    }
     attention.set(key, request)
     ++generation
     relay.enqueue(attention_event(kind === "permission" ? "permission.asked" : "form.created", request))
   }
 
-  function reconcile_attention(kind, ids) {
+  function reconcile_attention(kind, sources) {
     // Undefined means this native collection has not hydrated, not that its
     // previously observed requests have been answered.
-    if (!ids) return
+    if (!sources) return
     for (const [key, request] of attention) {
-      if (request.kind !== kind || ids.has(request.id)) continue
+      const ids = sources.get(request.source_session_id)
+      if (request.kind !== kind || !ids || ids.has(request.id)) continue
       remember_settled(key, request, false)
       ++generation
       // Absence proves the request is no longer pending, but neither its
       // answer nor cancellation. Keep that distinct from native reply events.
       relay.enqueue(attention_event(`logonomic.${kind}.resolved`, request, false))
     }
-    for (const id of ids) request_attention(kind, id)
+    for (const [source_session_id, ids] of sources) {
+      for (const id of ids) request_attention(kind, id, false, source_session_id)
+    }
   }
 
-  function snapshot_ids(requests) {
-    if (!Array.isArray(requests)) return
-    const ids = new Set()
-    for (const request of requests) {
-      if (request?.sessionID !== selected || !wake_identity(request.id)) continue
-      ids.add(request.id)
-      if (ids.size > max_pending_events) {
-        relay.enqueue({ event: "logonomic.delivery_overflow" })
-        return
+  function snapshot_ids(kind) {
+    const sources = new Map()
+    let count = 0
+    for (const source_session_id of session_family()) {
+      const requests = data.session[kind].list(source_session_id)
+      if (!Array.isArray(requests)) continue
+      const ids = new Set()
+      for (const request of requests) {
+        if (request?.sessionID !== source_session_id || !wake_identity(request.id) || ids.has(request.id)) continue
+        ids.add(request.id)
+        if (++count > max_pending_events) {
+          relay.enqueue({ event: "logonomic.delivery_overflow" })
+          return
+        }
       }
+      sources.set(source_session_id, ids)
     }
-    return ids
+    return sources
   }
 
   function observe_reply(type, value) {
@@ -213,8 +230,8 @@ export async function create_tui_integration(context) {
     // including when the same selected session finishes hydrating or refreshes.
     const snapshot = {
       session_id: selected,
-      permissions: snapshot_ids(data.session.permission.list(selected)),
-      forms: snapshot_ids(data.session.form.list(selected)),
+      permissions: snapshot_ids("permission"),
+      forms: snapshot_ids("form"),
     }
     const queued = pending_snapshot !== undefined
     pending_snapshot = snapshot
@@ -236,12 +253,15 @@ export async function create_tui_integration(context) {
     if (session?.id !== session_id || selected !== session_id) {
       return wake_unavailable("provider_session_unavailable")
     }
-    const permissions = data.session.permission.list(session_id)
-    const forms = data.session.form.list(session_id)
-    if (!Array.isArray(permissions) || !Array.isArray(forms)) {
-      return wake_unavailable("provider_status_unavailable")
+    for (const source_session_id of session_family()) {
+      const permissions = data.session.permission.list(source_session_id)
+      const forms = data.session.form.list(source_session_id)
+      if (!Array.isArray(permissions) || !Array.isArray(forms)) {
+        return wake_unavailable("provider_status_unavailable")
+      }
+      if (permissions.length || forms.length) return wake_unavailable("provider_awaiting_input")
     }
-    if (permissions.length || forms.length || attention.size) return wake_unavailable("provider_awaiting_input")
+    if (attention.size) return wake_unavailable("provider_awaiting_input")
     if (data.session.status(session_id) !== "idle" || data.session.pending.list(session_id).length) {
       return wake_unavailable("provider_busy")
     }
@@ -264,7 +284,22 @@ export async function create_tui_integration(context) {
       return
     }
     const session_id = value?.sessionID ?? value?.form?.sessionID
-    if (session_id !== selected) return
+    const root_event = session_id === selected
+    const asked = type === "permission.asked" || type === "form.created"
+    const replied = type === "permission.replied" || type === "form.replied" || type === "form.cancelled"
+    if (!root_event && type === "session.deleted") {
+      for (const [key, request] of attention) {
+        if (request.source_session_id !== session_id) continue
+        remember_settled(key, request, false)
+        relay.enqueue(attention_event(`logonomic.${request.kind}.resolved`, request, false))
+        ++generation
+      }
+      return
+    }
+    const reply_key = `${type.startsWith("permission.") ? "permission" : "form"}:${value?.requestID ?? value?.id}`
+    const reply_owner = attention.get(reply_key) ?? settled.get(reply_key)?.request
+    const known_reply = replied && reply_owner?.source_session_id === session_id
+    if (!root_event && (!(asked || replied) || (!session_family().has(session_id) && !known_reply))) return
     if (type.startsWith("session.execution.") || type.startsWith("session.inbox.") ||
         type.startsWith("permission.") || type.startsWith("form.") ||
         type === "session.agent.selected" || type === "session.model.selected" || type === "session.deleted") {
@@ -275,8 +310,8 @@ export async function create_tui_integration(context) {
       latest_turn_id = turn_id
       assistant_reply = undefined
     }
-    observe_reply(type, value)
-    const projected = { event: type, session_id, api_generation: 2, ...(turn_id ? { turn_id } : {}) }
+    if (root_event) observe_reply(type, value)
+    const projected = { event: type, session_id: selected, api_generation: 2, ...(turn_id ? { turn_id } : {}) }
     if (type === "session.execution.started" || type === "session.execution.succeeded" ||
         type === "session.execution.failed" || type === "session.execution.interrupted") {
       if (type === "session.execution.succeeded" && turn_id && assistant_reply?.complete && !attention.size) {
@@ -310,15 +345,13 @@ export async function create_tui_integration(context) {
       settled.clear()
       return
     }
-    const asked = type === "permission.asked" || type === "form.created"
-    const replied = type === "permission.replied" || type === "form.replied" || type === "form.cancelled"
     if (!asked && !replied) return
     const request_id = type === "form.created" ? value.form.id : value.requestID ?? value.id
     if (!wake_identity(request_id)) return
     const kind = type.startsWith("permission.") ? "permission" : "form"
     const key = `${kind}:${request_id}`
     if (asked) {
-      request_attention(kind, request_id, true)
+      request_attention(kind, request_id, true, session_id)
       return
     }
     // A refreshed snapshot or a local reply response can remove the request
@@ -326,7 +359,7 @@ export async function create_tui_integration(context) {
     // and prevent an older snapshot from reopening a settled identity.
     const prior = settled.get(key)
     const request = attention.get(key) ?? prior?.request
-    if (!request || prior?.replied) return
+    if (!request || request.source_session_id !== session_id || prior?.replied) return
     remember_settled(key, request, true)
     // A request may outlive its execution. Its native identity still pairs the
     // reply, but a superseded turn would prevent the host from resolving it.
