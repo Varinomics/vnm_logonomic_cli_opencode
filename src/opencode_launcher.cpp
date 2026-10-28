@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <cctype>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -174,6 +175,9 @@ std::optional<fs::path> npm_shim_target(const fs::path& shim)
 }
 
 #ifdef _WIN32
+constexpr std::size_t k_cmd_line_characters   = 8191;
+constexpr std::size_t k_cmd_program_allowance = 1024;
+
 std::string powershell_quote(std::string_view text)
 {
     std::string result = "'";
@@ -182,6 +186,35 @@ std::string powershell_quote(std::string_view text)
         if (character == '\'') result += '\'';
     }
     return result + '\'';
+}
+
+bool powershell_literal(std::string_view argument)
+{
+    for (const std::string_view quote : {"\"", "\xE2\x80\x98", "\xE2\x80\x99", "\xE2\x80\x9A", "\xE2\x80\x9B"}) {
+        if (argument.find(quote) != std::string_view::npos) {
+            return false;
+        }
+    }
+    return !argument.ends_with('\\') || argument.find_first_of(" \t") == std::string_view::npos;
+}
+
+bool cmd_literal(std::string_view argument)
+{
+    const bool control = std::any_of(argument.begin(), argument.end(),
+        [](unsigned char byte) { return byte < 0x20 || byte == 0x7F; });
+    return !control && argument.find_first_of("\"%!") == std::string_view::npos &&
+        (argument.find(' ') != std::string_view::npos || argument.find_first_of("&|<>^()") == std::string_view::npos);
+}
+
+std::size_t cmd_argument_characters(const std::vector<std::string>& command)
+{
+    std::size_t characters = 0;
+    for (auto argument = command.begin() + 1; argument != command.end(); ++argument) {
+        const auto kept = argument->find_last_not_of('\\');
+        characters += 3 + argument->size() +
+            (kept == std::string::npos ? argument->size() : argument->size() - kept - 1);
+    }
+    return characters;
 }
 #endif
 
@@ -276,21 +309,24 @@ std::optional<std::vector<std::string>> tui_invocation(
     return std::nullopt;
 }
 
-std::optional<std::vector<std::string>> resume_arguments(
+namespace {
+
+std::optional<std::vector<std::string>> session_launcher_arguments(
     const addon::Launcher_request&  launcher,
     const std::vector<std::string>& launcher_argv,
     const addon::Json_value&        effective_environment,
     std::string_view                working_directory,
-    std::string_view                session)
+    bool                            native_tui)
 {
     const auto command = recognize_launcher(launcher.script_body);
     const auto literal = addon::literal_argv(launcher.script_body);
     if (!command || !command->prefix_arguments.empty() || !command->environment.empty() ||
-        literal.empty() || addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "opencode")
+        literal.empty() || !opencode_program(literal.front()) ||
+        (!native_tui && addon::base_name(literal.front(), Launcher_whitespace::ASCII) != "opencode"))
     {
         return std::nullopt;
     }
-    // The TUI options (1.18) that keep the reopened session in this directory
+    // The TUI options (1.18) that keep the session in this directory
     // and interface with plugins loaded, and a project argument naming this
     // directory. Enabled --continue, --session, --fork, --prompt and --pure pick
     // another session, add a turn or drop the plugin; anything unknown is refused
@@ -329,6 +365,9 @@ std::optional<std::vector<std::string>> resume_arguments(
         if (flags.contains(argument) || negated.contains(argument)) {
             continue;
         }
+        if (native_tui && argument == "--standalone") {
+            continue;
+        }
         const auto equals = argument.find('=');
         if (equals != std::string_view::npos) {
             const auto name  = argument.substr(0, equals);
@@ -355,17 +394,112 @@ std::optional<std::vector<std::string>> resume_arguments(
     if (launcher.runner_key == "direct" && launcher_argv.size() == literal.size() &&
         std::equal(literal.begin() + 1, literal.end(), launcher_argv.begin() + 1))
     {
-        std::vector<std::string> arguments(launcher_argv.begin() + 1, launcher_argv.end());
-        arguments.insert(arguments.end(), {"--session", std::string(session)});
-        return arguments;
+        return std::vector<std::string>(launcher_argv.begin() + 1, launcher_argv.end());
     }
     if (launcher.runner_key == "powershell" && plain_powershell_command(launcher.script_body) &&
         launcher_argv.size() == 4 && addon::base_name(launcher_argv[0], Launcher_whitespace::ASCII) == "powershell" &&
         launcher_argv[1] == "-NoLogo" && launcher_argv[2] == "-Command" && launcher_argv[3] == launcher.script_body)
     {
-        return std::vector<std::string>{"-NoLogo", "-Command", launcher.script_body + " --session " + std::string(session)};
+        return std::vector<std::string>{"-NoLogo", "-Command", launcher.script_body};
     }
     return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::vector<std::string>> resume_arguments(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    std::string_view                session)
+{
+    auto arguments = session_launcher_arguments(
+        launcher, launcher_argv, effective_environment, working_directory, false);
+    if (!arguments) {
+        return std::nullopt;
+    }
+    if (launcher.runner_key == "direct") {
+        arguments->insert(arguments->end(), {"--session", std::string(session)});
+    }
+    else {
+        arguments->back() += " --session " + std::string(session);
+    }
+    return arguments;
+}
+
+std::optional<std::vector<std::string>> initial_prompt_invocation(
+    const addon::Launcher_request&  launcher,
+    const std::vector<std::string>& launcher_argv,
+    const addon::Json_value&        effective_environment,
+    std::string_view                working_directory,
+    const Verified_launch&         verified,
+    std::string_view                prompt)
+{
+    // Native composers reserve normalized exit/command input, and yargs strips
+    // matching outer quotes from an attached --prompt value.
+    if (prompt.empty() || addon::trim(prompt) != prompt ||
+        prompt.starts_with("\xEF\xBB\xBF") || prompt.ends_with("\xEF\xBB\xBF") ||
+        ((prompt.front() == '\'' || prompt.front() == '"') && prompt.back() == prompt.front()) ||
+        prompt.starts_with('/') ||
+        prompt == "exit" || prompt == "quit" || prompt == ":q")
+    {
+        return std::nullopt;
+    }
+    const bool native_tui = uses_tui_plugin(verified.version);
+    const auto arguments = session_launcher_arguments(
+        launcher, launcher_argv, effective_environment, working_directory, native_tui);
+    if (!arguments) {
+        return std::nullopt;
+    }
+    std::optional<std::vector<std::string>> invocation;
+    if (native_tui) {
+        invocation = tui_invocation(launcher, launcher_argv, effective_environment, working_directory);
+    }
+    else {
+        invocation = std::vector<std::string>{launcher_argv.front()};
+        invocation->insert(invocation->end(), arguments->begin(), arguments->end());
+    }
+    if (!invocation) {
+        return std::nullopt;
+    }
+    const std::string prompt_argument = "--prompt=" + std::string(prompt);
+#ifdef _WIN32
+    auto command = launcher.runner_key == "direct"
+        ? *invocation : addon::literal_argv(invocation->back());
+    const auto selected = resolve_program(command.front(), addon::environment_pairs(effective_environment),
+        working_directory, Launcher_whitespace::ASCII);
+    if (!selected || (launcher.runner_key == "direct" && !native_image(*selected))) {
+        return std::nullopt;
+    }
+    const auto extension = lower(selected->extension().string());
+    if (extension == ".cmd" || extension == ".bat") {
+        command.emplace_back(prompt_argument);
+        // A batch shim expands %* through cmd.exe's own parser and line bound.
+        // UTF-8 byte counts bound its UTF-16 arguments, including quote escaping;
+        // reserve the same executable-prefix allowance as the Claude integration.
+        if (!std::all_of(command.begin() + 1, command.end(), cmd_literal) ||
+            cmd_argument_characters(command) + k_cmd_program_allowance > k_cmd_line_characters)
+        {
+            return std::nullopt;
+        }
+    }
+#endif
+    if (launcher.runner_key == "direct") {
+        invocation->emplace_back(prompt_argument);
+        return invocation;
+    }
+#ifdef _WIN32
+    // Preserve the admitted shell and shim: either can contribute the selected
+    // launch environment. Only the new literal argument needs quoting.
+    if (!powershell_literal(prompt_argument)) {
+        return std::nullopt;
+    }
+    invocation->back() += " " + powershell_quote(prompt_argument);
+    return invocation;
+#else
+    return std::nullopt;
+#endif
 }
 
 bool version_is_at_least(std::string_view version, int major, int minor, int patch)

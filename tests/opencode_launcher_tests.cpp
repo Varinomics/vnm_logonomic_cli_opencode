@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -196,6 +197,26 @@ int main(int argc, char** argv)
     // The test's own native image is copied into a stock installation. This
     // exercises actual probe startup/output/cancellation without an installed
     // vendor CLI or network access.
+    if (argc == 2 && std::string_view(argv[1]) == "--help") {
+        if (!std::getenv("OPENCODE_FIXTURE_NO_PROMPT")) {
+            std::cout << "Options:\n  --prompt <text>  Initial interactive message\n";
+        }
+        return 0;
+    }
+    if (argc > 1 && std::any_of(argv + 1, argv + argc, [](const char* value) {
+            return std::string_view(value).starts_with("--prompt="); }))
+    {
+        auto arguments = addon::Json_value::array();
+        for (int index = 1; index < argc; ++index) {
+            arguments.push_back(addon::Json_value(argv[index]));
+        }
+        auto observation = addon::Json_value::object();
+        observation.set("argv", std::move(arguments));
+        const char* setting = std::getenv("OPENCODE_FIXTURE_SHIM_SETTING");
+        observation.set("shim_setting", addon::Json_value(setting ? setting : ""));
+        std::cout << addon::serialize_json(observation) << '\n';
+        return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
 #ifndef _WIN32
         if (const char* custody = std::getenv("OPENCODE_FIXTURE_CUSTODY")) {
@@ -464,6 +485,103 @@ int main(int argc, char** argv)
     };
     check(lifecycle_reported(prepare_interactive()) == true, "verified direct launch reports its lifecycle");
 
+    // Oracle: interactive-initial-prompt@1 and the two native TUI home routes,
+    // which submit --prompt once after model selection is ready.
+    const std::string initial_text = "Read the continuation brief at " +
+        path_string(root / "continuation's brief.md") + " and explain the working state; retain $context & paths.";
+    const addon::Initial_prompt_request first_message{initial_text, path_string(root / "continuation's brief.md")};
+    const auto initial_message_delivered = [
+            &interactive,
+            &initial_text
+        ](
+            const std::optional<addon::Launch_patch>& patch,
+            std::string_view expected_shim_setting = {}
+        )
+        {
+            addon::Contract_failure acknowledgment_failure;
+            if (!patch || !addon::validate_initial_prompt_acknowledgment(
+                    interactive.initial_prompt, *patch, &acknowledgment_failure))
+            {
+                return false;
+            }
+            Context execution;
+            const auto environment = addon::environment_pairs(interactive.launch_environment->effective_environment);
+            auto invocation = *patch->argv;
+            // The terminal backend resolves the image in its final environment;
+            // SDK probes pass their first argument directly to CreateProcessW.
+            const auto image = addon::resolve_program(invocation.front(), environment, interactive.working_directory);
+            if (!image) {
+                return false;
+            }
+            invocation.front() = addon::path_to_utf8(*image);
+            const auto received = addon::probe(
+                invocation, environment, interactive.working_directory, 5000, execution);
+            const auto observation = received ? addon::parse_json(received->output, {}, nullptr) : std::nullopt;
+            if (!observation) {
+                return false;
+            }
+            const auto* arguments = observation->find("argv");
+            const auto* setting   = observation->find("shim_setting");
+            if (!arguments || !arguments->is_array() || !setting || !setting->is_string() ||
+                setting->as_string() != expected_shim_setting)
+            {
+                return false;
+            }
+            std::size_t messages = 0;
+            for (const auto& argument : arguments->as_array()) {
+                if (argument.as_string() == "--prompt=" + initial_text) {
+                    ++messages;
+                }
+            }
+            return messages == 1;
+        };
+    interactive.initial_prompt = first_message;
+    const auto initial_patch = prepare_interactive();
+    check(initial_message_delivered(initial_patch) && lifecycle_reported(initial_patch) == true,
+        "hooks-generation native invocation receives the exact first message once");
+    interactive.launcher.script_body += " --model provider/model --auto";
+    interactive.launcher_argv.insert(interactive.launcher_argv.end(), {"--model", "provider/model", "--auto"});
+    const auto configured_initial = prepare_interactive();
+    check(initial_message_delivered(configured_initial) && configured_initial->argv->size() == 5 &&
+        (*configured_initial->argv)[1] == "--model" && (*configured_initial->argv)[2] == "provider/model" &&
+        (*configured_initial->argv)[3] == "--auto",
+        "first-message preparation keeps the selected model and approval option");
+    interactive.launcher = launcher;
+    interactive.launcher_argv = {program_text};
+    for (const char* selection : {"--continue", "--session=ses_previous", "--prompt=earlier", "--pure", "run"}) {
+        interactive.launcher.script_body = launcher.script_body + " " + selection;
+        interactive.launcher_argv = {program_text, selection};
+        Context rejected;
+        rejected.invocation = {"initial", {"launch-preparation", 3}, "prepare",
+            addon::encode_prepare_request(interactive, 3)};
+        opencode::handle_preparation(rejected);
+        check(!rejected.payload && rejected.reason == addon::reason::k_initial_prompt_unavailable,
+            "an existing conversation, prompt or alternate interface cannot receive the handoff");
+    }
+    interactive.launcher = launcher;
+    interactive.launcher_argv = {program_text};
+    for (const std::string text : {"'quoted'", "\"quoted\"", "'", "\"", "\xC2\xA0" "exit",
+             "quit" "\xE2\x80\xA8", "\xEF\xBB\xBF" ":q", "exit" "\xEF\xBB\xBF"})
+    {
+        interactive.initial_prompt->text = text;
+        Context rejected;
+        rejected.invocation = {"initial", {"launch-preparation", 3}, "prepare",
+            addon::encode_prepare_request(interactive, 3)};
+        opencode::handle_preparation(rejected);
+        check(!rejected.payload && rejected.reason == addon::reason::k_initial_prompt_unavailable,
+            "native quote stripping and Unicode-normalized exit input cannot be acknowledged as messages");
+    }
+    interactive.initial_prompt = first_message;
+    interactive.launch_environment->effective_environment.set("OPENCODE_FIXTURE_NO_PROMPT", addon::Json_value("1"));
+    Context unsupported_prompt;
+    unsupported_prompt.invocation = {"initial", {"launch-preparation", 3}, "prepare",
+        addon::encode_prepare_request(interactive, 3)};
+    opencode::handle_preparation(unsupported_prompt);
+    check(!unsupported_prompt.payload && unsupported_prompt.reason == addon::reason::k_initial_prompt_unavailable,
+        "a CLI without the native prompt option refuses the requested capability");
+    interactive.launch_environment->effective_environment.erase("OPENCODE_FIXTURE_NO_PROMPT");
+    interactive.initial_prompt.reset();
+
     // A resume relaunches the same verified launcher with the session selector
     // and names the session the managed plugin confirms.
     const std::string resumed_session = "ses_4f1c2a9e7b3d5f8a1c6e0b2d9f";
@@ -582,7 +700,8 @@ int main(int argc, char** argv)
     // the native fixture with `shim_version`, exercising shell-owned evidence.
     const auto npm_script = [](const char* version) {
         return std::string("@echo off\r\nset OPENCODE_FIXTURE_VERSION=") + version +
-            "\r\n\"%~dp0\\node_modules\\opencode-ai\\bin\\opencode.exe\" %*\r\n";
+            "\r\nset OPENCODE_FIXTURE_SHIM_SETTING=preserved-profile\r\n"
+            "\"%~dp0\\node_modules\\opencode-ai\\bin\\opencode.exe\" %*\r\n";
     };
     const auto npm_installation = [&](const char* name, const char* shim_version) {
         const auto directory = root / name;
@@ -614,6 +733,25 @@ int main(int argc, char** argv)
     interactive.launcher_argv = shell_argv;
     interactive.launch_environment->effective_environment = shell_environment;
     check(lifecycle_reported(prepare_interactive()) == true, "verified PowerShell launch reports its lifecycle");
+    interactive.initial_prompt = first_message;
+    check(initial_message_delivered(prepare_interactive()),
+        "PowerShell preserves the exact prompt through native argument binding");
+    interactive.launch_environment->effective_environment = npm_installation("initial", "1.18.25");
+    check(initial_message_delivered(prepare_interactive(), "preserved-profile"),
+        "initial-message preparation preserves the selected npm shim's environment effects");
+    interactive.initial_prompt->text = "Explain the 20% completed work.";
+    check(!prepare_interactive(), "a batch shim cannot acknowledge percent expansion as verbatim text");
+    const auto initial_shim = root / "initial" / "opencode.cmd";
+    interactive.launcher = {"\"" + path_string(initial_shim) + "\"", "direct", ""};
+    interactive.launcher_argv = {path_string(initial_shim)};
+    interactive.initial_prompt = first_message;
+    check(!prepare_interactive(), "a direct Windows batch file is not silently replaced by its native target");
+    interactive.launcher = shell_launcher;
+    interactive.launcher_argv = shell_argv;
+    interactive.launch_environment->effective_environment = shell_environment;
+    interactive.initial_prompt->text = "Explain the \"quoted\" brief.";
+    check(!prepare_interactive(), "PowerShell cannot acknowledge text whose native quote binding changes it");
+    interactive.initial_prompt.reset();
     interactive.launcher_argv = {"powershell.exe", "-NoLogo", "-Command", "opencode --pure"};
     check(lifecycle_reported(prepare_interactive()) == false,
         "an invocation other than the recognized launcher keeps lifecycle off");
@@ -694,6 +832,13 @@ int main(int argc, char** argv)
     check(tui_patch && tui_patch->argv == std::optional(std::vector<std::string>{program_text, "--standalone"}) &&
         tui_patch->session_wake && tui_patch->session_wake->available && lifecycle_reported(tui_patch) == true,
         "verified OpenCode 2 prepares live TUI wake in a private native server");
+    interactive.initial_prompt = first_message;
+    const auto native_initial = prepare_interactive();
+    check(initial_message_delivered(native_initial) && native_initial->argv->size() == 3 &&
+        (*native_initial->argv)[1] == "--standalone" && native_initial->session_wake &&
+        native_initial->session_wake->available,
+        "OpenCode 2 receives the exact first message in its private interactive server");
+    interactive.initial_prompt.reset();
     if (tui_patch) {
         check(std::none_of(tui_patch->set.begin(), tui_patch->set.end(),
                 [](const auto& value) { return value.first == "OPENCODE_CLI_CONFIG_CONTENT"; }),
@@ -769,6 +914,23 @@ int main(int argc, char** argv)
     check(mixed_patch && mixed_patch->argv == std::optional(std::vector<std::string>{path_string(npm_shim), "--standalone"}) &&
         mixed_patch->session_wake && mixed_patch->session_wake->available,
         "mixed installed families prepare the selected native TUI with its own server");
+#ifdef _WIN32
+    const auto native_initial_shim = npm_root / "opencode2.cmd";
+    std::ofstream(native_initial_shim, std::ios::binary) <<
+        "@echo off\r\nset OPENCODE_FIXTURE_SHIM_SETTING=preserved-tui\r\n"
+        "\"%~dp0\\node_modules\\@opencode\\cli\\bin\\opencode.exe\" %*\r\n";
+    interactive.launcher = {"opencode2 --auto", "powershell", ""};
+    interactive.launcher_argv = {"powershell.exe", "-NoLogo", "-Command", "opencode2 --auto"};
+    interactive.launch_environment->effective_environment = npm_environment;
+    interactive.launch_environment->effective_environment.set("PATH",
+        addon::Json_value(path_string(npm_root) + ";" + powershell_directory));
+    interactive.initial_prompt = first_message;
+    const auto shim_initial = prepare_interactive();
+    check(initial_message_delivered(shim_initial, "preserved-tui") && shim_initial->session_wake &&
+        shim_initial->session_wake->available,
+        "OpenCode 2 keeps its npm shim's environment and private server when delivering the first message");
+    interactive.initial_prompt.reset();
+#endif
     const auto ps_shim = npm_root / "opencode2.ps1";
     std::ofstream(ps_shim, std::ios::binary) <<
         "$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n"

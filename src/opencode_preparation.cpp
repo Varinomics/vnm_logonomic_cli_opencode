@@ -19,8 +19,10 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <regex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace opencode {
 namespace {
@@ -396,17 +398,20 @@ bool interactive_launcher_admitted(
     const addon::Launcher_request&         launcher,
     bool                                   profile_storage,
     const std::vector<std::string>&        declared_assets,
-    addon::Invocation_context&             context)
+    addon::Invocation_context&             context,
+    bool                                   initial_prompt = false)
 {
     const auto command = recognize_launcher(launcher.script_body);
     if (!command || !profile_storage) {
-        context.fail(addon::Result_status::UNAVAILABLE, "launcher_unavailable");
+        context.fail(addon::Result_status::UNAVAILABLE,
+            initial_prompt ? addon::reason::k_initial_prompt_unavailable : "launcher_unavailable");
         return false;
     }
     for (const auto& [name, value] : command->environment) {
         (void)value;
         if (environment_name_equal(name, "OPENCODE_CONFIG_CONTENT")) {
-            context.fail(addon::Result_status::UNAVAILABLE, "inline_configuration_assignment");
+            context.fail(addon::Result_status::UNAVAILABLE,
+                initial_prompt ? addon::reason::k_initial_prompt_unavailable : "inline_configuration_assignment");
             return false;
         }
     }
@@ -415,6 +420,53 @@ bool interactive_launcher_admitted(
         return false;
     }
     return true;
+}
+
+std::optional<std::vector<std::string>> prepare_initial_prompt(
+    const addon::Prepare_request& request,
+    const Verified_launch&        launch,
+    addon::Invocation_context&    context)
+{
+    auto invocation = initial_prompt_invocation(
+        request.launcher, request.launcher_argv, request.launch_environment->effective_environment,
+        request.working_directory, launch, request.initial_prompt->text);
+    if (!invocation) {
+        context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable);
+        return std::nullopt;
+    }
+    auto probe = launch.argv;
+    probe.emplace_back("--help");
+    auto environment = addon::environment_pairs(request.launch_environment->effective_environment);
+    for (const auto& [name, value] : launch.environment) {
+        addon::set_environment(environment, name, value);
+    }
+    const auto help = addon::probe(probe, environment, request.working_directory, 3000, context);
+    static const std::regex prompt_option(R"((^|\n)[^\n]*[ \t]--prompt([ \t=<]|$))");
+    if (!help || !std::regex_search(help->output, prompt_option)) {
+        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+            context.cancel_requested() ? "cancelled" : addon::reason::k_initial_prompt_unavailable);
+        return std::nullopt;
+    }
+    return invocation;
+}
+
+void finish_interactive(
+    addon::Launch_patch                    patch,
+    const addon::Prepare_request&          request,
+    std::optional<std::vector<std::string>> initial_invocation,
+    addon::Invocation_context&             context)
+{
+    if (request.initial_prompt) {
+        patch.argv = std::move(initial_invocation);
+        patch.initial_prompt = addon::Initial_prompt_acknowledgment{
+            addon::initial_prompt_text_digest_hex(request.initial_prompt->text)};
+        addon::Contract_failure failure;
+        if (!addon::validate_launch_patch(patch, request.declared_assets, request.declared_assets, &failure)) {
+            context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable);
+            return;
+        }
+    }
+    context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
 void prepare_interactive(addon::Invocation_context& context)
@@ -426,7 +478,7 @@ void prepare_interactive(addon::Invocation_context& context)
         return;
     }
     if (!interactive_launcher_admitted(request->launcher, request->profile_storage.has_value(),
-            request->declared_assets, context))
+            request->declared_assets, context, request->initial_prompt.has_value()))
     {
         return;
     }
@@ -438,6 +490,17 @@ void prepare_interactive(addon::Invocation_context& context)
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
+    }
+    std::optional<std::vector<std::string>> initial_invocation;
+    if (request->initial_prompt) {
+        if (!launch) {
+            context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable);
+            return;
+        }
+        initial_invocation = prepare_initial_prompt(*request, *launch, context);
+        if (!initial_invocation) {
+            return;
+        }
     }
     if (launch && uses_tui_plugin(launch->version)) {
         addon::Launch_patch patch;
@@ -457,7 +520,7 @@ void prepare_interactive(addon::Invocation_context& context)
         {
             return;
         }
-        context.succeed(addon::encode_launch_patch(patch, 3));
+        finish_interactive(std::move(patch), *request, std::move(initial_invocation), context);
         return;
     }
     const auto command = recognize_launcher(request->launcher.script_body);
@@ -479,7 +542,7 @@ void prepare_interactive(addon::Invocation_context& context)
     patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, patch.session_wake));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
     patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
-    context.succeed(addon::encode_launch_patch(patch, 3));
+    finish_interactive(std::move(patch), *request, std::move(initial_invocation), context);
 }
 
 // OpenCode's own session identifiers: `ses_` and ASCII letters and digits.
