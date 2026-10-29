@@ -974,7 +974,7 @@ int main(int argc, char** argv)
         std::cerr << "Mixed installation selected native shim but probed " << mixed_launch->version << '\n';
     }
     check(mixed_launch && mixed_launch->version == "2.1.4" &&
-        mixed_launch->argv.front() == path_string(npm_package / "bin" / "opencode.exe"),
+        fs::equivalent(addon::path_from_utf8(mixed_launch->argv.front()), npm_package / "bin" / "opencode.exe"),
         "a native npm shim retains its selected package when both OpenCode families are installed");
     interactive.launcher = {"\"" + path_string(npm_shim) + "\"", "direct", ""};
     interactive.launcher_argv = {path_string(npm_shim)};
