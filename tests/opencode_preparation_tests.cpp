@@ -161,14 +161,17 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     request.launch_environment->platform_id = addon::host_platform_id();
 #endif
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(path_text(root / "absent-bin")));
-    request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value("{\"model\":\"retained/model\",\"instructions\":[\"user.md\"]}"));
+    request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(
+        R"({"model":"retained/model","instructions":["user.md"],"plugins":["user-plugin",{"package":"package-plugin","options":{"label":"retained-option"}}]})"));
     request.launcher_argv = {"opencode"};
     request.session_wake = addon::Session_wake_offer{};
     request.launch_environment->effective_environment.set(opencode::k_export_source_environment,
         addon::Json_value("v1|inherited-source.db"));
     const auto valid_environment = request.launch_environment->effective_environment;
     for (const char* invalid : {"[]", "{/*", "{\"instructions\":false}",
-             "{\"instructions\":[3]}", "{\"plugin\":false}", "{\"plugin\":[[\"private-sentinel\",false]]}"})
+             "{\"instructions\":[3]}", "{\"plugin\":false}", "{\"plugin\":[[\"private-sentinel\",false]]}",
+             R"({"plugins":false})", R"({"plugins":[{}]})", R"({"plugins":[{"package":false}]})",
+             R"({"plugins":[{"package":" "}]})", R"({"plugins":[{"package":"private-sentinel","options":false}]})"})
     {
         request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(invalid));
         const auto rejected = invoke(host, {"launch-preparation", 3}, "prepare", addon::encode_prepare_request(request, 3));
@@ -203,7 +206,9 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     for (const auto& [name, value] : patch->set) {
         if (name == "OPENCODE_CONFIG_CONTENT") {
             merged = value.find("retained/model") != std::string::npos && value.find("user.md") != std::string::npos &&
-                value.find("{{asset_json:assets/logonomic_opencode_plugin.mjs}}") != std::string::npos;
+                value.find("{{asset_json:assets/logonomic_opencode_plugin.mjs}}") != std::string::npos &&
+                value.find("user-plugin") != std::string::npos && value.find("package-plugin") != std::string::npos &&
+                value.find("retained-option") != std::string::npos;
         }
         if (name == "OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED") {
             disabled = value == "0";

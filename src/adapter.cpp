@@ -125,7 +125,9 @@ void invoke(addon::Invocation_context& context)
             reason == "OpenCode configuration must be a JSON object." ||
             reason == "OpenCode instructions must be an array of strings." ||
             reason == "OpenCode plugin configuration must be an array." ||
-            reason == "OpenCode plugin entries must be names or name/options pairs.")
+            reason == "OpenCode plugin entries must be names or name/options pairs." ||
+            reason == "OpenCode plugins must be an array." ||
+            reason == "OpenCode plugins must be names or package/options objects.")
         {
             context.fail(addon::Result_status::FAILED, "opencode_settings_invalid", "OpenCode settings are invalid.");
             return;
