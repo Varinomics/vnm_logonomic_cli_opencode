@@ -1,5 +1,7 @@
 # OpenCode for Logonomic
 
+[![OpenCode provider CI](https://github.com/Varinomics/vnm_logonomic_cli_opencode/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_logonomic_cli_opencode/actions/workflows/ci.yml)
+
 This standalone package supplies OpenCode launcher recognition, interactive
 configuration and tools, delegated ACP implementation, lifecycle delivery, and
 interactive resume through the public Logonomic CLI add-on SDK. Its package identity is `logonomic.cli.opencode`.
