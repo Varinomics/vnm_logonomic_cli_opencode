@@ -138,13 +138,16 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const bool idle       = name == "session.idle";
     const bool error      = name == "session.error";
     const bool asked      = name == "permission.asked";
-    const bool replied    = name == "permission.replied";
+    const bool replied    = name == "permission.replied" ||
+        (native_inbox && name == "logonomic.permission.resolved");
     const bool question_asked    = name == "question.asked" || (native_inbox && name == "form.created");
     const bool question_replied  = name == "question.replied" || (native_inbox && name == "form.replied");
-    const bool question_rejected = name == "question.rejected" || (native_inbox && name == "form.cancelled");
-    const bool submitted        = name == "chat.message";
+    const bool question_resolved = name == "question.rejected" ||
+        (native_inbox && (name == "form.cancelled" || name == "logonomic.form.resolved"));
+    const bool submitted        = name == "chat.message" ||
+        (native_inbox && name == "session.inbox.enqueued" && metadata(body, "input_type") == "user");
     if (!(child_start || child_stop || deleted || status || idle || error || asked || replied ||
-          question_asked || question_replied || question_rejected || submitted || execution))
+          question_asked || question_replied || question_resolved || submitted || execution))
     {
         return result;
     }
@@ -179,8 +182,18 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.observations.push_back(std::move(observation));
         return result;
     }
+    const bool attention = asked || replied || question_asked || question_replied || question_resolved;
+    const auto agent     = attention ? metadata(body, "agent_id") : std::nullopt;
+    if (attention && body.find("agent_id") && !agent) {
+        return std::nullopt;
+    }
+    if (agent) {
+        observation.agent_id = *agent;
+    }
+    // A child prompt can outlive or overlap root turns. Its session and request
+    // identities establish attention without attributing it to a root turn.
     const auto turn = metadata(body, "turn_id");
-    if (!turn && (!native_inbox || body.find("turn_id"))) {
+    if (!turn && ((!native_inbox && !agent) || body.find("turn_id"))) {
         return std::nullopt;
     }
     // OpenCode 2 terminal events can be observed after attaching to a run.
@@ -229,7 +242,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         }
     }
     else
-    if (question_asked || question_replied || question_rejected) {
+    if (question_asked || question_replied || question_resolved) {
         const auto question = metadata(body, "question_id");
         if (!question || body.find("question_id")->as_string() != *question) {
             return std::nullopt;
@@ -275,11 +288,14 @@ std::optional<addon::Attention_classification_result> classify_attention(
     const auto& name = request.base.event.name;
     const auto& body = request.base.event.body;
     if (observation.attention_transition != addon::Attention_transition::NONE) {
-        const bool permission = name == "permission.asked" || name == "permission.replied";
+        const bool permission = name == "permission.asked" || name == "permission.replied" ||
+            name == "logonomic.permission.resolved";
         result.attention_kind = addon::Attention_kind{0, permission ? "permission" : "interactive_question"};
     }
     else
-    if (name == "chat.message" && request.pending_conversational_request_id) {
+    if ((name == "chat.message" || name == "session.inbox.enqueued") &&
+        request.pending_conversational_request_id)
+    {
         observation.attention_transition = addon::Attention_transition::RESOLVED;
         observation.attention_evidence = addon::Evidence::INFERRED;
         observation.attention_request_id = *request.pending_conversational_request_id;
@@ -287,12 +303,14 @@ std::optional<addon::Attention_classification_result> classify_attention(
     }
     else
     if (name == "session.idle" ||
-        (name == "session.status" && metadata(body, "status_type") == "idle"))
+        (name == "session.status" && metadata(body, "status_type") == "idle") ||
+        (name == "session.execution.succeeded" &&
+            observation.outcome_transition == addon::Outcome_transition::SUCCEEDED))
     {
         const auto* normal = body.find("normal_completion");
-        const auto* text = body.find("assistant_text");
-        if (normal && normal->is_boolean() && normal->as_boolean() && text && text->is_string() &&
-            text->as_string().size() <= 2048 && addon::looks_like_reply_request(text->as_string()))
+        const auto* evidence = body.find("assistant_reply_evidence");
+        if (normal && normal->is_boolean() && normal->as_boolean() && evidence &&
+            addon::looks_like_reply_request_evidence(*evidence))
         {
             observation.attention_transition = addon::Attention_transition::REQUESTED;
             observation.attention_evidence = addon::Evidence::INFERRED;

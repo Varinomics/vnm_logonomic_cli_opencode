@@ -5,10 +5,10 @@ import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { create_session_wake } from "./logonomic_opencode_wake.mjs"
 import { create_event_delivery } from "./logonomic_opencode_relay.mjs"
+import { Assistant_reply_evidence } from "./logonomic_opencode_reply.mjs"
 
 const maxMetadataCharacters = 256
 const maxPendingItems = 32
-const max_assistant_text_bytes = 2048
 const maxPendingTurnCandidates = 8
 const maxChildSessions = 128
 const maxChildParentDepth = 16
@@ -485,7 +485,9 @@ export const Logonomic = async ({ client }, options = {}) => {
     finalCleanupReservationMilliseconds
   const rootTurnIDs = new Map()
   const pending_questions = new Map()
+  const pending_permissions = new Map()
   const assistant_replies = new Map()
+  const reply_text = new Map()
   const hint_candidates = new Set()
   const pendingRootTurns = new Map()
   const degradedRootSessions = new Set()
@@ -539,11 +541,14 @@ export const Logonomic = async ({ client }, options = {}) => {
     return { event: "logonomic.delivery_overflow" }
   }
 
-  const clear_attention_state = (session_id) => {
+  const clear_attention_state = (session_id, preserve_children = false) => {
     assistant_replies.delete(session_id)
     hint_candidates.delete(session_id)
-    for (const [id, question] of pending_questions) {
-      if (question.session_id === session_id) pending_questions.delete(id)
+    for (const pending of [pending_questions, pending_permissions]) {
+      for (const [id, request] of pending) {
+        if (preserve_children && request.agent_id) continue
+        if (request.session_id === session_id || request.agent_id === session_id) pending.delete(id)
+      }
     }
   }
 
@@ -551,12 +556,12 @@ export const Logonomic = async ({ client }, options = {}) => {
     const reply = assistant_replies.get(session_id)
     const pending_question = [...pending_questions.values()]
       .some((question) => question.session_id === session_id)
-    clear_attention_state(session_id)
+    clear_attention_state(session_id, true)
     if (reply?.turn_id === turn_id && reply.normal &&
-        reply.text !== undefined && !pending_question) {
+        reply.evidence !== undefined && !pending_question) {
       if (hint_candidates.size >= maxPendingItems) return childObservationLoss()
       projected.normal_completion = true
-      projected.assistant_text = reply.text
+      projected.assistant_reply_evidence = reply.evidence
       hint_candidates.add(session_id)
     }
     return projected
@@ -572,7 +577,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
 
   const clearRootCorrelationState = (sessionID) => {
-    clear_attention_state(sessionID)
+    clear_attention_state(sessionID, true)
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     degradedRootSessions.delete(sessionID)
@@ -907,7 +912,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const degradeTurnCorrelation = (sessionID, degradationType) => {
     if (degradedRootSessions.has(sessionID)) return
     degradedRootSessions.add(sessionID)
-    clear_attention_state(sessionID)
+    clear_attention_state(sessionID, true)
     rootTurnIDs.delete(sessionID)
     pendingRootTurns.delete(sessionID)
     return {
@@ -929,6 +934,53 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (classifiedSessionKind(sessionID) === "root") {
       return degradeTurnCorrelation(sessionID, pending.degradationType)
     }
+  }
+
+  const project_attention = (event, session_id, source_session_id) => {
+    const properties = event.properties
+    const question = event.type.startsWith("question.")
+    const asked = event.type.endsWith(".asked")
+    const pending = question ? pending_questions : pending_permissions
+    const request_id = metadata(asked ? properties.id : properties.requestID)
+    if (!request_id) return
+    const prior = pending.get(request_id)
+    if (!asked) {
+      if (!prior || prior.session_id !== session_id ||
+          (prior.agent_id ?? prior.session_id) !== source_session_id) return
+      if (event.type === "question.replied" && typeof properties.answer_nonempty !== "boolean") return
+      pending.delete(request_id)
+      return {
+        ...prior, event: event.type,
+        ...(event.type === "question.replied" ? { answer_nonempty: properties.answer_nonempty } : {}),
+      }
+    }
+
+    const root_request = source_session_id === session_id
+    const turn_id = root_request ? rootTurnIDs.get(session_id) : undefined
+    if (root_request && !turn_id) return
+    const tool = question ? properties.tool : undefined
+    if (tool !== undefined &&
+        (!metadata(tool?.messageID) || !metadata(tool?.callID) ||
+         (root_request &&
+          assistant_replies.get(session_id)?.message_id !== tool.messageID))) return
+    if (prior) {
+      if (prior.session_id !== session_id || prior.turn_id !== turn_id ||
+          (prior.agent_id ?? prior.session_id) !== source_session_id) {
+        return degradeTurnCorrelation(session_id, "conflicting_confirmation")
+      }
+      return
+    }
+    if (pending.size >= maxPendingItems) return childObservationLoss()
+    // A background child can outlive the root turn or overlap its next turn.
+    // Its native request identifies the child, not an active root turn.
+    const projected = {
+      event: event.type, session_id,
+      ...(root_request ? { turn_id } : { agent_id: source_session_id }),
+      ...(question ? { question_id: request_id } : { permission_id: request_id }),
+      ...(tool ? { tool_message_id: tool.messageID, tool_call_id: tool.callID } : {}),
+    }
+    pending.set(request_id, projected)
+    return projected
   }
 
   const projectEvent = async (event) => {
@@ -1006,7 +1058,7 @@ export const Logonomic = async ({ client }, options = {}) => {
           return childObservationLoss()
         }
         const reply = retained?.message_id === messageID
-          ? retained : { message_id: messageID, turn_id: parentID, text: "", part_id: undefined }
+          ? retained : { message_id: messageID, turn_id: parentID }
         reply.normal = info.finish === "stop" && !info.error &&
           Number.isFinite(info.time?.completed) && info.time.completed > 0
         assistant_replies.set(sessionID, reply)
@@ -1029,12 +1081,17 @@ export const Logonomic = async ({ client }, options = {}) => {
       return
     }
 
-    const sessionID = metadata(properties.sessionID)
-    if (!sessionID) return
+    const sourceSessionID = metadata(properties.sessionID)
+    if (!sourceSessionID) return
+    let sessionID = sourceSessionID
     const kind = await resolveSessionKind(sessionID)
     if (kind === childObservationCapacityLost) {
       return childObservationLoss()
     }
+    const attentionEvent = [
+      "permission.asked", "permission.replied",
+      "question.asked", "question.replied", "question.rejected",
+    ].includes(event.type)
     if (kind === "child") {
       if (event.type === "session.status") {
         const statusType = properties.status?.type
@@ -1065,9 +1122,14 @@ export const Logonomic = async ({ client }, options = {}) => {
           ? childObservationLoss()
           : stopped
       }
-      return
+      if (!attentionEvent) return
+      // The native root UI presents its children's prompts, including children
+      // still running after the root turn has completed.
+      sessionID = await managedRootForChild(sourceSessionID)
+      if (sessionID === childObservationCapacityLost) return childObservationLoss()
+      if (!sessionID) return
     }
-    if (kind !== "root") return
+    else if (kind !== "root") return
 
     const pendingDegradationType = pendingRootTurns.get(sessionID)
       ?.degradationType
@@ -1080,40 +1142,7 @@ export const Logonomic = async ({ client }, options = {}) => {
 
     if (degradedRootSessions.has(sessionID)) return
 
-    if (event.type === "question.asked") {
-      const question_id = metadata(properties.id)
-      const turn_id = rootTurnIDs.get(sessionID)
-      if (!question_id || !turn_id) return
-      const tool = properties.tool
-      if (tool !== undefined &&
-          (!metadata(tool?.messageID) || !metadata(tool?.callID) ||
-           assistant_replies.get(sessionID)?.message_id !== tool.messageID)) return
-      const prior = pending_questions.get(question_id)
-      if (prior) {
-        if (prior.session_id !== sessionID || prior.turn_id !== turn_id) {
-          return degradeTurnCorrelation(sessionID, "conflicting_confirmation")
-        }
-        return
-      }
-      if (pending_questions.size >= maxPendingItems) return childObservationLoss()
-      const projected = {
-        event: event.type, session_id: sessionID, turn_id, question_id,
-        ...(tool ? { tool_message_id: tool.messageID, tool_call_id: tool.callID } : {}),
-      }
-      pending_questions.set(question_id, projected)
-      return projected
-    }
-    if (event.type === "question.replied" || event.type === "question.rejected") {
-      const question_id = metadata(properties.requestID)
-      const pending = pending_questions.get(question_id)
-      if (!pending || pending.session_id !== sessionID) return
-      if (event.type === "question.replied" && typeof properties.answer_nonempty !== "boolean") return
-      pending_questions.delete(question_id)
-      return {
-        ...pending, event: event.type,
-        ...(event.type === "question.replied" ? { answer_nonempty: properties.answer_nonempty } : {}),
-      }
-    }
+    if (attentionEvent) return project_attention(event, sessionID, sourceSessionID)
 
     if (event.type === "session.status") {
       const statusType = properties.status?.type
@@ -1166,7 +1195,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     }
 
     if (event.type === "session.error") {
-      clear_attention_state(sessionID)
+      clear_attention_state(sessionID, true)
       const turnID = rootTurnIDs.get(sessionID)
       rootTurnIDs.delete(sessionID)
       pendingRootTurns.delete(sessionID)
@@ -1178,31 +1207,6 @@ export const Logonomic = async ({ client }, options = {}) => {
         error_type: properties.error?.name === "MessageAbortedError"
           ? "aborted"
           : "failed",
-      }
-    }
-
-    const turnID = rootTurnIDs.get(sessionID)
-    if (!turnID) return
-
-    if (event.type === "permission.asked") {
-      const permissionID = metadata(properties.id)
-      if (!permissionID) return
-      return {
-        event: event.type,
-        session_id: sessionID,
-        turn_id: turnID,
-        permission_id: permissionID,
-      }
-    }
-
-    if (event.type === "permission.replied") {
-      const permissionID = metadata(properties.requestID)
-      if (!permissionID) return
-      return {
-        event: event.type,
-        session_id: sessionID,
-        turn_id: turnID,
-        permission_id: permissionID,
       }
     }
   }
@@ -1237,16 +1241,9 @@ export const Logonomic = async ({ client }, options = {}) => {
     return submitted
   }
 
-  const project_completed_text = ({ session_id, message_id, part_id, text }) => {
+  const project_completed_text = ({ session_id, message_id, evidence }) => {
     const reply = assistant_replies.get(session_id)
-    if (!reply || reply.message_id !== message_id || reply.part_id === part_id) return
-    reply.part_id = part_id
-    if (text === undefined || reply.text === undefined ||
-        Buffer.byteLength(reply.text, "utf8") + Buffer.byteLength(text, "utf8") > max_assistant_text_bytes) {
-      reply.text = undefined
-      return
-    }
-    reply.text += text
+    if (reply?.message_id === message_id) reply.evidence = evidence
   }
 
   // Logonomic resumes a session by relaunching OpenCode with --session, which
@@ -1456,6 +1453,7 @@ export const Logonomic = async ({ client }, options = {}) => {
         rootTurnIDs.clear()
         pending_questions.clear()
         assistant_replies.clear()
+        reply_text.clear()
         hint_candidates.clear()
         pendingRootTurns.clear()
         degradedRootSessions.clear()
@@ -1497,6 +1495,18 @@ export const Logonomic = async ({ client }, options = {}) => {
   hooks.event = ({ event }) => {
     try {
       session_wake?.event(event)
+      // Release native text state at native event order, before queued helper
+      // delivery. An older queued completion must not erase a newer reply.
+      const info = event?.properties?.info
+      if (event?.type === "message.updated" && Number.isFinite(info?.time?.completed) &&
+          info.time.completed > 0 && reply_text.get(info.sessionID)?.message_id === info.id) {
+        reply_text.delete(info.sessionID)
+      } else if (event?.type === "session.deleted") {
+        reply_text.delete(info?.id)
+      } else if (["session.error", "session.idle"].includes(event?.type) ||
+          (event?.type === "session.status" && event.properties?.status?.type === "idle")) {
+        reply_text.delete(event.properties?.sessionID)
+      }
       if (relevantEvents.has(event?.type)) {
         if (event.type.startsWith("question.")) {
           const properties = event.properties
@@ -1537,14 +1547,21 @@ export const Logonomic = async ({ client }, options = {}) => {
     const session_id = metadata(input?.sessionID)
     const message_id = metadata(input?.messageID)
     const part_id = metadata(input?.partID)
-    if (!session_id || !message_id || !part_id) return
-    const text = output?.text
-    enqueue({ kind: "completed_text", session_id, message_id, part_id,
-      // A UTF-8 round trip rejects lone surrogates without requiring newer
-      // String APIs. Bound the input before allocating the encoded copy.
-      text: typeof text === "string" && text.length <= max_assistant_text_bytes && !text.includes("\0") &&
-        Buffer.byteLength(text, "utf8") <= max_assistant_text_bytes &&
-        Buffer.from(text, "utf8").toString("utf8") === text ? text : undefined })
+    if (!accepting || !session_id || !message_id || !part_id) return
+    let retained = reply_text.get(session_id)
+    if (retained?.message_id !== message_id) {
+      if (!retained && reply_text.size >= maxPendingItems) {
+        enqueue({ kind: "overflow" })
+        return
+      }
+      retained = { message_id, scan: new Assistant_reply_evidence() }
+      reply_text.set(session_id, retained)
+    }
+    if (retained.part_id === part_id) return
+    retained.part_id = part_id
+    retained.scan.append(output?.text)
+    enqueue({ kind: "completed_text", session_id, message_id,
+      evidence: retained.scan.snapshot() })
   }
   const resumedSessionID = metadata(
     process.env.OPENCODE_LOGONOMIC_RESUME_SESSION,

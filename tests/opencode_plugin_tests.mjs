@@ -1,14 +1,16 @@
 // Native event fixtures preserve the adopted root/child correlation and bounded
 // projection contract while exercising the packaged SDK helper subprocess.
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const [pluginPath, helperPath, wrapperPath] = process.argv.slice(2)
-assert(pluginPath && helperPath && wrapperPath,
-  "Expected plugin, packaged helper and test vnmctl executable paths")
+const [pluginPath, helperPath, wrapperPath, verifierPath, packagePath] = process.argv.slice(2)
+assert(pluginPath && helperPath && wrapperPath && verifierPath && packagePath,
+  "Expected plugin, packaged helper, test vnmctl, reply verifier and package paths")
+const reply_cases = []
 const scratch = mkdtempSync(join(tmpdir(), "opencode-plugin-"))
 const capturePath = join(scratch, "events.jsonl")
 process.once("exit", () => rmSync(scratch, { recursive: true, force: true }))
@@ -632,6 +634,161 @@ for (const deletedInfo of [
 
 resetCapture()
 {
+  const session_id = "prompt-root"
+  const turn_id = `published-turn-${session_id}`
+  const sessions = new Map([
+    [session_id, { id: session_id }],
+    ["prompt-child-a", { id: "prompt-child-a", parentID: session_id }],
+    ["prompt-child-b", { id: "prompt-child-b", parentID: session_id }],
+    ["unmanaged-root", { id: "unmanaged-root" }],
+    ["unmanaged-child", { id: "unmanaged-child", parentID: "unmanaged-root" }],
+  ])
+  const plugin = await Logonomic({ client: clientFor(sessions) })
+  await publishRoot(plugin, session_id)
+
+  // OpenCode's root UI presents direct-child prompts. Their native request
+  // and tool identities must survive projection onto that root.
+  for (const child of ["a", "b"]) {
+    event(plugin, "permission.asked", {
+      sessionID: `prompt-child-${child}`, id: `per_child_${child}`,
+      permission: privateCanary,
+    })
+    event(plugin, "question.asked", {
+      sessionID: `prompt-child-${child}`, id: `que_child_${child}`,
+      questions: [{ question: privateCanary }],
+      tool: { messageID: `assistant-child-${child}`, callID: `call-child-${child}` },
+    })
+  }
+  event(plugin, "permission.asked", { sessionID: session_id, id: "per_root" })
+  event(plugin, "permission.replied", { sessionID: "prompt-child-b", requestID: "per_child_a" })
+  event(plugin, "question.replied", {
+    sessionID: "prompt-child-b", requestID: "que_child_a", answers: [[privateCanary]],
+  })
+  event(plugin, "permission.replied", { sessionID: session_id, requestID: "per_child_a" })
+  event(plugin, "permission.asked", { sessionID: "unmanaged-child", id: "per_unmanaged" })
+  event(plugin, "question.asked", { sessionID: "unmanaged-child", id: "que_unmanaged" })
+
+  await plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id: "next-prompt-turn" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", { info: {
+    sessionID: session_id, id: "assistant-next-prompt", parentID: "next-prompt-turn", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "busy" } })
+  event(plugin, "permission.replied", { sessionID: "prompt-child-a", requestID: "per_child_a" })
+  await waitForCapturedLength(7)
+  const partial = captured()
+  assert.deepEqual(partial.map((item) => [item.event, item.agent_id, item.permission_id ?? item.question_id]), [
+    ["permission.asked", "prompt-child-a", "per_child_a"],
+    ["question.asked", "prompt-child-a", "que_child_a"],
+    ["permission.asked", "prompt-child-b", "per_child_b"],
+    ["question.asked", "prompt-child-b", "que_child_b"],
+    ["permission.asked", undefined, "per_root"],
+    ["session.status", undefined, undefined],
+    ["permission.replied", "prompt-child-a", "per_child_a"],
+  ], "a reply resolves only its originating request; other native prompts remain pending")
+
+  event(plugin, "permission.replied", { sessionID: "prompt-child-b", requestID: "per_child_b" })
+  event(plugin, "question.replied", {
+    sessionID: "prompt-child-b", requestID: "que_child_b", answers: [[privateCanary]],
+  })
+  event(plugin, "question.rejected", { sessionID: "prompt-child-a", requestID: "que_child_a" })
+  event(plugin, "permission.replied", { sessionID: session_id, requestID: "per_root" })
+  await settle(plugin)
+  const observed = captured()
+  assert.deepEqual(observed.slice(7).map((item) =>
+    [item.event, item.agent_id, item.permission_id ?? item.question_id]), [
+    ["permission.replied", "prompt-child-b", "per_child_b"],
+    ["question.replied", "prompt-child-b", "que_child_b"],
+    ["question.rejected", "prompt-child-a", "que_child_a"],
+    ["permission.replied", undefined, "per_root"],
+  ])
+  assert(observed.every((item) => item.session_id === session_id))
+  assert(observed.filter((item) => !item.agent_id && item.event !== "session.status")
+    .every((item) => item.turn_id === turn_id), "root replies retain the turn that requested attention")
+  assert(observed.filter((item) => item.agent_id).every((item) => item.turn_id === undefined),
+    "child requests do not borrow an unrelated root turn")
+  assert.equal(observed[8].tool_message_id, "assistant-child-b")
+  assert.equal(observed[8].tool_call_id, "call-child-b")
+  assert.equal(observed[8].answer_nonempty, true)
+  assert.equal(observed[9].answer_nonempty, undefined)
+}
+
+for (const [terminal, properties] of [
+  ["session.status", { status: { type: "idle" } }],
+  ["session.idle", {}],
+  ["session.error", { error: { name: "Error", message: privateCanary } }],
+]) {
+  resetCapture()
+  const session_id = "background-root"
+  const child_id = "background-child"
+  const late_child_id = "background-late-child"
+  const sessions = new Map([
+    [session_id, { id: session_id }],
+    [child_id, { id: child_id, parentID: session_id }],
+    [late_child_id, { id: late_child_id, parentID: session_id }],
+  ])
+  const plugin = await Logonomic({ client: clientFor(sessions) })
+  await publishRoot(plugin, session_id)
+  event(plugin, "session.status", { sessionID: child_id, status: { type: "busy" } })
+  event(plugin, "permission.asked", { sessionID: child_id, id: "per_before_idle" })
+  event(plugin, "question.asked", { sessionID: child_id, id: "que_before_idle",
+    tool: { messageID: "assistant-background-child", callID: "call-before-idle" } })
+  event(plugin, terminal, { sessionID: session_id, ...properties })
+  event(plugin, "session.updated", { info: { id: child_id, parentID: session_id, title: privateCanary } })
+  event(plugin, "permission.replied", { sessionID: child_id, requestID: "per_before_idle" })
+  event(plugin, "question.replied", {
+    sessionID: child_id, requestID: "que_before_idle", answers: [[privateCanary]],
+  })
+  event(plugin, "permission.asked", { sessionID: child_id, id: "per_after_idle" })
+  event(plugin, "question.asked", { sessionID: child_id, id: "que_after_idle" })
+  // A child's first observed prompt may arrive after its parent has finished;
+  // native session ownership is sufficient even without an observed child start.
+  event(plugin, "permission.asked", { sessionID: late_child_id, id: "per_late_child" })
+  event(plugin, "question.asked", { sessionID: late_child_id, id: "que_late_child" })
+  await plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id: "next-background-turn" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", { info: {
+    sessionID: session_id, id: "assistant-next-background", parentID: "next-background-turn", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "busy" } })
+  event(plugin, "permission.replied", { sessionID: child_id, requestID: "per_after_idle" })
+  event(plugin, "question.rejected", { sessionID: child_id, requestID: "que_after_idle" })
+  event(plugin, "permission.replied", { sessionID: late_child_id, requestID: "per_late_child" })
+  event(plugin, "question.replied", {
+    sessionID: late_child_id, requestID: "que_late_child", answers: [[privateCanary]],
+  })
+  await settle(plugin)
+  const observed = captured()
+  assert.deepEqual(observed.map((item) => [item.event, item.permission_id ?? item.question_id]), [
+    ["logonomic.subagent.started", undefined],
+    ["permission.asked", "per_before_idle"],
+    ["question.asked", "que_before_idle"],
+    [terminal, undefined],
+    ["permission.replied", "per_before_idle"],
+    ["question.replied", "que_before_idle"],
+    ["permission.asked", "per_after_idle"],
+    ["question.asked", "que_after_idle"],
+    ["permission.asked", "per_late_child"],
+    ["question.asked", "que_late_child"],
+    ["session.status", undefined],
+    ["permission.replied", "per_after_idle"],
+    ["question.rejected", "que_after_idle"],
+    ["permission.replied", "per_late_child"],
+    ["question.replied", "que_late_child"],
+  ], `${terminal} does not settle background child prompts`)
+  const prompts = observed.filter((item) => item.permission_id || item.question_id)
+  assert(prompts.every((item) => item.session_id === session_id && item.turn_id === undefined))
+  assert(prompts.every((item) => item.agent_id ===
+    ((item.permission_id ?? item.question_id).endsWith("late_child") ? late_child_id : child_id)))
+  assert.equal(observed[5].tool_message_id, "assistant-background-child")
+  assert.equal(observed[5].tool_call_id, "call-before-idle")
+  assert.equal(observed[10].turn_id, "next-background-turn")
+}
+
+resetCapture()
+{
   const session_id = "question-root"
   const plugin = await Logonomic({ client: clientFor(new Map()) })
   await publishRoot(plugin, session_id)
@@ -675,6 +832,75 @@ resetCapture()
   assert.deepEqual(captured(), observed)
 }
 
+// A normal attributed reply still carries its final question after a long
+// explanation; the native text-complete hook supplies the complete text part.
+resetCapture()
+{
+  const session_id = "long-reply-question"
+  const turn_id = `published-turn-${session_id}`
+  const message_id = `assistant-${turn_id}`
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  const text = privateCanary + "An explanation. ".repeat(400) + "\n\nWhich target should I use?"
+  await plugin["experimental.text.complete"](
+    { sessionID: session_id, messageID: message_id, partID: "part-long" }, { text })
+  event(plugin, "message.updated", { info: {
+    id: message_id, sessionID: session_id, parentID: turn_id, role: "assistant",
+    finish: "stop", time: { completed: 1234 },
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  await settle(plugin)
+  const body = captured().find((item) => item.event === "session.status")
+  assert.equal(body.normal_completion, true, "a long normal reply lost its closing conversational question")
+  assert.equal(body.assistant_reply_evidence.suffix, "Which target should I use?")
+  reply_cases.push({ text, body, hint: true })
+}
+
+
+// Text parts can split a Markdown opener, a CRLF boundary, or a long paragraph.
+// The complete attributed reply remains the oracle, regardless of that split.
+const long_text = "A complete explanation. ".repeat(350)
+const stream_cases = [
+  { parts: [long_text, " Which target?"], hint: true },
+  { parts: ["Please provide ", long_text, "."], hint: true },
+  { parts: ["Which target?", " ".repeat(5000)], hint: true },
+  { parts: ["``", "`text\n", long_text, "\n\nWhich target?"], hint: false },
+  { parts: ["~~~~text\r", "\n", long_text, "\n~~~\nWhich target?"], hint: false },
+  { parts: ["```text\n", long_text, "\n```\n\nWhich target?"], hint: true },
+  { parts: ["~~~text\n", long_text, "\n~~~ trailing text\nWhich target?"], hint: false },
+  { parts: ["> ", long_text, "\nWhich target?"], hint: false },
+  { parts: ["Prose\n> Quoted text", "\nWhich target?"], hint: false },
+  { parts: ["> Quote\n", "\nWhich target?"], hint: true },
+  { parts: ["Complete.\r", "\n \t\r", "\nWhich target?"], hint: true },
+  { parts: ["Which target?\n\n", "    code question?"], hint: false },
+  { parts: ["Which target?\n\n", "> quoted question?"], hint: false },
+  { parts: ["界".repeat(750), "选择哪个目标？"], hint: true },
+  { parts: [long_text, "\n\nComplete."], hint: false },
+]
+for (const [index, { parts, hint }] of stream_cases.entries()) {
+  resetCapture()
+  const session_id = `stream-reply-${index}`
+  const turn_id = `published-turn-${session_id}`
+  const message_id = `assistant-${turn_id}`
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  for (const [part, text] of parts.entries()) {
+    const input = { sessionID: session_id, messageID: message_id, partID: `part-${part}` }
+    await plugin["experimental.text.complete"](input, { text })
+    // Repeated delivery of the same complete part must not duplicate its bytes.
+    await plugin["experimental.text.complete"](input, { text })
+  }
+  event(plugin, "message.updated", { info: {
+    id: message_id, sessionID: session_id, parentID: turn_id, role: "assistant",
+    finish: "stop", time: { completed: 1234 },
+  } })
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  await settle(plugin)
+  const body = captured().find((item) => item.event === "session.status")
+  assert(body, "normal completion was lost while scanning text parts")
+  reply_cases.push({ text: parts.join(""), body, hint })
+}
+
 for (const disposition of ["normal", "intermediate", "aborted", "oversized", "unicode", "pending-question",
   "lone-high", "lone-low", "surrogate-pair", "replacement-character", "nul"]) {
   resetCapture()
@@ -712,13 +938,18 @@ for (const disposition of ["normal", "intermediate", "aborted", "oversized", "un
   await settle(plugin)
   const observed = captured()
   const completion = observed.find((item) => item.event === "session.status")
-  if (["normal", "unicode", "surrogate-pair", "replacement-character"].includes(disposition)) {
-    assert.equal(completion.assistant_text, text)
+  if (["normal", "oversized", "unicode", "surrogate-pair", "replacement-character"].includes(disposition)) {
+    assert.equal(completion.assistant_reply_evidence.scope, "final_paragraph_edges")
+    assert.equal(completion.assistant_reply_evidence.context, "prose")
+    for (const edge of ["prefix", "suffix"]) {
+      assert(Buffer.byteLength(completion.assistant_reply_evidence[edge], "utf8") <= 128)
+    }
+    reply_cases.push({ text, body: completion, hint: true })
     assert.equal(completion.normal_completion, true)
     assert.equal(observed.filter((item) => item.event === "session.status").length, 1)
     assert.equal(observed.at(-1).event, "chat.message")
   } else {
-    assert(observed.every((item) => item.assistant_text === undefined))
+    assert(observed.every((item) => item.assistant_reply_evidence === undefined))
     assert(observed.every((item) => item.event !== "chat.message"))
   }
 }
@@ -839,4 +1070,10 @@ resetCapture()
   assert.equal(captured()[1].turn_id, "turn-after-resume")
 }
 
+const reply_cases_path = join(scratch, "reply-cases.json")
+writeFileSync(reply_cases_path, JSON.stringify(reply_cases))
+const reply_verification = spawnSync(verifierPath, [packagePath, reply_cases_path], { encoding: "utf8" })
+assert.equal(reply_verification.status, 0,
+  `packaged reply evidence failed: ${reply_verification.stdout}${reply_verification.stderr}`)
+process.stdout.write(reply_verification.stdout)
 console.log("native-agent-plugin-passed")

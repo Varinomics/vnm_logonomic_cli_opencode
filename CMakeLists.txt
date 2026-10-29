@@ -202,6 +202,9 @@ add_dependencies(opencode_conversation_source_tests opencode_package)
 add_test(NAME opencode_conversation_source_tests COMMAND opencode_conversation_source_tests)
 add_executable(opencode_fake_vnmctl tests/opencode_fake_vnmctl.cpp)
 opencode_target(opencode_fake_vnmctl)
+add_executable(opencode_reply_evidence_tests tests/opencode_reply_evidence_tests.cpp)
+opencode_target(opencode_reply_evidence_tests)
+add_dependencies(opencode_reply_evidence_tests opencode_package)
 add_executable(opencode2_native_prepare tests/opencode2_native_prepare.cpp)
 opencode_target(opencode2_native_prepare)
 add_dependencies(opencode2_native_prepare opencode_package)
@@ -216,11 +219,13 @@ add_test(NAME opencode_wake_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
 add_test(NAME opencode_tui_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_tui_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_tui.mjs"
-    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
+    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>"
+    "$<TARGET_FILE:opencode_reply_evidence_tests>" "${OPENCODE_PACKAGE_DIRECTORY}")
 add_test(NAME opencode_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"
-    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>")
+    "$<TARGET_FILE:opencode_helper>" "$<TARGET_FILE:opencode_fake_vnmctl>"
+    "$<TARGET_FILE:opencode_reply_evidence_tests>" "${OPENCODE_PACKAGE_DIRECTORY}")
 add_test(NAME opencode_context_plugin_tests COMMAND "${OPENCODE_NODE_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/opencode_context_plugin_tests.mjs"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/logonomic_opencode_plugin.mjs"

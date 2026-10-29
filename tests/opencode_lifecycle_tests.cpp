@@ -249,7 +249,7 @@ void declared_profile_admits_every_shape(const std::filesystem::path& package)
     }
     request = event("session.idle");
     request.event.body.set("normal_completion", addon::Json_value(true));
-    request.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+    request.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target should I use?"));
     const auto hint = admitted(request, "the declaration refuses a completion that ends in a question");
     pending = hint.base.observations.front().attention_request_id;
     admitted(event("chat.message"), "the declaration refuses the reply that resolves a conversational hint");
@@ -327,6 +327,30 @@ int main(int argc, char** argv)
                 ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED),
             "native form events preserve attention identity without answer prose");
     }
+
+    for (const auto* name : {"logonomic.permission.resolved", "logonomic.form.resolved"}) {
+        const bool permission = std::string_view(name) == "logonomic.permission.resolved";
+        auto request = event(name);
+        request.event.body.erase("turn_id");
+        request.event.body.set("api_generation", addon::Json_value(2));
+        request.event.body.set(permission ? "permission_id" : "question_id", addon::Json_value("request-removed"));
+        const auto observation = classify(request).observations.front();
+        require(observation.provider_event_name == name && observation.provider_turn_id.empty() &&
+                observation.attention_request_id == "request-removed" &&
+                observation.attention_transition == addon::Attention_transition::RESOLVED &&
+                observation.attention_evidence == addon::Evidence::CONFIRMED &&
+                observation.phase_transition == addon::Phase_transition::NONE &&
+                observation.outcome_transition == addon::Outcome_transition::NONE,
+            "native pending-list absence resolves its exact request without inventing a reply or execution outcome");
+        Classification_call call(addon::Attention_classification_request{request, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind &&
+                result->attention_kind->kind == (permission ? "permission" : "interactive_question"),
+            "snapshot resolution preserves the native prompt kind");
+        request.event.body.erase("api_generation");
+        require(classify(request).observations.empty(), "snapshot resolution belongs only to the native TUI contract");
+    }
     for (const auto* name : {"question.asked", "question.replied", "question.rejected"}) {
         auto request = event(name);
         request.event.body.set("question_id", addon::Json_value("que_native_question"));
@@ -364,11 +388,51 @@ int main(int argc, char** argv)
             permission_call.attention_result()->attention_kind->kind == "permission",
         "permissions are not classified as questions");
 
-    for (const auto* name : {"session.idle", "session.status"}) {
+    for (const auto* name : {"permission.asked", "permission.replied",
+        "question.asked", "question.replied", "question.rejected", "form.created", "form.replied",
+        "form.cancelled", "logonomic.permission.resolved", "logonomic.form.resolved"})
+    {
+        const bool is_permission = std::string_view(name).starts_with("permission.") ||
+            std::string_view(name) == "logonomic.permission.resolved";
+        auto request = event(name);
+        request.event.body.set("api_generation", addon::Json_value(2));
+        request.event.body.erase("turn_id");
+        request.event.body.set("agent_id", addon::Json_value("background-child"));
+        request.event.body.set(is_permission ? "permission_id" : "question_id",
+            addon::Json_value("background-request"));
+        if (std::string_view(name) == "question.replied" || std::string_view(name) == "form.replied") {
+            request.event.body.set("answer_nonempty", addon::Json_value(true));
+        }
+        const auto observation = classify(request).observations.front();
+        require(observation.provider_session_id == "session-primary" &&
+                observation.agent_id == "background-child" && observation.provider_turn_id.empty() &&
+                observation.attention_request_id == "background-request" &&
+                observation.attention_transition == (std::string_view(name).ends_with(".asked") ||
+                    std::string_view(name) == "form.created"
+                    ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED) &&
+                observation.phase_transition == addon::Phase_transition::NONE &&
+                observation.outcome_transition == addon::Outcome_transition::NONE,
+            "background child attention retains ownership without claiming a root turn or phase");
+        Classification_call call(addon::Attention_classification_request{request, std::nullopt});
+        opencode::handle_lifecycle(call);
+        const auto result = call.attention_result();
+        require(result && result->attention_kind &&
+                result->attention_kind->kind == (is_permission ? "permission" : "interactive_question"),
+            "background child prompts retain their confirmed attention kind");
+        request.event.body.set("agent_id", addon::Json_value(""));
+        Classification_call malformed_child(request);
+        opencode::handle_lifecycle(malformed_child);
+        require(malformed_child.status() == addon::Result_status::FAILED,
+            "missing child identity cannot bypass root turn correlation");
+    }
+
+    for (const auto* name : {"session.idle", "session.status", "session.execution.succeeded"}) {
         auto completed = event(name);
+        const bool native_inbox = std::string_view(name) == "session.execution.succeeded";
+        if (native_inbox) completed.event.body.set("api_generation", addon::Json_value(2));
         completed.event.body.set("status_type", addon::Json_value("idle"));
         completed.event.body.set("normal_completion", addon::Json_value(true));
-        completed.event.body.set("assistant_text", addon::Json_value("Which target should I use?"));
+        completed.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target should I use?"));
         require(classify(completed).observations.front().attention_transition == addon::Attention_transition::NONE,
             "base helper ingress does not acquire optional hint semantics");
         Classification_call call(addon::Attention_classification_request{completed, std::nullopt});
@@ -378,20 +442,44 @@ int main(int argc, char** argv)
                 result->base.observations.front().attention_evidence == addon::Evidence::INFERRED,
             "normal completed text uses the local SDK heuristic as inferred evidence");
         const auto hint_id = result->base.observations.front().attention_request_id;
-        Classification_call resolved(addon::Attention_classification_request{event("chat.message"), hint_id});
+        auto submitted = event(native_inbox ? "session.inbox.enqueued" : "chat.message");
+        if (native_inbox) {
+            submitted.event.body.erase("turn_id");
+            submitted.event.body.set("api_generation", addon::Json_value(2));
+            submitted.event.body.set("input_type", addon::Json_value("user"));
+        }
+        Classification_call resolved(addon::Attention_classification_request{submitted, hint_id});
         opencode::handle_lifecycle(resolved);
         require(resolved.attention_result() &&
                 resolved.attention_result()->base.observations.front().attention_request_id == hint_id &&
                 resolved.attention_result()->base.observations.front().attention_transition == addon::Attention_transition::RESOLVED,
             "new user input resolves only the host-selected hint identity");
-        for (const auto& text : {std::string("Completed."), std::string(2048, 'x') + "?"}) {
-            completed.event.body.set("assistant_text", addon::Json_value(text));
+        if (native_inbox) {
+            for (const auto* input_type : {"synthetic", "compaction", "move"}) {
+                submitted.event.body.set("input_type", addon::Json_value(input_type));
+                Classification_call unrelated(addon::Attention_classification_request{submitted, hint_id});
+                opencode::handle_lifecycle(unrelated);
+                require(unrelated.attention_result() && unrelated.attention_result()->base.observations.empty() &&
+                        !unrelated.attention_result()->attention_kind,
+                    "native synthetic or housekeeping input cannot answer a conversational hint");
+            }
+            auto attached = completed;
+            attached.event.body.erase("turn_id");
+            Classification_call unknown_turn(addon::Attention_classification_request{attached, std::nullopt});
+            opencode::handle_lifecycle(unknown_turn);
+            require(unknown_turn.attention_result() && !unknown_turn.attention_result()->attention_kind,
+                "a terminal event without its observed start cannot infer a completed reply");
+        }
+        for (const auto& evidence : {addon::assistant_reply_evidence("Completed."),
+            addon::assistant_reply_evidence("```\nWhich target?\n```"), addon::Json_value("malformed")})
+        {
+            completed.event.body.set("assistant_reply_evidence", evidence);
             Classification_call ignored(addon::Attention_classification_request{completed, std::nullopt});
             opencode::handle_lifecycle(ignored);
             require(ignored.attention_result() && !ignored.attention_result()->attention_kind,
-                "nonquestion or overlong text does not request inferred attention");
+                "nonquestion, excluded or malformed evidence does not request inferred attention");
         }
-        completed.event.body.set("assistant_text", addon::Json_value("Which target?"));
+        completed.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which target?"));
         completed.event.body.set("normal_completion", addon::Json_value(false));
         Classification_call interrupted(addon::Attention_classification_request{completed, std::nullopt});
         opencode::handle_lifecycle(interrupted);

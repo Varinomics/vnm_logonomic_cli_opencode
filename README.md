@@ -86,21 +86,47 @@ No version ceiling is imposed on compatible launchers.
 ## Building and local qualification
 
 Interactive native question events retain `question.asked`, `question.replied`,
-and `question.rejected`, the native question identity, and its original root
-turn. Replies carry a boolean `answer_nonempty` in the projected provider event:
+and `question.rejected` and the native question identity. Root questions retain
+their original root turn; child questions retain their native child and request
+identities without borrowing a root turn. Replies carry a boolean
+`answer_nonempty` in the projected provider event:
 true means at least one returned answer string contains non-whitespace text.
 Question and answer prose are omitted. A reply is distinct from a rejection;
 disposal or session termination clears pending correlation without fabricating
 either event. A native qualification gate must require a correlated reply with
 `answer_nonempty: true`, not merely disappearance of attention.
 
+The OpenCode 2 TUI restores pending permissions and forms from the selected
+root and its native session family, including after hydration and reselection.
+Descendant requests retain their source session as `agent_id` without acquiring
+the parent's execution turn. Unhydrated descendant collections do not resolve
+pending requests; root completion does not resolve them either. A deleted child
+resolves only that child's retained requests. Global forms have no root-session
+ownership and are not projected onto the selected root.
+Restored requests have no invented execution turn. A request removed from a refreshed
+pending list resolves attention without claiming a native reply or cancellation;
+only an observed native form reply supplies `answer_nonempty`. A native reply
+keeps its request identity and answer evidence when the request outlives its
+execution; after a newer execution starts, it omits the superseded turn.
+
 The optional `attention-kind@1` companion distinguishes confirmed native
-questions from permissions and inferred conversational hints. The plugin retains
-at most 2048 UTF-8 bytes of completed assistant text per correlated message and
-supplies it only on normal root completion (`finish: stop`, completed timestamp,
-no error), before the first idle event clears turn identity. Overlong or invalid
-text is unavailable, not truncated into a different question. This bounded text
-is private classifier input, never copied into lifecycle observation fields.
+questions from permissions and inferred conversational hints. The OpenCode 1
+plugin scans complete native assistant text parts while retaining bounded
+Markdown context and the final prose paragraph's first and last 128 UTF-8 bytes.
+It supplies those explicitly scoped edges only on normal root completion
+(`finish: stop`, completed timestamp, no error), before the first idle event
+clears turn identity. Long explanations retain their closing question; invalid,
+quoted or code evidence is omitted. Part boundaries preserve fence, quote and
+paragraph context. These edges are private classifier input, never a claimed
+complete message or copied into lifecycle observation fields.
+The OpenCode 2 TUI uses the same bounded scanner on native `session.text.ended`
+complete values, following contiguous text ordinals within an observed assistant
+step. It emits evidence only after that step ends with `finish: stop` and its
+observed root execution succeeds. Missing starts, incomplete text, failed or
+interrupted executions, reconnects and later assistant steps invalidate earlier
+reply evidence. Reasoning and streaming deltas do not supply reply text. A genuine
+native user inbox item can resolve a conversational hint; synthetic notifications
+and housekeeping items cannot.
 The existing SDK local heuristic classifies hints; genuine subsequent user input
 can resolve only the host-selected conversational hint. No transcript hydration
 or external classification is used. Pending question, reply, and hint tracking
