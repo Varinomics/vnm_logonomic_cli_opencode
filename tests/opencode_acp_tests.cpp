@@ -83,14 +83,28 @@ void require_permission_reply(const std::string& bytes, const Json& id, const ch
 class Session
 {
 public:
-    explicit Session(const fs::path& attestation)
+    explicit Session(const fs::path& attestation, bool auto_approve = false)
     {
         const auto path = attestation.u8string();
         Json entry = parse("{\"server_id\":\"task_control\",\"nonce\":\"0123456789abcdef0123456789abcdef\"}");
         entry.set("path", Json(std::string(path.begin(), path.end())));
         m_state = opencode::make_acp_inspection(
             "Implement the requested change", ".", "1.2.3", Json::array(),
-            Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)})).protocol_state;
+            Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)}), auto_approve).protocol_state;
+    }
+
+    void omit_auto_mode()
+    {
+        auto state = parse(m_state);
+        state.erase("auto_approve");
+        m_state = addon::serialize_json(state);
+    }
+
+    void omit_permission_reply_marker()
+    {
+        auto state = parse(m_state);
+        state.erase("deferred_input_has_permission_reply");
+        m_state = addon::serialize_json(state);
     }
 
     addon::Structured_inspect_result feed(const std::string& bytes, bool final = false,
@@ -130,6 +144,219 @@ std::string foreign_session(std::string record)
 
 void run(const fs::path& attestation)
 {
+    // Native OpenCode 1.18.33 asks for an ACP write after edit approval despite
+    // empty client capabilities. A JSON-RPC refusal lets its own edit complete.
+    // The client must neither claim a successful write nor gain filesystem access.
+    auto write_request = parse(R"({"jsonrpc":"2.0","id":18,"method":"fs/write_text_file",)"
+        R"("params":{"sessionId":"ses_root","path":"fixture","content":"proposed edit"}})");
+    const auto proposed_file = attestation.parent_path() / "proposed.txt";
+    write_request.find("params")->set("path", Json(proposed_file.generic_string()));
+    const auto write_bytes = addon::serialize_json(write_request) + '\n';
+    const auto unsupported = parse(
+        R"({"jsonrpc":"2.0","id":18,"error":{"code":-32601,"message":"Method not found"}})");
+    {
+        const auto initialize = parse(opencode::acp_initial_input());
+        require(initialize.find("params")->find("clientCapabilities")->as_object().empty(),
+            "declining the unsolicited write must not advertise filesystem capability");
+        Session automatic(attestation, true);
+        automatic.reach_prompt();
+        auto permission = parse(k_permission);
+        permission.find("params")->find("toolCall")->set("kind", Json("edit"));
+        const auto approved = automatic.feed(addon::serialize_json(permission) + '\n');
+        require(approved.stdin_bytes.has_value(), "native edit ask must receive a reply");
+        require_permission_reply(*approved.stdin_bytes, Json(17), "once");
+        const auto refused = automatic.feed(write_bytes);
+        require(!refused.complete && refused.stdin_bytes && parse(*refused.stdin_bytes) == unsupported,
+            "the approved edit's client write must receive a truthful unsupported-method error");
+        require(!fs::exists(proposed_file), "the inspector must not perform the proposed write");
+        automatic.feed(k_message);
+        const auto ended = automatic.feed(k_end_turn);
+        require(!ended.complete && ended.stdin_bytes, "native edit completion must request close");
+        const auto closed = automatic.feed(k_closed);
+        require(closed.complete && closed.result_bytes == "Finished",
+            "refusing the client write must preserve native prompt completion");
+    }
+    {
+        Session session(attestation);
+        session.reach_prompt();
+        std::string emitted;
+        for (const char byte : write_bytes) {
+            const auto result = session.feed(std::string(1, byte));
+            require(!result.complete, "a fragmented client write must remain a protocol refusal");
+            if (result.stdin_bytes) emitted += *result.stdin_bytes;
+        }
+        require(parse(emitted) == unsupported, "fragmented writes must retain one correlated refusal");
+        require(session.feed(permission_request(Json(18.0))).failure_reason == "acp_unsupported_reverse_request",
+            "filesystem and permission requests share duplicate-ID protection");
+    }
+    {
+        Session automatic(attestation, true);
+        automatic.reach_prompt();
+        const auto approved = automatic.feed(k_permission);
+        require(approved.stdin_bytes.has_value(), "edit approval must be delivered before its continuation");
+        require_permission_reply(*approved.stdin_bytes, Json(17), "once");
+        const auto completed = automatic.feed(write_bytes + k_message + k_end_turn);
+        require(!completed.complete && completed.stdin_bytes && !completed.failure_reason,
+            "a native fire-and-forget write and end_turn in one read must retain refusal and request close");
+        const auto refusal_end = completed.stdin_bytes->find('\n');
+        require(parse(completed.stdin_bytes->substr(0, refusal_end)) == unsupported &&
+                parse(completed.stdin_bytes->substr(refusal_end + 1)).find("method")->as_string() == "session/close",
+            "the combined continuation must send the write refusal before the close request");
+        require(automatic.feed(k_closed).result_bytes == "Finished",
+            "the coalesced native edit must close and deliver its result");
+        const auto transcript = write_bytes + k_message + k_end_turn;
+        for (std::size_t split = 1; split < transcript.size(); ++split) {
+            Session fragmented(attestation, true);
+            fragmented.reach_prompt();
+            fragmented.feed(k_permission);
+            const auto first  = fragmented.feed(transcript.substr(0, split));
+            const auto second = fragmented.feed(transcript.substr(split));
+            require(!first.complete && !second.complete &&
+                    first.stdin_bytes.value_or("") + second.stdin_bytes.value_or("") == *completed.stdin_bytes &&
+                    second.protocol_state == completed.protocol_state,
+                "every split of write, message and end_turn must preserve replies and continuation");
+            require(fragmented.feed(k_closed).result_bytes == "Finished",
+                "a split native edit must close and deliver the same result");
+        }
+    }
+    for (const auto& requests : {write_bytes + k_permission, k_permission + write_bytes}) {
+        for (const bool legacy : {false, true}) {
+            Session session(attestation, true);
+            session.reach_prompt();
+            const auto partial = session.feed(requests + k_message + k_end_turn.substr(0, 15));
+            require(!partial.complete && !partial.stdin_bytes,
+                "partial end_turn must withhold queued permission and filesystem replies");
+            if (legacy) session.omit_permission_reply_marker();
+            const auto result = session.feed(k_end_turn.substr(15));
+            require(result.failure_reason == "acp_invalid_prompt_completion" && !result.stdin_bytes,
+                "a deferred permission reply must still block completion beside a filesystem refusal");
+        }
+    }
+    {
+        Session session(attestation, true);
+        session.feed(k_initialize);
+        const auto early_write = session.feed(k_new + write_bytes);
+        require(early_write.failure_reason == "acp_out_of_order_reverse_request" && !early_write.stdin_bytes,
+            "an unsent prompt must still block a filesystem reverse request");
+        Session closing(attestation, true);
+        closing.reach_prompt();
+        const auto early_close = closing.feed(write_bytes + k_message + k_end_turn + k_closed);
+        require(early_close.failure_reason == "acp_invalid_close" && !early_close.stdin_bytes,
+            "an unsent close must still block its response after coalesced write refusals");
+    }
+    {
+        auto error = unsupported;
+        error.set("id", Json(""));
+        const auto overhead = addon::serialize_json(error).size() + 1;
+        const auto id_size  = addon::limits::k_max_structured_stream_bytes / 5 - overhead - 1;
+        std::string requests;
+        for (int id = 0; id < 5; ++id) {
+            auto request = write_request;
+            request.set("id", Json(std::string(id_size - 1, 'w') + std::to_string(id)));
+            requests += addon::serialize_json(request) + '\n';
+        }
+        Session session(attestation, true);
+        session.reach_prompt();
+        const auto prefix = session.feed(requests.substr(0, 128 * 1024));
+        require(!prefix.complete && !prefix.stdin_bytes, "a partial large write request must wait");
+        const auto tail = requests.substr(128 * 1024) + k_message + k_end_turn;
+        require(tail.size() <= addon::limits::k_max_structured_stream_bytes, "fixture stdout must fit the SDK bound");
+        const auto result = session.feed(tail);
+        require(result.failure_reason == "acp_permission_reply_bound_exceeded" && !result.stdin_bytes,
+            "appending close to bounded write refusals must not overflow the stdin continuation");
+    }
+    {
+        Session session(attestation, true);
+        session.reach_prompt();
+        session.feed(permission_request(Json(18)));
+        require(session.feed(write_bytes).failure_reason == "acp_unsupported_reverse_request",
+            "a filesystem request cannot reuse a permission request ID");
+    }
+    for (const auto& invalid : {
+             R"({"sessionId":"ses_foreign","path":"fixture","content":"edit"})",
+             R"({"sessionId":"ses_root","path":"","content":"edit"})",
+             R"({"sessionId":"ses_root","path":false,"content":"edit"})",
+             R"({"sessionId":"ses_root","path":"fixture","content":false})",
+             R"({"sessionId":"ses_root","path":"fixture","content":"edit","_meta":false})",
+             R"({"sessionId":"ses_root","path":"fixture","content":"edit","extra":true})"})
+    {
+        Session session(attestation, true);
+        session.reach_prompt();
+        auto request = write_request;
+        request.set("params", parse(invalid));
+        const auto result = session.feed(k_permission + addon::serialize_json(request) + '\n');
+        require(result.failure_reason == "acp_unsupported_reverse_request" && !result.stdin_bytes,
+            "foreign or malformed writes must fail without partial permission replies");
+    }
+    for (const auto& request : [&] {
+        auto oversized = write_request;
+        oversized.find("params")->set("path", Json(std::string(32 * 1024 + 1, 'p')));
+        auto other_method = write_request;
+        other_method.set("method", Json("fs/read_text_file"));
+        auto invalid_id = write_request;
+        invalid_id.set("id", Json(false));
+        return Json::Array{oversized, other_method, invalid_id};
+    }())
+    {
+        Session session(attestation, true);
+        session.reach_prompt();
+        require(session.feed(addon::serialize_json(request) + '\n').failure_reason ==
+            "acp_unsupported_reverse_request", "the refusal must remain bounded and method-specific");
+    }
+    {
+        Session session(attestation, true);
+        session.reach_prompt();
+        for (int id = 1000; id < 1256; ++id) {
+            auto request = write_request;
+            request.set("id", Json(id));
+            const auto result = session.feed(addon::serialize_json(request) + '\n');
+            require(!result.complete && result.stdin_bytes, "256 filesystem request IDs fit the shared bound");
+        }
+        require(session.feed(k_permission).failure_reason == "acp_unsupported_reverse_request",
+            "filesystem refusals must consume the existing session request bound");
+    }
+    // Native --auto (TUI SyncProvider) replies once to permission.asked.
+    // Permission.ask rejects explicit deny rules before publishing that event.
+    {
+        Session automatic(attestation, true);
+        automatic.reach_prompt();
+        const auto first = automatic.feed(k_permission);
+        require(!first.complete && first.stdin_bytes, "selected auto mode answers a native pending ask");
+        require_permission_reply(*first.stdin_bytes, Json(17), "once");
+        const auto next = automatic.feed(permission_request(Json(18)));
+        require(!next.complete && next.stdin_bytes, "auto mode survives the serialized inspection continuation");
+        require_permission_reply(*next.stdin_bytes, Json(18), "once");
+        const auto foreign = automatic.feed(foreign_session(permission_request(Json(19))));
+        require(foreign.failure_reason == "acp_unsupported_reverse_request" && !foreign.stdin_bytes,
+            "auto mode cannot approve another session's request");
+    }
+    {
+        Session automatic(attestation, true);
+        automatic.reach_prompt();
+        auto request = parse(k_permission);
+        auto& options = request.find("params")->find("options")->as_array();
+        options.erase(options.begin());
+        const auto unoffered = automatic.feed(addon::serialize_json(request) + '\n');
+        require(unoffered.failure_reason == "acp_unsupported_reverse_request" && !unoffered.stdin_bytes,
+            "auto mode never substitutes a persistent grant when allow-once is absent");
+    }
+    {
+        Session default_mode(attestation);
+        default_mode.omit_auto_mode();
+        default_mode.reach_prompt();
+        const auto rejected = default_mode.feed(k_permission);
+        require(!rejected.complete && rejected.stdin_bytes, "an unspecified mode keeps the original posture");
+        require_permission_reply(*rejected.stdin_bytes, Json(17));
+    }
+    {
+        auto state = parse(opencode::make_acp_inspection(
+            "Task", ".", "1.18.25", Json::array(), Json::array(), Json::array()).protocol_state);
+        state.set("auto_approve", Json("true"));
+        addon::Structured_inspection malformed;
+        malformed.protocol_state = addon::serialize_json(state);
+        require(opencode::inspect_acp(malformed).failure_reason == "acp_invalid_state",
+            "an auto-mode continuation requires a boolean policy value");
+    }
     // ACP lets the agent announce the new session before or after it answers
     // session/new; OpenCode 1.18.32 announces after.
     for (const auto& root_output : {k_ready + k_new, k_new + k_ready}) {

@@ -397,9 +397,8 @@ bool attestations_ready(const Json& values)
     return true;
 }
 
-// The run keeps the launcher's permission posture, which OpenCode's own
-// configuration expresses. The package approves once only a call of one of the
-// task's own Task tools: OpenCode announced it with a `tool_call` titled with
+// Without an explicit auto mode, the package approves once only a call of one
+// of the task's own Task tools: OpenCode announced it with a `tool_call` titled with
 // the tool's id, and the request carries that id, title and kind `other`.
 // Anything else gets the request's own reject option, since nobody can approve
 // it in a headless run; OpenCode titles a shell request with the command text,
@@ -414,8 +413,49 @@ bool announced_task_tool(const Json& tool, const Json& announced)
         });
 }
 
+bool record_request_id(const Json& id, Json* request_ids)
+{
+    if ((!id.is_number() && !id.is_string()) || request_ids->as_array().size() >= 256) {
+        return false;
+    }
+    // Numeric JSON IDs compare by value, including alternate exponent/fraction spellings.
+    const Json normalized_id = id.is_number() ? Json(id.as_number() == 0 ? 0.0 : id.as_number()) : id;
+    const auto encoded_id = addon::serialize_json(Json(Json::Array{normalized_id}));
+    for (const auto& previous : request_ids->as_array()) {
+        if (text(previous) == encoded_id) {
+            return false;
+        }
+    }
+    request_ids->push_back(Json(encoded_id));
+    return true;
+}
+
+std::string unsupported_write_response(
+    const Json& request, const std::string& session_id, Json* request_ids)
+{
+    const auto& id     = member(request, "id");
+    const auto& params = member(request, "params");
+    if (!exact_keys(request, {"jsonrpc", "id", "method", "params"}) ||
+        text(member(request, "jsonrpc")) != "2.0" ||
+        text(member(request, "method")) != "fs/write_text_file" ||
+        !only_keys(params, {"_meta", "content", "path", "sessionId"}) || !valid_meta(params) ||
+        text(member(params, "sessionId")) != session_id ||
+        !bounded_nonempty(member(params, "path"), 32 * 1024) ||
+        !bounded_string(member(params, "content"), k_max_record_bytes) ||
+        !record_request_id(id, request_ids))
+    {
+        return {};
+    }
+    // OpenCode 1.18.33 proposes an ACP write even without client FS capability.
+    // Refuse it truthfully; OpenCode retains ownership of its approved native edit.
+    return json_line(object({
+        {"jsonrpc", Json("2.0")}, {"id", id},
+        {"error", object({{"code", Json(-32601)}, {"message", Json("Method not found")}})},
+    }));
+}
+
 std::string permission_response(
-    const Json& request, const std::string& session_id, const Json& announced, Json* permission_ids)
+    const Json& request, const std::string& session_id, const Json& announced, bool auto_approve, Json* permission_ids)
 {
     const auto& id     = member(request, "id");
     const auto& params = member(request, "params");
@@ -438,7 +478,9 @@ std::string permission_response(
     if (!tool_update(tool)) {
         return {};
     }
-    const bool approve = announced_task_tool(tool, announced);
+    // Native --auto replies once to pending asks. OpenCode enforces explicit
+    // denies before emitting these requests; no configured rule is replaced.
+    const bool approve = auto_approve || announced_task_tool(tool, announced);
     const std::string chosen_id   = approve ? "once" : "reject";
     const std::string chosen_kind = approve ? "allow_once" : "reject_once";
     bool offered = false;
@@ -458,19 +500,10 @@ std::string permission_response(
         }
     }
     if (!offered || option_ids.empty() || option_ids.size() > 64 ||
-        permission_ids->as_array().size() >= 256)
+        !record_request_id(id, permission_ids))
     {
         return {};
     }
-    // Numeric JSON IDs compare by value, including alternate exponent/fraction spellings.
-    const Json normalized_id = id.is_number() ? Json(id.as_number() == 0 ? 0.0 : id.as_number()) : id;
-    const auto encoded_id = addon::serialize_json(Json(Json::Array{normalized_id}));
-    for (const auto& previous : permission_ids->as_array()) {
-        if (text(previous) == encoded_id) {
-            return {};
-        }
-    }
-    permission_ids->push_back(Json(encoded_id));
     return json_line(object({
         {"jsonrpc", Json("2.0")}, {"id", id},
         {"result", object({{"outcome", object({
@@ -505,16 +538,18 @@ addon::Inspection_setup make_acp_inspection(
     const std::string& provider_version,
     const Json& mcp_servers,
     const Json& attestations,
-    const Json& task_tools)
+    const Json& task_tools,
+    bool auto_approve)
 {
     const auto state = object({
         {"stage", Json("await_initialize")}, {"pending_base64", Json("")},
         {"deferred_input_base64", Json("")}, {"deferred_input_is_request", Json(false)},
+        {"deferred_input_has_permission_reply", Json(false)},
         {"prompt_base64", Json(addon::encode_base64(prompt))}, {"session_id", Json("")},
         {"working_directory", Json(working_directory)}, {"provider_version", Json(provider_version)},
         {"result_base64", Json("")}, {"result_message_id", Json("")},
         {"permission_ids", Json::array()}, {"mcp_servers", mcp_servers}, {"attestations", attestations},
-        {"task_tools", task_tools}, {"announced", Json::array()},
+        {"task_tools", task_tools}, {"announced", Json::array()}, {"auto_approve", Json(auto_approve)},
     });
     addon::Inspection_setup setup;
     setup.incremental    = true;
@@ -537,11 +572,22 @@ std::string acp_initial_input()
 addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection& inspection)
 {
     auto parsed_state = addon::parse_exchange_protocol_state(inspection.protocol_state);
+    // An in-flight inspection without an explicit mode keeps default refusal.
+    if (parsed_state && parsed_state->is_object() && !parsed_state->find("auto_approve")) {
+        parsed_state->set("auto_approve", Json(false));
+    }
+    // Older continuations did not distinguish permission replies from refusals.
+    // Keep their deferred input causally blocking until it has been delivered.
+    if (parsed_state && parsed_state->is_object() && !parsed_state->find("deferred_input_has_permission_reply")) {
+        parsed_state->set("deferred_input_has_permission_reply",
+            Json(!text(member(*parsed_state, "deferred_input_base64")).empty()));
+    }
     if (!parsed_state ||
         !exact_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
                                   "working_directory", "provider_version", "result_base64",
                                   "result_message_id", "permission_ids", "mcp_servers", "attestations",
-                                  "deferred_input_base64", "deferred_input_is_request", "task_tools", "announced"}))
+                                  "deferred_input_base64", "deferred_input_is_request", "deferred_input_has_permission_reply",
+                                  "task_tools", "announced", "auto_approve"}))
     {
         return failure("acp_invalid_state");
     }
@@ -555,7 +601,9 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         !member(state, "result_base64").is_string() ||
         !member(state, "deferred_input_base64").is_string() ||
         !member(state, "deferred_input_is_request").is_boolean() ||
-        !member(state, "task_tools").is_array() || !member(state, "announced").is_array())
+        !member(state, "deferred_input_has_permission_reply").is_boolean() ||
+        !member(state, "task_tools").is_array() || !member(state, "announced").is_array() ||
+        !member(state, "auto_approve").is_boolean())
     {
         return failure("acp_invalid_state");
     }
@@ -576,7 +624,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     }
     // Preserve the causal boundary while a record preceding these writes is partial.
     std::string next_input = std::move(*deferred_input);
-    bool next_input_contains_request = member(state, "deferred_input_is_request").as_boolean();
+    bool next_input_contains_request     = member(state, "deferred_input_is_request").as_boolean();
+    bool next_input_has_permission_reply = member(state, "deferred_input_has_permission_reply").as_boolean();
     std::string_view remaining = pending;
     for (;;) {
         const auto line_end = remaining.find('\n');
@@ -602,8 +651,12 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 if (stage != "await_prompt" || next_input_contains_request) {
                     return failure("acp_out_of_order_reverse_request");
                 }
-                const auto reply = permission_response(
-                    value, text(member(state, "session_id")), member(state, "announced"), &permissions);
+                const auto session_id = text(member(state, "session_id"));
+                const bool unsupported_write = text(member(value, "method")) == "fs/write_text_file";
+                const auto reply = unsupported_write
+                    ? unsupported_write_response(value, session_id, &permissions)
+                    : permission_response(value, session_id, member(state, "announced"),
+                                          member(state, "auto_approve").as_boolean(), &permissions);
                 if (reply.empty()) {
                     return failure("acp_unsupported_reverse_request");
                 }
@@ -613,6 +666,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 // Independent reverse requests may share a transport read. Their
                 // replies do not authorize responses to an unsent session request.
                 next_input += reply;
+                next_input_has_permission_reply |= !unsupported_write;
                 state.set("permission_ids", permissions);
                 continue;
             }
@@ -702,16 +756,23 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         }
         else
         if (stage == "await_prompt") {
-            if (!next_input.empty() || !response(value, 3, &response_result) ||
+            if (next_input_contains_request || next_input_has_permission_reply ||
+                !response(value, 3, &response_result) ||
                 !prompt_response(response_result) || result.empty())
             {
                 return failure("acp_invalid_prompt_completion");
             }
             state.set("stage", Json("await_close"));
-            next_input = json_line(object({
+            const auto close_request = json_line(object({
                 {"jsonrpc", Json("2.0")}, {"id", Json(4)}, {"method", Json("session/close")},
                 {"params", object({{"sessionId", member(state, "session_id")}})},
             }));
+            if (close_request.size() > addon::limits::k_max_structured_stream_bytes - next_input.size()) {
+                return failure("acp_permission_reply_bound_exceeded");
+            }
+            // Native writes are fire-and-forget: their refusals may share a read
+            // with end_turn. Deliver those errors before the new close request.
+            next_input += close_request;
         }
         else
         if (stage == "await_close") {
@@ -742,6 +803,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     const bool defer_input = !remaining.empty() && !next_input.empty();
     state.set("deferred_input_base64", Json(defer_input ? addon::encode_base64(next_input) : ""));
     state.set("deferred_input_is_request", Json(defer_input && next_input_contains_request));
+    state.set("deferred_input_has_permission_reply", Json(defer_input && next_input_has_permission_reply));
     if (!next_input.empty() && !defer_input) {
         return partial(state, next_input);
     }

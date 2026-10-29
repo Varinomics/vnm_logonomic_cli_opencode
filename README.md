@@ -14,9 +14,17 @@ which tools run and which ask. When OpenCode asks, the package answers with the
 request's own `once` option only for the task's own Task tools
 (`logonomic-task-<task>-<server>_<action>`, announced by OpenCode's `tool_call`
 with that title and requested with kind `other`), and with `reject` for anything else, which
-nobody can approve in a headless run; it never chooses `always`. OpenCode fails
-a rejected tool call and continues the turn. A task that needs other tools
-therefore needs a configuration that allows them.
+nobody can approve in a headless run; it never chooses `always`. An explicit
+`--auto` launcher instead selects the offered `once` option for each valid
+pending request, matching OpenCode's native auto mode. Native explicit denies
+still apply before a request is emitted. OpenCode fails a rejected tool call
+and continues the turn. A task that needs other tools therefore needs a
+configuration that allows them or the user's explicit `--auto` choice.
+
+The ACP client advertises no filesystem capability. Valid native
+`fs/write_text_file` requests receive JSON-RPC `-32601`; OpenCode owns the
+approved edit. OpenCode 1.18.33 reports that refusal on stderr but completes
+its native edit and turn.
 
 The `opencode-ai` lifecycle contract requires a verified version at least 1.18.11;
 its delegated ACP contract requires at least 1.18.25. The `@opencode/cli` 2.x

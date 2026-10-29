@@ -539,6 +539,20 @@ std::string parse_version_output(std::string_view output, std::string_view error
     return first->empty() ? *second : *first;
 }
 
+std::optional<bool> delegated_auto_approval(const std::vector<std::string>& literal)
+{
+    if (literal.empty() || !opencode_program(literal.front())) {
+        return std::nullopt;
+    }
+    if (literal.size() == 1) {
+        return false;
+    }
+    if (literal.size() == 2 && literal[1] == "--auto") {
+        return true;
+    }
+    return std::nullopt;
+}
+
 std::optional<Verified_launch> verified_launch(
     const addon::Launcher_request& launcher, const std::vector<std::string>& launcher_argv,
     const addon::Json_value& effective_environment, std::string_view working_directory,
@@ -548,7 +562,8 @@ std::optional<Verified_launch> verified_launch(
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
     const auto literal = addon::literal_argv(launcher.script_body);
     if (literal.empty() || !opencode_program(literal.front())) return std::nullopt;
-    if (delegated && literal.size() != 1) return std::nullopt;
+    const auto auto_approve = delegated_auto_approval(literal);
+    if (delegated && !auto_approve) return std::nullopt;
     if (launcher.runner_key == "direct") {
         if (launcher_argv.size() != literal.size() ||
             !std::equal(literal.begin() + 1, literal.end(), launcher_argv.begin() + 1)) return std::nullopt;
@@ -738,7 +753,8 @@ std::optional<Verified_launch> verified_launch(
         if (cached != cache.end() && !context.cancel_requested()) {
             if ((!package_version.empty() && cached->second != package_version) ||
                 !version_is_at_least(cached->second, 1, 18, delegated ? 25 : 11)) return std::nullopt;
-            return Verified_launch{std::move(launch_argv), cached->second, command->environment};
+            return Verified_launch{std::move(launch_argv), cached->second, command->environment,
+                delegated && auto_approve.value_or(false)};
         }
     }
     const auto output = addon::probe(probe_argv, environment, working_directory, timeout_ms, context);
@@ -756,7 +772,8 @@ std::optional<Verified_launch> verified_launch(
         if (cache.size() >= 32) cache.erase(cache.begin());
         cache[cache_key] = version;
     }
-    return Verified_launch{std::move(launch_argv), version, command->environment};
+    return Verified_launch{std::move(launch_argv), version, command->environment,
+        delegated && auto_approve.value_or(false)};
 }
 
 } // namespace opencode

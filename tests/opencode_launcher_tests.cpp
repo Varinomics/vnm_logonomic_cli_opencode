@@ -433,6 +433,68 @@ int main(int argc, char** argv)
             next.stdin_bytes->find("opencode-host-authority-canary") == std::string::npos,
             "actual native session request carries nonsecret relay configuration");
     }
+    auto automatic = delegated;
+    const auto yolofied = addon::transform_launcher_approval({
+        automatic.context.launcher, discovery.platform_id, addon::Launcher_approval_action::YOLOFY},
+        opencode::launcher_approval_rules());
+    check(yolofied.disposition == addon::Launcher_approval_disposition::CHANGED,
+        "the product's Yolofy transform adds the canonical auto option");
+    automatic.context.launcher.script_body = yolofied.script_body;
+    automatic.context.launcher_argv.push_back("--auto");
+    automatic.context.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT",
+        addon::Json_value("{\"permission\":{\"bash\":\"deny\",\"edit\":\"ask\"}}"));
+    Context auto_prepared;
+    auto_prepared.invocation = prepared.invocation;
+    auto_prepared.invocation.payload = addon::encode_delegated_prepare_request(automatic);
+    opencode::handle_preparation(auto_prepared);
+    const auto auto_result = auto_prepared.payload
+        ? addon::decode_delegated_prepare_result(*auto_prepared.payload, &failure) : std::nullopt;
+    check(auto_result.has_value(), "Yolofy keeps a verified legacy ACP launcher delegatable");
+    if (auto_result) {
+        const auto state = addon::parse_json(auto_result->inspection.protocol_state, {}, nullptr);
+        const auto* approve = state ? state->find("auto_approve") : nullptr;
+        check(approve && approve->is_boolean() && approve->as_boolean(),
+            "the selected auto mode reaches the delegated permission responder");
+        const auto config = std::find_if(auto_result->process.environment.begin(), auto_result->process.environment.end(),
+            [](const auto& entry) { return entry.first == "OPENCODE_CONFIG_CONTENT"; });
+        const auto value = config != auto_result->process.environment.end()
+            ? addon::parse_json(config->second, {}, nullptr) : std::nullopt;
+        const auto expected = addon::parse_json("{\"bash\":\"deny\",\"edit\":\"ask\"}", {}, nullptr);
+        check(value && value->find("permission") && *value->find("permission") == *expected,
+            "auto mode preserves explicit native denies and asks without a blanket allow override");
+    }
+    check(!opencode::verified_launch(automatic.context.launcher, {program_text},
+        automatic.context.launch_environment->effective_environment, path_string(root), true, context),
+        "auto mode is not inferred when the captured invocation omits the selected flag");
+    auto absent = automatic;
+    const auto absent_program = path_string(root / "absent" / program.filename());
+    absent.context.launcher.script_body = "\"" + absent_program + "\" --auto";
+    absent.context.launcher_argv = {absent_program, "--auto"};
+    Context missing;
+    missing.invocation = prepared.invocation;
+    missing.invocation.payload = addon::encode_delegated_prepare_request(absent);
+    opencode::handle_preparation(missing);
+    check(!missing.payload && missing.reason == "launcher_program_unavailable",
+        "an unavailable executable retains its own refusal");
+    auto newer = automatic;
+    newer.context.launch_environment->effective_environment.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("2.1.4"));
+    Context unsupported_generation;
+    unsupported_generation.invocation = prepared.invocation;
+    unsupported_generation.invocation.payload = addon::encode_delegated_prepare_request(newer);
+    opencode::handle_preparation(unsupported_generation);
+    check(!unsupported_generation.payload && unsupported_generation.reason == "opencode_acp_generation_unavailable",
+        "the distinct native TUI generation keeps its existing delegated integration limit");
+    for (const auto* option : {"--model=provider/model", "--auto=false", "--no-auto"}) {
+        auto unsupported = delegated;
+        unsupported.context.launcher.script_body += " " + std::string(option);
+        unsupported.context.launcher_argv.push_back(option);
+        Context rejected;
+        rejected.invocation = prepared.invocation;
+        rejected.invocation.payload = addon::encode_delegated_prepare_request(unsupported);
+        opencode::handle_preparation(rejected);
+        check(!rejected.payload && rejected.reason == "delegated_launcher_options_unavailable",
+            "unsupported options are distinct from an unavailable executable");
+    }
     delegated.control.connection.reset();
     Context refused;
     refused.invocation = prepared.invocation;

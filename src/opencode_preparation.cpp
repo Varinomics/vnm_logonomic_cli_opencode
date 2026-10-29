@@ -680,6 +680,10 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, "invalid_implementation_request");
         return;
     }
+    if (!delegated_auto_approval(addon::literal_argv(request->context.launcher.script_body))) {
+        context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
+        return;
+    }
     const auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
         request->context.launch_environment->effective_environment, request->context.working_directory, true, context);
     if (!launch) {
@@ -765,7 +769,8 @@ void prepare_delegated(addon::Invocation_context& context)
             [&name](const auto& entry) { return environment_name_equal(entry.first, name); });
     });
     result.inspection = make_acp_inspection(
-        request->prompt, request->context.working_directory, launch->version, servers, attestations, task_tools);
+        request->prompt, request->context.working_directory, launch->version, servers, attestations, task_tools,
+        launch->auto_approve);
     result.inspection.keep_stdin_open = true;
     auto payload = addon::encode_delegated_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {

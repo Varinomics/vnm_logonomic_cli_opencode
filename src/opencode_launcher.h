@@ -25,6 +25,7 @@ struct Verified_launch
     std::vector<std::string>                         argv;
     std::string                                      version;
     std::vector<std::pair<std::string, std::string>> environment;
+    bool                                            auto_approve = false;
 };
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
@@ -70,6 +71,9 @@ bool local_interactive_launcher(const addon::Launcher_request& launcher,
 
 bool version_is_at_least(std::string_view version, int major, int minor, int patch);
 std::string parse_version_output(std::string_view output, std::string_view errors);
+
+// Only the bare launcher and Yolofy's canonical --auto have an ACP mapping.
+std::optional<bool> delegated_auto_approval(const std::vector<std::string>& literal);
 
 // Probes only a native image or a verified stock npm installation. Delegated
 // probes execute the selected shim, preserving its behavior and version evidence.
