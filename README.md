@@ -196,9 +196,8 @@ the other's process paths. Local staging uses `logonomic_cli_addon_stage` and th
 desktop's generic package ingestion in isolated profiles.
 
 Local qualification does not activate this package in a user's live profile.
-Publication, signed availability, hosted rehearsal, migration/rollback gates and
-the maintained observation window are separate release checkpoints. The native
-OpenCode implementation remains installed until its authorized deletion landing.
+[Bundle publication qualification](https://github.com/Varinomics/vnm_logonomic_cli_bundle/blob/master/docs/publication.md)
+owns signed availability, hosted rehearsal, restoration and observation gates.
 
 ## Attribution
 
