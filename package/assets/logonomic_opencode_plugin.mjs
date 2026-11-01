@@ -508,6 +508,8 @@ export const Logonomic = async ({ client }, options = {}) => {
   let sessionDiffDisposalStarted = false
   let incompleteDrainReported = false
   let context_model
+  let input_sequence = 0
+  let selected_input_sequence = 0
 
   const evictInactiveChildSession = () => {
     for (const [childSessionID, record] of sessionRecords) {
@@ -927,8 +929,8 @@ export const Logonomic = async ({ client }, options = {}) => {
     const kind = classifiedSessionKind(sessionID)
     if (kind === "child" || kind === "unresolved") return
     rootTurnIDs.delete(sessionID)
-    const pending = pendingRootTurns.get(sessionID) ?? { turnIDs: [] }
-    pending.turnIDs.length = 0
+    const pending = pendingRootTurns.get(sessionID) ?? { turns: new Map() }
+    pending.turns.clear()
     pending.confirmedTurnID = undefined
     pending.degradationType ??= degradationType
     pendingRootTurns.set(sessionID, pending)
@@ -984,7 +986,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     return projected
   }
 
-  const projectEvent = async (event) => {
+  const projectEvent = async (event, wake_record) => {
     const properties = event?.properties
     if (!properties || typeof properties !== "object") return
 
@@ -1053,7 +1055,7 @@ export const Logonomic = async ({ client }, options = {}) => {
       if (degradedRootSessions.has(sessionID)) return
       const pending = pendingRootTurns.get(sessionID)
       if (rootTurnIDs.get(sessionID) === parentID ||
-          pending?.turnIDs.includes(parentID)) {
+          pending?.turns.has(parentID)) {
         const retained = assistant_replies.get(sessionID)
         if (!retained && assistant_replies.size >= maxPendingItems) {
           return childObservationLoss()
@@ -1067,7 +1069,7 @@ export const Logonomic = async ({ client }, options = {}) => {
       if (
         !pending ||
         pending.degradationType ||
-        !pending.turnIDs.includes(parentID)
+        !pending.turns.has(parentID)
       ) return
       if (
         pending.confirmedTurnID &&
@@ -1086,6 +1088,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (!sourceSessionID) return
     let sessionID = sourceSessionID
     const kind = await resolveSessionKind(sessionID)
+    session_wake?.session_kind(sessionID, kind, wake_record)
     if (kind === childObservationCapacityLost) {
       return childObservationLoss()
     }
@@ -1151,6 +1154,14 @@ export const Logonomic = async ({ client }, options = {}) => {
       let turnID = rootTurnIDs.get(sessionID)
       if (statusType === "busy" || statusType === "retry") {
         const pending = pendingRootTurns.get(sessionID)
+        // A late confirmation of an older input must not reclaim another root.
+        const input_order = pending?.turns.get(pending.confirmedTurnID)
+        if (input_order < selected_input_sequence && !sessionRecords.get(sessionID)?.published) {
+          // The host cannot fence a session it has never admitted.
+          pendingRootTurns.delete(sessionID)
+          return
+        }
+        const fresh_user_turn = input_order > selected_input_sequence && pending.confirmedTurnID !== turnID
         if (pending?.confirmedTurnID) {
           turnID = pending.confirmedTurnID
           pendingRootTurns.delete(sessionID)
@@ -1159,6 +1170,10 @@ export const Logonomic = async ({ client }, options = {}) => {
         if (!turnID) return
         const root = sessionRecords.get(sessionID)
         if (root?.kind !== "root") return
+        if (fresh_user_turn) {
+          selected_input_sequence = input_order
+          session_wake?.select_root(sessionID, wake_record)
+        }
         sessionRecords.set(sessionID, {
           ...root,
           published: true,
@@ -1168,6 +1183,7 @@ export const Logonomic = async ({ client }, options = {}) => {
           session_id: sessionID,
           turn_id: turnID,
           status_type: statusType,
+          ...(fresh_user_turn ? { fresh_user_turn: true } : {}),
         }
       } else {
         rootTurnIDs.delete(sessionID)
@@ -1227,18 +1243,18 @@ export const Logonomic = async ({ client }, options = {}) => {
     const pending = pendingRootTurns.get(sessionID)
     if (!pending) {
       pendingRootTurns.set(sessionID, {
-        turnIDs: [turnID],
+        turns: new Map([[turnID, ++input_sequence]]),
       })
       return submitted
     }
     if (
       pending.degradationType ||
-      pending.turnIDs.includes(turnID)
+      pending.turns.has(turnID)
     ) return
-    if (pending.turnIDs.length >= maxPendingTurnCandidates) {
+    if (pending.turns.size >= maxPendingTurnCandidates) {
       return markTurnCorrelationAmbiguous(sessionID, "candidate_capacity")
     }
-    pending.turnIDs.push(turnID)
+    pending.turns.set(turnID, ++input_sequence)
     return submitted
   }
 
@@ -1280,11 +1296,11 @@ export const Logonomic = async ({ client }, options = {}) => {
       return project_context(item.event.type, item.context_sample)
     }
     if (item.event.type === "message.updated") {
-      const lifecycle = await projectEvent(item.event)
+      const lifecycle = await projectEvent(item.event, item.wake_record)
       const context = await project_context(item.event.type, item.context_sample)
       return lifecycle && context ? [lifecycle, context] : lifecycle ?? context
     }
-    return projectEvent(item.event)
+    return projectEvent(item.event, item.wake_record)
   }
 
   const startWorker = () => {
@@ -1495,7 +1511,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
   hooks.event = ({ event }) => {
     try {
-      session_wake?.event(event)
+      const wake_record = session_wake?.event(event)
       // Release native text state at native event order, before queued helper
       // delivery. An older queued completion must not erase a newer reply.
       const info = event?.properties?.info
@@ -1527,7 +1543,7 @@ export const Logonomic = async ({ client }, options = {}) => {
             } : {}),
           } }
         }
-        enqueue({ kind: "event", event,
+        enqueue({ kind: "event", event, wake_record,
           ...(["message.updated", "session.compacted"].includes(event.type)
             ? { context_sample: context_sample(event) } : {}),
         })

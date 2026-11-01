@@ -516,6 +516,19 @@ int main(int argc, char** argv)
             transition.observations[0].phase_transition == addon::Phase_transition::WORKING &&
             transition.observations[0].phase_evidence == addon::Evidence::CONFIRMED,
         "initial root status preserves confirmed working evidence");
+    auto returning = event("session.status");
+    returning.ledger.current_transition->provider_session_id = "session-B";
+    returning.event.body.set("status_type", addon::Json_value("busy"));
+    returning.event.body.set("fresh_user_turn", addon::Json_value(true));
+    require(classify(returning).transition == addon::Transition_kind::RESUME,
+        "the first confirmed busy status for a new user turn can re-admit retired root A after B");
+    returning.event.body.erase("fresh_user_turn");
+    require(classify(returning).transition == addon::Transition_kind::START,
+        "a delayed busy status cannot re-admit retired A");
+    returning.event.body.set("fresh_user_turn", addon::Json_value(true));
+    returning.event.body.set("status_type", addon::Json_value("idle"));
+    require(classify(returning).transition == addon::Transition_kind::START,
+        "a delayed idle from retired A keeps the host's retired-session fence");
     for (const auto* type : {"busy", "retry", "idle"}) {
         auto request = event("session.status");
         request.event.body.set("status_type", addon::Json_value(type));

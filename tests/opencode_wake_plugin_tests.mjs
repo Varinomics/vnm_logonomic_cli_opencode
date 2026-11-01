@@ -17,7 +17,9 @@ try {
   let status_hook
   let prompt_hook
   const client = { session: {
-    get: async ({ path }) => ({ data: { id: path.id } }),
+    get: async ({ path }) => ({ data: {
+      id: path.id, ...(path.id.startsWith("child-") ? { parentID: "ses_previous" } : {}),
+    } }),
     status: async (options) => {
       assert.equal(options.throwOnError, true)
       await status_hook?.()
@@ -94,6 +96,15 @@ try {
     event("session.status", { sessionID: "ses_recipient", status: { type: "idle" } })
   }
   assert.equal((await inspect()).reason, "provider_session_unavailable")
+  event("session.created", { info: { id: "ses_previous" } })
+  for (let child = 0; child < 130; ++child) {
+    const id = `child-${child}`
+    event("session.created", { info: { id, parentID: "ses_previous" } })
+    event("session.status", { sessionID: id, status: { type: "idle" } })
+    event("message.updated", { info: { sessionID: id, role: "assistant" } })
+    event("question.asked", { sessionID: id, id: "child-question" })
+    event("question.replied", { sessionID: id, requestID: "child-question" })
+  }
   start()
   assert.equal((await notify("busy")).disposition, "deferred")
   complete()
@@ -157,12 +168,110 @@ try {
     })
   }
   assert.equal(prompts.length, submitted, "invalid native context must not silently select a default")
-  event("session.deleted", { info: { id: "ses_recipient" } })
-  assert.equal((await notify("deleted")).reason, "provider_session_unavailable")
+  start()
+  complete()
+  status_hook = () => event("session.deleted", { info: { id: "ses_recipient" } })
+  assert.equal((await notify("deleted-during-status")).disposition, "unavailable")
+  status_hook = undefined
+  assert.equal(prompts.length, submitted, "a revoked in-flight operation cannot submit")
+  assert.equal((await notify("deleted")).reason, "provider_correlation_changed")
+  start()
+  complete()
+  const new_epoch = { transition_nonce: "f".repeat(32) }
+  assert.equal((await inspect()).reason, "provider_correlation_changed")
+  assert.deepEqual(await send({ operation: "inspect", ...new_epoch }), { available: true })
+  const first_record = event("session.idle", { sessionID: "ses_recipient" })
+  const previous_record = event("session.idle", { sessionID: "ses_previous" })
+  wake.select_root("ses_recipient", first_record)
+  wake.select_root("ses_previous", previous_record)
+  assert.equal((await send({ operation: "inspect", ...new_epoch })).reason, "provider_correlation_changed")
+  wake.select_root("ses_recipient", first_record)
+  const returned = { transition_nonce: "b".repeat(32) }
+  assert.deepEqual(await send({ operation: "inspect", ...returned }), { available: true })
+  assert.deepEqual(await send({
+    operation: "notify", notification_id: "mail_one", instruction: "existing notification", ...returned,
+  }), accepted)
+  assert.equal(prompts.length, submitted, "session deletion must retain submitted receipts")
+  for (let i = 0; i <= 128; ++i) {
+    event("question.asked", { sessionID: `unclassified-${i}`, id: `pending-${i}` })
+  }
+  assert.deepEqual(await send({ operation: "inspect", ...returned }), { available: true })
+  event("session.created", { info: { id: "unclassified-128" } })
+  wake.select_root("unclassified-128", event("session.idle", { sessionID: "unclassified-128" }))
+  assert.equal((await send({ operation: "inspect", provider_session_id: "unclassified-128" })).reason,
+    "provider_session_capacity", "a dropped question cannot be forgotten on later root admission")
   await wake.dispose()
   wake = undefined
   await assert.rejects(stat(registration), { code: "ENOENT" })
   assert.equal(await create_session_wake({ session: {} }, registration), undefined)
+  // Drive the real hooks and asynchronous lifecycle classification. An event
+  // queued before a deletion cannot resurrect its wake record. Failed lookups
+  // for unrelated turns must leave room for a root whose first fact was an ask.
+  delete process.env.LOGONOMIC_SESSION_CAPABILITY
+  delete process.env.OPENCODE_LOGONOMIC_RESUME_SESSION
+  process.env.OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED = "1"
+  const { Logonomic } = await import(pathToFileURL(join(dirname(resolve(module_path)), "logonomic_opencode_plugin.mjs")))
+  let lookup_available = false
+  client.session.get = async ({ path }) => {
+    if (!lookup_available) throw new Error("temporary lookup failure")
+    return { data: { id: path.id } }
+  }
+  const plugin = await Logonomic({ client }, { session_wake: { registration_file: registration } })
+  wake = { event: (event) => plugin.event({ event }), chat_message: plugin["chat.message"], dispose: plugin.dispose }
+  binding = JSON.parse(await readFile(registration, "utf8"))
+  const turn = (id) => wake.chat_message({ sessionID: id }, {
+    message: { id: "user-turn", agent: "plan", model: { providerID: "fixture", modelID: "model" } },
+    parts: [{ synthetic: false }],
+  })
+  const working = (id) => {
+    event("message.updated", { info: { id: "reply", sessionID: id, role: "assistant",
+      parentID: "user-turn", finish: "stop", time: { completed: Date.now() } } })
+    event("session.status", { sessionID: id, status: { type: "busy" } })
+  }
+  const drain = () => new Promise((resolve) => setImmediate(resolve))
+  event("session.created", { info: { id: "deleted" } })
+  await turn("deleted")
+  working("deleted")
+  event("session.deleted", { info: { id: "deleted" } })
+  await drain()
+  assert.equal((await send({ operation: "inspect", provider_session_id: "deleted" })).reason,
+    "provider_session_unavailable")
+  event("question.asked", { sessionID: "ses_recipient", id: "ask-before-chat" })
+  for (let i = 0; i < 130; ++i) {
+    const id = `unresolved-turn-${i}`
+    await turn(id)
+    event("session.status", { sessionID: id, status: { type: "idle" } })
+    await drain()
+  }
+  lookup_available = true
+  await turn("ses_recipient")
+  working("ses_recipient")
+  event("session.idle", { sessionID: "ses_recipient" })
+  await drain()
+  assert.equal((await inspect()).reason, "provider_awaiting_input")
+  event("question.rejected", { sessionID: "ses_recipient", requestID: "ask-before-chat" })
+  assert.deepEqual(await inspect(), { available: true })
+  for (let i = 0; i < 127; ++i) {
+    const id = `blocked-root-${i}`
+    event("session.created", { info: { id } })
+    event("permission.asked", { sessionID: id, id: "p" })
+    await drain()
+  }
+  const later = "next-root"
+  event("session.created", { info: { id: later } })
+  event("question.asked", { sessionID: later, id: "pending-at-capacity" })
+  await turn(later)
+  working(later)
+  event("session.idle", { sessionID: later })
+  await drain()
+  assert.equal((await inspect()).reason, "provider_correlation_changed")
+  const inspect_later = () => send({ operation: "inspect", provider_session_id: later })
+  assert.equal((await inspect_later()).available, false)
+  event("session.deleted", { info: { id: "blocked-root-0" } })
+  event("session.updated", { info: { id: later } })
+  assert.equal((await inspect_later()).reason, "provider_awaiting_input")
+  event("question.rejected", { sessionID: later, requestID: "pending-at-capacity" })
+  assert.deepEqual(await inspect_later(), { available: true })
   console.log("OpenCode wake plugin: identity, policy, native admission, replay, interruption and disposal passed")
 } finally {
   await wake?.dispose()

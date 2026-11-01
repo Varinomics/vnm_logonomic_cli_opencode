@@ -84,11 +84,19 @@ the mailbox message remains stored. Repeated notification IDs for the same sessi
 still return their retained result. Deleting a session does not free receipts;
 restarting OpenCode creates a fresh plugin instance and receipt table.
 
+The hooks plugin tracks up to 128 confirmed roots and 128 sessions awaiting
+classification. If all pending slots hold unanswered questions or permissions
+and another unclassified session asks for input, newly encountered sessions
+report `provider_session_capacity` for the rest of that plugin instance.
+Already tracked sessions retain their request evidence and readiness checks.
+
 Switching to another root conversation revokes the previous native wake binding.
-Returning requires inspection under the new Logonomic transition; retired
-transition nonces cannot submit notifications. Temporarily showing the home,
-child-session or plugin page suppresses wake readiness without inventing a new
-root conversation. The bridge retains at most 256 retired correlations before
+The 1.x hooks establish a switch when a fresh user turn at the new root is
+confirmed working. OpenCode 2 observes root selection directly in the TUI.
+Returning requires inspection under the new Logonomic transition. Retired
+transition nonces cannot submit notifications. In OpenCode 2, temporarily showing
+the home, child-session or plugin page suppresses wake readiness without selecting
+a new root conversation. The bridge retains at most 256 retired correlations before
 refusing fresh bindings with `provider_session_capacity`.
 
 OpenCode 2 uses `session.synthetic` with queue delivery and execution enabled.
@@ -152,8 +160,9 @@ The wake fixture exercises the real authenticated bridge and packaged C++ adapte
 including repeat delivery, busy/attention deferral and uncertain acceptance.
 `node tests/opencode_wake_native_tests.mjs <opencode-executable> <managed-plugin> [public-dependency-seed]`
 is an opt-in native gate: it creates an isolated profile and loopback fake model,
-then observes two turns in the same native session. It does not prove TUI rendering
-or draft preservation visually and never uses the user's provider credentials.
+then checks same-session delivery, root reselection and receipt replay. The gate
+uses no provider credentials. Visual TUI behavior and draft rendering require
+a separate test.
 The optional seed directory supplies only `node_modules`, `package.json` and
 `package-lock.json` to avoid a first-run dependency download; no native profile
 configuration, authentication or history is copied.

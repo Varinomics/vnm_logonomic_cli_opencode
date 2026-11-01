@@ -159,6 +159,9 @@ export async function create_wake_bridge(native, registration_file) {
   }
 
   return {
+    bound(session_id) {
+      return correlations.has(session_id) || submitting.has(session_id)
+    },
     revoke(session_id) {
       const correlation = correlations.get(session_id)
       if (correlation) {

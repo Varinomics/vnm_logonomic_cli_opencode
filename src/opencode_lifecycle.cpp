@@ -223,6 +223,13 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         if (!type || (*type != "busy" && *type != "retry" && *type != "idle")) {
             return std::nullopt;
         }
+        // Only the first working status for newly confirmed user input can
+        // re-admit a retired 1.x root. Trailing facts keep the host's fence.
+        const auto* fresh = body.find("fresh_user_turn");
+        if (!native_inbox && result.transition && request.ledger.current_transition &&
+            *type != "idle" && fresh && fresh->is_boolean() && fresh->as_boolean()) {
+            result.transition = addon::Transition_kind::RESUME;
+        }
         observation.phase_transition = *type == "idle"
             ? addon::Phase_transition::AWAITING_INPUT : addon::Phase_transition::WORKING;
         observation.phase_evidence = addon::Evidence::CONFIRMED;
