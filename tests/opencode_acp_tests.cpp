@@ -602,14 +602,19 @@ void run(const fs::path& attestation)
     {
         Session session(attestation);
         session.reach_prompt();
-        session.feed(k_message);
         std::string replacement = k_message;
         replacement.replace(replacement.find("msg_result"), 10, "msg_final");
         replacement.replace(replacement.find("Finished"), 8, "Revised");
-        session.feed(replacement);
-        session.feed("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n");
-        const auto result = session.feed("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\n");
-        require(result.result_bytes == "Revised", "a new message identity replaces accumulated result");
+        const auto split = replacement.size() / 2;
+        const auto partial = session.feed(k_message + replacement + replacement.substr(0, split));
+        require(!partial.complete && !partial.stdin_bytes && !partial.failure_reason,
+            "coalesced chunks followed by a partial record must wait for the rest");
+        const auto ended = session.feed(replacement.substr(split) + k_end_turn);
+        require(ended.stdin_bytes && ended.stdin_bytes->find("session/close") != std::string::npos,
+            "end_turn after a split message chunk must request close");
+        const auto result = session.feed(k_closed);
+        require(result.complete && result.result_bytes == "RevisedRevised",
+            "a new message replaces earlier chunks and keeps its own chunks across reads");
     }
     {
         Session session(attestation);

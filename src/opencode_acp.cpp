@@ -694,8 +694,6 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 announced.push_back(object({{"toolCallId", member(update, "toolCallId")}, {"title", member(update, "title")}}));
                 state.set("announced", std::move(announced));
             }
-            state.set("result_base64", Json(addon::encode_base64(result)));
-            state.set("result_message_id", Json(message_id));
             state.set("session_id", Json(session));
             continue;
         }
