@@ -162,7 +162,7 @@ void adapter_tests(const fs::path& package, const fs::path& root)
 #endif
     request.launch_environment->effective_environment.set("PATH", addon::Json_value(path_text(root / "absent-bin")));
     request.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(
-        R"({"model":"retained/model","instructions":["user.md"],"plugins":["user-plugin",{"package":"package-plugin","options":{"label":"retained-option"}}]})"));
+        R"({"model":"retained/model","instructions":["user.md"],"plugins":["user-plugin",{"package":"package-plugin","options":{"label":"retained-option","literal":"{{file}}"}}]})"));
     request.launcher_argv = {"opencode"};
     request.session_wake = addon::Session_wake_offer{};
     request.launch_environment->effective_environment.set(opencode::k_export_source_environment,
@@ -190,6 +190,8 @@ void adapter_tests(const fs::path& package, const fs::path& root)
     require(prepared.status == addon::Host_status::SUCCESS, "interactive prepare remains available without verified lifecycle");
     const auto patch = addon::decode_launch_patch(prepared.payload, &failure, 3);
     require(patch.has_value(), "prepared patch decodes");
+    require(addon::validate_launch_patch(*patch, request.declared_assets, request.declared_assets, &failure),
+        "host admits a packaged preparation containing literal configuration braces");
     require(std::find(patch->unset.begin(), patch->unset.end(), opencode::k_export_source_environment) !=
             patch->unset.end() && std::none_of(patch->set.begin(), patch->set.end(), [](const auto& entry) {
                 return entry.first == opencode::k_export_source_environment;
