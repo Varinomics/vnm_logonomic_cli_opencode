@@ -713,9 +713,10 @@ export const Logonomic = async ({ client }, options = {}) => {
     const provider = Array.isArray(providers?.all)
       ? providers.all.find((item) => item?.id === provider_id) : undefined
     const window = provider?.models?.[model_id]?.limit?.context
-    if (!context_count(window) || window === 0) return
-    context_model = { provider_id, model_id, window }
-    return window
+    if (!context_count(window)) return
+    // OpenCode reports zero for a configured model with no known capacity.
+    context_model = { provider_id, model_id, window: window || undefined }
+    return context_model.window
   }
 
   const project_context = async (name, sample) => {

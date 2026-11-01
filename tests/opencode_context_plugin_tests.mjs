@@ -115,15 +115,35 @@ let catalogue_calls = 0
 const recovered_capacity = await run((plugin) => {
   root(plugin)
   event(plugin, "evt-before-catalogue", "message.updated", { info: assistant("session-root", usage()) })
+  event(plugin, "evt-before-model", "message.updated", { info: assistant("session-root", usage()) })
   event(plugin, "evt-after-catalogue", "message.updated", { info: assistant("session-root", usage()) })
 }, client(async () => {
   if (++catalogue_calls === 1) throw new Error("provider catalogue unavailable")
+  if (catalogue_calls === 2) return { data: { all: [] } }
   return { data: { all: [{
     id: "provider-context", models: { "model-context": { limit: { context: 4000 } } },
   }] } }
 }))
 assert.equal(recovered_capacity.length, 2, "unchanged native usage can recover an unavailable model capacity")
+assert.equal(catalogue_calls, 3, "lookup failure and a missing model both remain retryable")
 assert.equal(recovered_capacity[1].context_updates[0].context_window, 4000)
+
+let zero_window_calls = 0
+const unknown_window = await run((plugin) => {
+  root(plugin)
+  event(plugin, "evt-zero-window", "message.updated", { info: assistant("session-root", usage()) })
+  event(plugin, "evt-more-usage", "message.updated", { info: assistant("session-root", usage(2000)) })
+}, client(async () => {
+  ++zero_window_calls
+  return { data: { all: [{
+    id: "provider-context", models: { "model-context": { limit: { context: 0 } } },
+  }] } }
+}))
+assert.deepEqual(unknown_window.map((body) => body.context_updates[0]), [
+  { provider_session_id: "session-root", event_id: "evt-zero-window", used_tokens: 1330 },
+  { provider_session_id: "session-root", event_id: "evt-more-usage", used_tokens: 2330 },
+])
+assert.equal(zero_window_calls, 1, "a catalogue-confirmed zero window is stable for the current model")
 
 const isolated = await run((plugin) => {
   root(plugin)
