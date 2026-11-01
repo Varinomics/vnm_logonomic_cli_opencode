@@ -192,6 +192,18 @@ std::string path_string(const fs::path& path)
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+void set_host_directory(const std::string& name, const fs::path& directory)
+{
+#ifdef _WIN32
+    const std::wstring wide(name.begin(), name.end());
+    check(SetEnvironmentVariableW(wide.c_str(), directory.empty() ? nullptr : directory.c_str()) != 0,
+        "set host directory in the native environment");
+#else
+    if (directory.empty()) unsetenv(name.c_str());
+    else setenv(name.c_str(), directory.c_str(), 1);
+#endif
+}
+
 // Apply the same asset scanner and substitution as the host before OpenCode decodes the JSON.
 std::optional<addon::Json_value> applied_config(const addon::Environment& environment)
 {
@@ -921,14 +933,28 @@ int main(int argc, char** argv)
     interactive.session_wake = addon::Session_wake_offer{};
     const fs::path generation = root / u8"generation-\u00e9-\u6771";
     fs::create_directory(generation);
-    const auto saved_package_root = addon::environment_value(addon::current_process_environment(), addon::k_env_package_root);
-#ifdef _WIN32
-    check(SetEnvironmentVariableW(L"LOGONOMIC_ADDON_PACKAGE_ROOT", generation.c_str()) != 0,
-        "set the Unicode generation in the host process environment");
-#else
-    setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", generation.c_str(), 1);
-#endif
+    const auto scratch = root / u8"scratch-{{file}}-\u6771";
+    fs::create_directory(scratch);
+    const auto host_environment = addon::current_process_environment();
+    const auto saved_package_root = addon::environment_value(host_environment, addon::k_env_package_root);
+    const auto saved_scratch = addon::environment_value(host_environment, addon::k_env_scratch_dir);
+    set_host_directory(addon::k_env_package_root, generation);
+    for (const auto& unavailable : {fs::path{}, fs::path("relative-scratch")}) {
+        set_host_directory(addon::k_env_scratch_dir, unavailable);
+        const auto without = prepare_interactive();
+        check(without && lifecycle_reported(without) == true && without->session_wake &&
+            !without->session_wake->available && without->session_wake->reason == "opencode_scratch_unavailable" &&
+            std::find(without->unset.begin(), without->unset.end(), "OPENCODE_LOGONOMIC_WAKE_REGISTRATION") != without->unset.end(),
+            "missing or relative scratch disables only wake and clears an inherited binding");
+    }
+    set_host_directory(addon::k_env_scratch_dir, scratch);
     const auto tui_config_ok = [&](const addon::Launch_patch& patch) {
+        if (!patch.session_wake || !patch.session_wake->available) return false;
+        const auto* registration = patch.session_wake->binding.find("registration_file");
+        const auto emitted = addon::parse_json(addon::environment_value(patch.set, "OPENCODE_LOGONOMIC_WAKE_REGISTRATION"), {}, nullptr);
+        if (!registration || emitted != *registration ||
+            addon::path_from_utf8(registration->as_string()).parent_path() != scratch ||
+            !addon::validate_launch_patch(patch, interactive.declared_assets, interactive.declared_assets, nullptr)) return false;
         const auto config = applied_config(patch.set);
         if (!config || !config->find("instructions") || !config->find("plugins")) return false;
         const auto& plugins = config->find("plugins")->as_array();
@@ -1059,13 +1085,8 @@ int main(int argc, char** argv)
     check(!opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
         {path_string(npm_shim)}, npm_environment, path_string(root), false, context),
         "a wrapper with multiple different native targets cannot establish launch identity");
-#ifdef _WIN32
-    SetEnvironmentVariableW(L"LOGONOMIC_ADDON_PACKAGE_ROOT",
-        saved_package_root.empty() ? nullptr : addon::path_from_utf8(saved_package_root).c_str());
-#else
-    if (!saved_package_root.empty()) setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", saved_package_root.c_str(), 1);
-    else unsetenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
-#endif
+    set_host_directory(addon::k_env_package_root, addon::path_from_utf8(saved_package_root));
+    set_host_directory(addon::k_env_scratch_dir, addon::path_from_utf8(saved_scratch));
     launcher.script_body += " --model selected";
     check(!opencode::verified_launch(launcher, {program_text, "--model", "selected"}, effective,
         path_string(root), true, context), "delegation refuses changed stock argv");

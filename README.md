@@ -36,7 +36,7 @@ protocol messages are validated. The selected stock launcher chain is
 verified before delegation. An interactive launch reports its lifecycle only when
 the host's complete invocation, a direct launcher or `powershell -NoLogo -Command`
 running the recognized script, starts a verified OpenCode; otherwise the launch is
-prepared without lifecycle. User configuration is merged, and package writes use
+prepared without lifecycle. User configuration is merged, and managed instructions use
 the exact host-acknowledged profile storage allocation.
 
 For a verified OpenCode 2 TUI invocation, preparation adds the native
@@ -72,6 +72,10 @@ or questions defer delivery; interrupted sessions remain unavailable. It never
 submits terminal input or edits the TUI draft. A retained notification receipt
 prevents a repeated accepted or uncertain delivery from creating another turn;
 acceptance does not mean the mailbox has been read or acknowledged.
+
+The bridge registers under a unique name in the adapter generation's scratch
+directory. Disposal and normal process exit remove the registration. If the
+plugin is killed, the host collects the file when it retires that generation.
 
 Receipts are retained for the lifetime of the managed plugin instance and shared
 across its native sessions. Once 256 receipts have accumulated, a new otherwise

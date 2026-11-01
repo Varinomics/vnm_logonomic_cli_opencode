@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const module_path = process.argv[2] ?? "package/assets/logonomic_opencode_wake.mjs"
@@ -31,8 +31,18 @@ try {
   } }
   wake = await create_session_wake(client, registration)
   assert(wake)
-  const binding = JSON.parse(await readFile(registration, "utf8"))
+  let binding = JSON.parse(await readFile(registration, "utf8"))
   if (process.platform !== "win32") assert.equal((await stat(registration)).mode & 0o777, 0o600)
+  const other_registration = join(root, "other-launch.json")
+  const other = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    const { create_session_wake } = await import(process.argv[1])
+    const wake = await create_session_wake(
+      { session: { get() {}, status() {}, promptAsync() {} } }, process.argv[2])
+    if (!wake) process.exitCode = 1
+  `, pathToFileURL(resolve(module_path)).href, other_registration], { encoding: "utf8" })
+  assert.equal(other.status, 0, other.stderr)
+  await assert.rejects(stat(other_registration), { code: "ENOENT" })
+  assert.deepEqual(JSON.parse(await readFile(registration, "utf8")), binding)
   const incomplete = connect(binding.port, "127.0.0.1")
   let progress
   let deadline

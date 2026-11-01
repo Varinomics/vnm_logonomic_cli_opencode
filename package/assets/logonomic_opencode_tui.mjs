@@ -374,6 +374,11 @@ export async function create_tui_integration(context) {
     relay.enqueue(response)
   })
 
+  let registration_file
+  try {
+    const path = JSON.parse(process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION ?? "null")
+    if (typeof path === "string") registration_file = path
+  } catch {}
   bridge = await create_wake_bridge({
     inspect: readiness,
     async notify(session_id, instruction, signal, mark_submitted) {
@@ -418,7 +423,7 @@ export async function create_tui_integration(context) {
           wake_identity(accepted.id) ? "accepted" : "uncertain",
       }
     },
-  }, process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION)
+  }, registration_file)
 
   return {
     select,
