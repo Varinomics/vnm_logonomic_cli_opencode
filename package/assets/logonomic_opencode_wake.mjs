@@ -6,18 +6,55 @@ export async function create_session_wake(client, registration_file) {
   if (!registration_file || typeof client?.session?.promptAsync !== "function" ||
       typeof client?.session?.status !== "function" || typeof client?.session?.get !== "function") return
   const sessions = new Map()
-  function session_record(session_id) {
-    let record = sessions.get(session_id)
-    if (!record && identity(session_id) && sessions.size < max_sessions) {
-      record = { status: "unknown", completed: false, blocked: new Set(), generation: 0 }
-      sessions.set(session_id, record)
+  const unresolved = new Map()
+  let selected
+  let unknown_blocker_lost = false
+
+  function record() {
+    return { status: "unknown", completed: false, blocked: new Set(), generation: 0, incomplete: unknown_blocker_lost }
+  }
+
+  function admit_root(id) {
+    if (sessions.has(id)) return
+    if (sessions.size >= max_sessions) {
+      // An observed root that never supplied turn context can be re-admitted
+      // later. Live bindings and outstanding requests keep their records.
+      const unused = [...sessions].find(([other, value]) => other !== selected &&
+        !value.context && !value.blocked.size && !bridge.bound(other))
+      if (!unused) return
+      sessions.delete(unused[0])
     }
-    return record
+    sessions.set(id, unresolved.get(id) ?? record())
+    unresolved.delete(id)
+  }
+
+  // Keep native facts in arrival order until the lifecycle plugin classifies
+  // an already-existing session. Only user input and open requests need state.
+  function input_record(id, asked = false) {
+    if (!identity(id)) return
+    const retained = sessions.get(id) ?? unresolved.get(id)
+    if (retained) return retained
+    if (unresolved.size >= max_sessions) {
+      // Never discard an unanswered request. Displaced turn context makes
+      // its session unavailable until the next observed user turn.
+      const unused = [...unresolved].find(([, candidate]) => !candidate.blocked.size)
+      if (!unused) {
+        // All slots hold open, unclassified requests. Once an ask is lost the
+        // plugin cannot prove absence of a blocker for newly encountered IDs.
+        if (asked) unknown_blocker_lost = true
+        return
+      }
+      unresolved.delete(unused[0])
+    }
+    const pending = record()
+    unresolved.set(id, pending)
+    return pending
   }
 
   function readiness(session_id) {
     const record = sessions.get(session_id)
-    if (!record || record.child) return unavailable("provider_session_unavailable")
+    if (!record || (selected && session_id !== selected)) return unavailable("provider_session_unavailable")
+    if (record.incomplete) return unavailable("provider_session_capacity")
     if (!record.context) return unavailable("provider_turn_context_unavailable")
     if (record.blocked.size) return unavailable("provider_awaiting_input")
     if (record.status !== "idle") return unavailable("provider_busy")
@@ -56,8 +93,23 @@ export async function create_session_wake(client, registration_file) {
   if (!bridge) return
 
   return {
+    session_kind(id, kind, observed) {
+      if (!observed || unresolved.get(id) !== observed) return
+      if (kind === "root") admit_root(id)
+      if (kind === "child") unresolved.delete(id)
+    },
+    select_root(session_id, observed) {
+      if (observed !== (sessions.get(session_id) ?? unresolved.get(session_id))) return
+      if (selected === session_id) return
+      // A resume can be inspected before this launch's first confirmed input.
+      if (selected) bridge.revoke(selected)
+      else for (const id of sessions.keys()) {
+        if (id !== session_id) bridge.revoke(id)
+      }
+      selected = session_id
+    },
     chat_message(input, output) {
-      const record = session_record(input?.sessionID)
+      const record = input_record(input?.sessionID)
       if (!record) return
       ++record.generation
       record.completed = false
@@ -79,12 +131,21 @@ export async function create_session_wake(client, registration_file) {
       const properties = event?.properties
       const session_id = properties?.sessionID ?? properties?.info?.sessionID ?? properties?.info?.id
       if (!identity(session_id)) return
-      if (event.type === "session.deleted") { sessions.delete(session_id); return }
-      const record = session_record(session_id)
-      if (!record) return
-      if (event.type === "session.created" || event.type === "session.updated") {
-        record.child = !!properties.info.parentID
+      const session_fact = event.type === "session.created" || event.type === "session.updated"
+      if (event.type === "session.deleted" || (session_fact && properties.info?.parentID)) {
+        bridge.revoke(session_id)
+        sessions.delete(session_id)
+        unresolved.delete(session_id)
+        if (selected === session_id) selected = undefined
+        return
       }
+      if (session_fact && properties.info?.id === session_id) {
+        admit_root(session_id)
+        return
+      }
+      const asked = event.type === "permission.asked" || event.type === "question.asked"
+      const record = asked ? input_record(session_id, true) : sessions.get(session_id) ?? unresolved.get(session_id)
+      if (!record) return
       if (event.type === "session.status") {
         record.status = properties.status?.type ?? "unknown"
         ++record.generation
@@ -96,19 +157,22 @@ export async function create_session_wake(client, registration_file) {
         record.completed = properties.info.finish === "stop" &&
           Number.isFinite(properties.info.time?.completed) && !properties.info.error
       }
-      if (event.type === "permission.asked" || event.type === "question.asked") {
+      if (asked) {
         record.blocked.add(properties.id)
         ++record.generation
       }
       if (event.type === "permission.replied" || event.type === "question.replied" ||
           event.type === "question.rejected") {
         record.blocked.delete(properties.requestID ?? properties.id)
+        if (!record.blocked.size && !record.context) unresolved.delete(session_id)
         ++record.generation
       }
+      return record
     },
     async dispose() {
       await bridge.dispose()
       sessions.clear()
+      unresolved.clear()
     },
   }
 }

@@ -202,7 +202,7 @@ export default {
   assert(patch.argv.includes("--standalone"), "prepared native invocation must own its server")
   assert.equal(patch.working_directory, "inherit")
   registration = patch.session_wake.binding.registration_file
-  assert.equal(patch.environment.set.OPENCODE_LOGONOMIC_WAKE_REGISTRATION, registration)
+  assert.equal(JSON.parse(patch.environment.set.OPENCODE_LOGONOMIC_WAKE_REGISTRATION), registration)
   for (const name of patch.environment.unset) delete environment[name]
   Object.assign(environment, patch.environment.set, { LOGONOMIC_SESSION_CAPABILITY: mailbox_identity })
   child = spawn(patch.argv[0], patch.argv.slice(1), {

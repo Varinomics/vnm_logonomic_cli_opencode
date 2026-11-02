@@ -111,20 +111,21 @@ try {
     assert(response.ok, `native API ${path}: ${response.status} ${await response.clone().text()}`)
     return response.status === 204 ? undefined : response.json()
   }
-  const session = await api("/session", {})
-  await api(`/session/${session.id}/message`, {
+  const send_turn = (id) => api(`/session/${id}/message`, {
     agent: "plan", model: { providerID: "fixture", modelID: "wake" }, variant: "deliberate reasoning",
     parts: [{ type: "text", text: "Reply with a short sentence; do not use tools." }],
   })
+  const session = await api("/session", {})
+  await send_turn(session.id)
   const binding = await until(async () => {
     try { return JSON.parse(await readFile(registration, "utf8")) } catch { return undefined }
   }, "native plugin bridge registration")
-  const bridge = (operation) => new Promise((resolve, reject) => {
+  const bridge = (operation, id = session.id, nonce = "d".repeat(32)) => new Promise((resolve, reject) => {
     const socket = connect(binding.port, "127.0.0.1")
     let bytes = ""
     socket.once("error", reject)
     socket.once("connect", () => socket.write(`${JSON.stringify({
-      ...binding, operation, provider_session_id: session.id, transition_nonce: "d".repeat(32),
+      ...binding, operation, provider_session_id: id, transition_nonce: nonce,
       ...(operation === "notify" ? { notification_id: "native_mail", instruction: "Read the new mailbox notification." } : {}),
     })}\n`))
     socket.on("data", (chunk) => { bytes += chunk })
@@ -145,6 +146,18 @@ try {
     item.info.model.variant === "deliberate reasoning"))
   assert.equal(users[1].parts.find((part) => part.type === "text").text, "Read the new mailbox notification.")
   assert(model_calls >= 2)
+  const second = await api("/session", {})
+  await send_turn(second.id)
+  const second_nonce = "e".repeat(32)
+  await until(async () => (await bridge("inspect", second.id, second_nonce)).available, "second root")
+  assert.equal((await bridge("inspect")).reason, "provider_correlation_changed")
+  await send_turn(session.id)
+  const return_nonce = "f".repeat(32)
+  await until(async () => (await bridge("inspect", session.id, return_nonce)).available, "return to first root")
+  assert.equal((await bridge("inspect", second.id, second_nonce)).reason, "provider_correlation_changed")
+  assert.equal((await bridge("inspect")).reason, "provider_correlation_changed")
+  assert.deepEqual(await bridge("notify", session.id, return_nonce), accepted)
+
   console.log("Native OpenCode: same live session woke once, Plan/model/variant retained, second response observed through native API")
 } catch (error) {
   console.error(output)

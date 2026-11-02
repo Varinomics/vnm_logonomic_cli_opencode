@@ -88,6 +88,45 @@ const clientFor = (sessions, failedSessions = new Set()) => ({
 
 resetCapture()
 {
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, "switch-A")
+  await plugin["chat.message"]({ sessionID: "switch-A" }, {
+    message: { id: "input-before-B" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "session.created", { info: { id: "never-published" } })
+  await plugin["chat.message"]({ sessionID: "never-published" }, {
+    message: { id: "never-published-input" }, parts: [{ synthetic: false }],
+  })
+  await publishRoot(plugin, "switch-B")
+  event(plugin, "message.updated", { info: {
+    id: "late-first-confirmation", parentID: "never-published-input", sessionID: "never-published", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: "never-published", status: { type: "busy" } })
+  event(plugin, "session.idle", { sessionID: "never-published" })
+  event(plugin, "message.updated", { info: {
+    id: "late-confirmation", parentID: "input-before-B", sessionID: "switch-A", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: "switch-A", status: { type: "retry" } })
+  event(plugin, "session.idle", { sessionID: "switch-A" })
+  await plugin["chat.message"]({ sessionID: "switch-A" }, {
+    message: { id: "return-to-A" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", { info: {
+    id: "reply-after-return", parentID: "return-to-A", sessionID: "switch-A", role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: "switch-A", status: { type: "busy" } })
+  event(plugin, "session.status", { sessionID: "switch-A", status: { type: "retry" } })
+  await settle(plugin)
+  assert.deepEqual(captured().map((item) => [item.event, item.turn_id, item.fresh_user_turn]), [
+    ["session.status", "input-before-B", undefined],
+    ["session.idle", "input-before-B", undefined],
+    ["session.status", "return-to-A", true],
+    ["session.status", "return-to-A", undefined],
+  ], "only the first confirmed working status for the new input can readmit root A")
+}
+
+resetCapture()
+{
   const sessions = new Map([
     ["root-native", { id: "root-native", title: privateCanary }],
   ])

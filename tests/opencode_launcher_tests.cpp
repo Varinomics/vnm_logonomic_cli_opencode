@@ -24,7 +24,9 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -188,6 +190,29 @@ std::string path_string(const fs::path& path)
 {
     const auto bytes = path.u8string();
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+void set_host_directory(const std::string& name, const fs::path& directory)
+{
+#ifdef _WIN32
+    const std::wstring wide(name.begin(), name.end());
+    check(SetEnvironmentVariableW(wide.c_str(), directory.empty() ? nullptr : directory.c_str()) != 0,
+        "set host directory in the native environment");
+#else
+    if (directory.empty()) unsetenv(name.c_str());
+    else setenv(name.c_str(), directory.c_str(), 1);
+#endif
+}
+
+// Apply the same asset scanner and substitution as the host before OpenCode decodes the JSON.
+std::optional<addon::Json_value> applied_config(const addon::Environment& environment)
+{
+    const auto text = addon::environment_value(environment, "OPENCODE_CONFIG_CONTENT");
+    const auto tokens = addon::scan_asset_tokens(text, nullptr);
+    if (!tokens) return std::nullopt;
+    const auto expanded = addon::substitute_asset_tokens(text, *tokens,
+        {{"assets/logonomic_opencode_plugin.mjs", "managed-plugin.mjs"}});
+    return expanded ? addon::parse_json(*expanded, {}, nullptr) : std::nullopt;
 }
 
 } // namespace
@@ -433,6 +458,10 @@ int main(int argc, char** argv)
             next.stdin_bytes->find("opencode-host-authority-canary") == std::string::npos,
             "actual native session request carries nonsecret relay configuration");
     }
+    // These settings are data even when their spelling matches the host's asset grammar.
+    const auto user_config = *addon::parse_json(
+        R"({"permission":{"bash":"deny","edit":"ask"},"instructions":["{{file}}"],"plugins":[{"package":"existing-server-plugin","options":{"{{":"{{asset:assets/logonomic_opencode_plugin.mjs}}"}}]})", {}, nullptr);
+    const auto inline_settings = addon::Json_value(addon::serialize_json(user_config));
     auto automatic = delegated;
     const auto yolofied = addon::transform_launcher_approval({
         automatic.context.launcher, discovery.platform_id, addon::Launcher_approval_action::YOLOFY},
@@ -442,7 +471,7 @@ int main(int argc, char** argv)
     automatic.context.launcher.script_body = yolofied.script_body;
     automatic.context.launcher_argv.push_back("--auto");
     automatic.context.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT",
-        addon::Json_value("{\"permission\":{\"bash\":\"deny\",\"edit\":\"ask\"}}"));
+        inline_settings);
     Context auto_prepared;
     auto_prepared.invocation = prepared.invocation;
     auto_prepared.invocation.payload = addon::encode_delegated_prepare_request(automatic);
@@ -455,13 +484,8 @@ int main(int argc, char** argv)
         const auto* approve = state ? state->find("auto_approve") : nullptr;
         check(approve && approve->is_boolean() && approve->as_boolean(),
             "the selected auto mode reaches the delegated permission responder");
-        const auto config = std::find_if(auto_result->process.environment.begin(), auto_result->process.environment.end(),
-            [](const auto& entry) { return entry.first == "OPENCODE_CONFIG_CONTENT"; });
-        const auto value = config != auto_result->process.environment.end()
-            ? addon::parse_json(config->second, {}, nullptr) : std::nullopt;
-        const auto expected = addon::parse_json("{\"bash\":\"deny\",\"edit\":\"ask\"}", {}, nullptr);
-        check(value && value->find("permission") && *value->find("permission") == *expected,
-            "auto mode preserves explicit native denies and asks without a blanket allow override");
+        check(applied_config(auto_result->process.environment) == user_config,
+            "the delegated host expands no user settings and keeps explicit native denies and asks");
     }
     check(!opencode::verified_launch(automatic.context.launcher, {program_text},
         automatic.context.launch_environment->effective_environment, path_string(root), true, context),
@@ -520,6 +544,12 @@ int main(int argc, char** argv)
     interactive.launch_environment = addon::Launch_environment{};
     interactive.launch_environment->platform_id = discovery.platform_id;
     interactive.launch_environment->effective_environment = launch_environment;
+    auto classic_settings = user_config;
+    const auto user_plugin = *addon::parse_json(
+        R"(["classic-plugin",{"literal":"{{asset_json:assets/logonomic_opencode_plugin.mjs}}"}])", {}, nullptr);
+    classic_settings.set("plugin", addon::Json_value(addon::Json_value::Array{user_plugin}));
+    interactive.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT",
+        addon::Json_value(addon::serialize_json(classic_settings)));
     const auto prepare_interactive = [&interactive]() {
         Context prepared_interactive;
         prepared_interactive.invocation = {"interactive", {"launch-preparation", 3}, "prepare",
@@ -547,7 +577,17 @@ int main(int argc, char** argv)
         if (relay != (patch->disposition->lifecycle_events ? "1" : "0")) return std::nullopt;
         return patch->disposition->lifecycle_events;
     };
-    check(lifecycle_reported(prepare_interactive()) == true, "verified direct launch reports its lifecycle");
+    const auto classic_config_ok = [&](const addon::Launch_patch& patch) {
+        const auto config = applied_config(patch.set);
+        if (!config || !config->find("instructions") || !config->find("plugin")) return false;
+        const auto& instructions = config->find("instructions")->as_array();
+        const auto& plugins = config->find("plugin")->as_array();
+        return !instructions.empty() && instructions.front().as_string() == "{{file}}" &&
+            plugins.size() == 2 && plugins.front() == user_plugin && plugins.back().as_string() == "managed-plugin.mjs";
+    };
+    const auto direct = prepare_interactive();
+    check(lifecycle_reported(direct) == true, "verified direct launch reports its lifecycle");
+    check(direct && classic_config_ok(*direct), "classic launch expands only its own plugin asset");
 
     // Oracle: interactive-initial-prompt@1 and the two native TUI home routes,
     // which submit --prompt once after model selection is ready.
@@ -702,6 +742,8 @@ int main(int argc, char** argv)
             config.find("{{asset_json:assets/logonomic_opencode_plugin.mjs}}") != std::string::npos;
     };
     check(resumes_with({"--session", resumed_session}), "a direct launcher resumes the session");
+    const auto direct_resume = prepare_resume(nullptr);
+    check(direct_resume && classic_config_ok(direct_resume->patch), "classic resume expands only its own plugin asset");
     resume.context.launcher.script_body = interactive.launcher.script_body + " --model provider/model --auto";
     resume.context.launcher_argv = {program_text, "--model", "provider/model", "--auto"};
     check(resumes_with({"--model", "provider/model", "--auto", "--session", resumed_session}),
@@ -884,19 +926,43 @@ int main(int argc, char** argv)
     interactive.launcher_argv = {program_text};
     interactive.launch_environment->effective_environment = launch_environment;
     interactive.launch_environment->effective_environment.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("2.1.4"));
-    interactive.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", addon::Json_value(
-        R"({"plugins":[{"package":"existing-server-plugin","options":{"enabled":true}}],"instructions":["user.md"]})"));
+    interactive.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT", inline_settings);
     interactive.launch_environment->effective_environment.set("OPENCODE_CLI_CONFIG_CONTENT", addon::Json_value(
         R"({"plugins":["existing-tui-plugin"],"theme":"user-theme"})"));
     interactive.declared_assets.push_back("assets/opencode_tui/tui.mjs");
     interactive.session_wake = addon::Session_wake_offer{};
-    const char* package_root = std::getenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
-    const std::optional<std::string> saved_package_root = package_root ? std::optional(std::string(package_root)) : std::nullopt;
-#ifdef _WIN32
-    _putenv_s("LOGONOMIC_ADDON_PACKAGE_ROOT", path_string(root).c_str());
-#else
-    setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", path_string(root).c_str(), 1);
-#endif
+    const fs::path generation = root / u8"generation-\u00e9-\u6771";
+    fs::create_directory(generation);
+    const auto scratch = root / u8"scratch-{{file}}-\u6771";
+    fs::create_directory(scratch);
+    const auto host_environment = addon::current_process_environment();
+    const auto saved_package_root = addon::environment_value(host_environment, addon::k_env_package_root);
+    const auto saved_scratch = addon::environment_value(host_environment, addon::k_env_scratch_dir);
+    set_host_directory(addon::k_env_package_root, generation);
+    for (const auto& unavailable : {fs::path{}, fs::path("relative-scratch")}) {
+        set_host_directory(addon::k_env_scratch_dir, unavailable);
+        const auto without = prepare_interactive();
+        check(without && lifecycle_reported(without) == true && without->session_wake &&
+            !without->session_wake->available && without->session_wake->reason == "opencode_scratch_unavailable" &&
+            std::find(without->unset.begin(), without->unset.end(), "OPENCODE_LOGONOMIC_WAKE_REGISTRATION") != without->unset.end(),
+            "missing or relative scratch disables only wake and clears an inherited binding");
+    }
+    set_host_directory(addon::k_env_scratch_dir, scratch);
+    const auto tui_config_ok = [&](const addon::Launch_patch& patch) {
+        if (!patch.session_wake || !patch.session_wake->available) return false;
+        const auto* registration = patch.session_wake->binding.find("registration_file");
+        const auto emitted = addon::parse_json(addon::environment_value(patch.set, "OPENCODE_LOGONOMIC_WAKE_REGISTRATION"), {}, nullptr);
+        if (!registration || emitted != *registration ||
+            addon::path_from_utf8(registration->as_string()).parent_path() != scratch ||
+            !addon::validate_launch_patch(patch, interactive.declared_assets, interactive.declared_assets, nullptr)) return false;
+        const auto config = applied_config(patch.set);
+        if (!config || !config->find("instructions") || !config->find("plugins")) return false;
+        const auto& plugins = config->find("plugins")->as_array();
+        const auto& instructions = config->find("instructions")->as_array();
+        return plugins.size() == 2 && plugins.front() == user_config.find("plugins")->as_array().front() &&
+            plugins.back().as_string() == path_string(generation / "assets" / "opencode_tui") &&
+            !instructions.empty() && instructions.front().as_string() == "{{file}}" && !config->find("plugin");
+    };
     const auto tui_patch = prepare_interactive();
     check(tui_patch && tui_patch->argv == std::optional(std::vector<std::string>{program_text, "--standalone"}) &&
         tui_patch->session_wake && tui_patch->session_wake->available && lifecycle_reported(tui_patch) == true,
@@ -912,13 +978,8 @@ int main(int argc, char** argv)
         check(std::none_of(tui_patch->set.begin(), tui_patch->set.end(),
                 [](const auto& value) { return value.first == "OPENCODE_CLI_CONFIG_CONTENT"; }),
             "native TUI discovery preserves the user's cli.json and inline plugin list");
-        const auto configured = std::find_if(tui_patch->set.begin(), tui_patch->set.end(),
-            [](const auto& value) { return value.first == "OPENCODE_CONFIG_CONTENT"; });
-        const auto config = configured == tui_patch->set.end() ? std::nullopt : addon::parse_json(configured->second, {}, nullptr);
-        check(config && config->find("plugins")->as_array().size() == 2 &&
-            config->find("plugins")->as_array().front().find("package")->as_string() == "existing-server-plugin" &&
-            config->find("instructions")->as_array().front().as_string() == "user.md" && !config->find("plugin"),
-            "native server configuration appends the managed directory and preserves existing configuration");
+        check(tui_config_ok(*tui_patch), "native launch keeps literal settings and the exact managed plugin directory");
+        const auto config = applied_config(tui_patch->set);
         if (config) {
             std::ifstream instruction(addon::path_from_utf8(config->find("instructions")->as_array().back().as_string()));
             const std::string text{std::istreambuf_iterator<char>(instruction), {}};
@@ -935,6 +996,8 @@ int main(int argc, char** argv)
         std::vector<std::string>{"--standalone", "--session", resumed_session} &&
         native_resume->patch.session_wake && native_resume->patch.session_wake->available,
         "native TUI resume owns a fresh private bridge and the exact stored session");
+    check(native_resume && tui_config_ok(native_resume->patch),
+        "native resume keeps literal settings and the exact managed plugin directory");
     interactive.launcher.script_body += " --server https://example.org";
     interactive.launcher_argv.insert(interactive.launcher_argv.end(), {"--server", "https://example.org"});
     const auto unmanaged = prepare_interactive();
@@ -1022,12 +1085,8 @@ int main(int argc, char** argv)
     check(!opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
         {path_string(npm_shim)}, npm_environment, path_string(root), false, context),
         "a wrapper with multiple different native targets cannot establish launch identity");
-#ifdef _WIN32
-    _putenv_s("LOGONOMIC_ADDON_PACKAGE_ROOT", saved_package_root ? saved_package_root->c_str() : "");
-#else
-    if (saved_package_root) setenv("LOGONOMIC_ADDON_PACKAGE_ROOT", saved_package_root->c_str(), 1);
-    else unsetenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
-#endif
+    set_host_directory(addon::k_env_package_root, addon::path_from_utf8(saved_package_root));
+    set_host_directory(addon::k_env_scratch_dir, addon::path_from_utf8(saved_scratch));
     launcher.script_body += " --model selected";
     check(!opencode::verified_launch(launcher, {program_text, "--model", "selected"}, effective,
         path_string(root), true, context), "delegation refuses changed stock argv");

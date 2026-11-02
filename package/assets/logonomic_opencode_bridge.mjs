@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto"
-import { writeFile, unlink } from "node:fs/promises"
+import { unlinkSync } from "node:fs"
+import { writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 
 const max_request_bytes = 32768
@@ -27,6 +28,13 @@ export async function create_wake_bridge(native, registration_file) {
   const operations = new Map()
   let disposed = false
   let registered = false
+  function unregister() {
+    if (!registered) return
+    registered = false
+    process.off("exit", unregister)
+    // Only the bridge that exclusively created this launch's file owns it.
+    try { unlinkSync(registration_file) } catch {}
+  }
 
   function readiness(session_id) {
     if (disposed) return wake_unavailable("provider_disposed")
@@ -143,6 +151,7 @@ export async function create_wake_bridge(native, registration_file) {
       version: 1, port: server.address().port, token, instance_id,
     }), { encoding: "utf8", flag: "wx", mode: 0o600 })
     registered = true
+    process.once("exit", unregister)
     server.unref()
   } catch {
     server.close()
@@ -150,6 +159,9 @@ export async function create_wake_bridge(native, registration_file) {
   }
 
   return {
+    bound(session_id) {
+      return correlations.has(session_id) || submitting.has(session_id)
+    },
     revoke(session_id) {
       const correlation = correlations.get(session_id)
       if (correlation) {
@@ -165,7 +177,7 @@ export async function create_wake_bridge(native, registration_file) {
       for (const controller of operations.keys()) controller.abort()
       for (const socket of sockets) socket.destroy()
       await new Promise((resolve) => server.close(resolve))
-      if (registered) await unlink(registration_file).catch(() => {})
+      unregister()
       correlations.clear()
       retired_correlations.clear()
       receipts.clear()

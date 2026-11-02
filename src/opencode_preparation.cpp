@@ -145,6 +145,24 @@ fs::path native_path(std::string_view value)
     return fs::path(std::u8string(value.begin(), value.end()));
 }
 
+fs::path host_directory(const std::string& name)
+{
+#ifdef _WIN32
+    // Read the host's UTF-16 process environment directly, independent of the CRT code page.
+    const std::wstring wide_name(name.begin(), name.end());
+    const DWORD size = GetEnvironmentVariableW(wide_name.c_str(), nullptr, 0);
+    if (!size) return {};
+    std::wstring value(size, L'\0');
+    const DWORD length = GetEnvironmentVariableW(wide_name.c_str(), value.data(), size);
+    if (length >= size) return {};
+    value.resize(length);
+    return fs::path(std::move(value));
+#else
+    const char* value = std::getenv(name.c_str());
+    return value ? native_path(value) : fs::path{};
+#endif
+}
+
 std::string path_text(const fs::path& path)
 {
     const auto value = path.u8string();
@@ -313,6 +331,22 @@ std::string materialize_instruction(std::string_view profile_root, std::string_v
 
 namespace {
 
+// Consecutive opening braces in serialized JSON can only occur inside a string.
+// Escape the second brace so the host leaves those literal characters alone.
+std::string literal_config_json(const addon::Json_value& value)
+{
+    auto text = addon::serialize_json(value);
+    if (text.find("{{") == std::string::npos) return text;
+
+    std::string result;
+    result.reserve(text.size());
+    for (const char c : text) {
+        if (c == '{' && result.ends_with('{')) result += "\\u007b";
+        else result += c;
+    }
+    return result;
+}
+
 std::string interactive_config(addon::Json_value config, const std::string& instruction,
     const std::optional<addon::Session_wake_preparation>& wake = std::nullopt)
 {
@@ -321,17 +355,17 @@ std::string interactive_config(addon::Json_value config, const std::string& inst
     config.set("instructions", std::move(instructions));
     const auto plugins = config.find("plugin") ? *config.find("plugin") : addon::Json_value::array();
     config.erase("plugin");
-    std::string result = addon::serialize_json(config);
+    std::string result = literal_config_json(config);
     result.pop_back();
     result += ",\"plugin\":[";
     for (const auto& plugin : plugins.as_array()) {
-        result += addon::serialize_json(plugin) + ",";
+        result += literal_config_json(plugin) + ",";
     }
     // The host substitutes a complete JSON string, including Windows escaping.
     if (wake && wake->available) {
         auto options = addon::Json_value::object();
         options.set("session_wake", wake->binding);
-        result += "[{{asset_json:assets/logonomic_opencode_plugin.mjs}}," + addon::serialize_json(options) + "]]}";
+        result += "[{{asset_json:assets/logonomic_opencode_plugin.mjs}}," + literal_config_json(options) + "]]}";
     }
     else {
         result += "{{asset_json:assets/logonomic_opencode_plugin.mjs}}]}";
@@ -339,16 +373,21 @@ std::string interactive_config(addon::Json_value config, const std::string& inst
     return result;
 }
 
-addon::Session_wake_preparation prepare_wake(std::string_view profile_root, bool verified)
+addon::Session_wake_preparation prepare_wake(bool verified)
 {
     addon::Session_wake_preparation result;
     if (!verified) {
         result.reason = "opencode_launcher_unverified";
         return result;
     }
-    // The plugin creates this file exclusively with owner-only permissions.
-    // Neither credentials nor a native endpoint are placed in the launch patch.
-    const auto file = native_path(profile_root) / ("wake-" + addon::random_nonce_hex() + ".json");
+    // The host revokes all wake bindings before collecting this generation's
+    // scratch. A killed plugin can leave only its own file until then.
+    const auto scratch = host_directory("LOGONOMIC_ADDON_SCRATCH_DIR");
+    if (!scratch.is_absolute()) {
+        result.reason = "opencode_scratch_unavailable";
+        return result;
+    }
+    const auto file = scratch / ("wake-" + addon::random_nonce_hex() + ".json");
     result.binding.set("registration_file", addon::Json_value(path_text(file)));
     result.available = true;
     return result;
@@ -368,8 +407,8 @@ bool configure_tui(
     }
     // TUI plugins are directory entrypoints. The host owns this immutable
     // package directory for the lifetime of the launched native process.
-    const char* package_root = std::getenv("LOGONOMIC_ADDON_PACKAGE_ROOT");
-    if (!package_root || !native_path(package_root).is_absolute()) {
+    const auto package_root = host_directory("LOGONOMIC_ADDON_PACKAGE_ROOT");
+    if (!package_root.is_absolute()) {
         context.fail(addon::Result_status::UNAVAILABLE, "package_root_unavailable");
         return false;
     }
@@ -379,14 +418,19 @@ bool configure_tui(
     instructions.push_back(addon::Json_value(instruction));
     server.value.set("instructions", std::move(instructions));
     auto plugins = server.value.find("plugins") ? *server.value.find("plugins") : addon::Json_value::array();
-    plugins.push_back(addon::Json_value(path_text(native_path(package_root) / "assets" / "opencode_tui")));
+    plugins.push_back(addon::Json_value(path_text(package_root / "assets" / "opencode_tui")));
     server.value.set("plugins", std::move(plugins));
     if (session_wake) {
-        patch.session_wake = prepare_wake(patch.profile_storage->root, true);
-        patch.set.emplace_back("OPENCODE_LOGONOMIC_WAKE_REGISTRATION",
-            patch.session_wake->binding.find("registration_file")->as_string());
+        patch.session_wake = prepare_wake(true);
     }
-    patch.set.emplace_back(server.environment_name, addon::serialize_json(server.value));
+    if (patch.session_wake && patch.session_wake->available) {
+        patch.set.emplace_back("OPENCODE_LOGONOMIC_WAKE_REGISTRATION",
+            literal_config_json(*patch.session_wake->binding.find("registration_file")));
+    }
+    else {
+        patch.unset.emplace_back("OPENCODE_LOGONOMIC_WAKE_REGISTRATION");
+    }
+    patch.set.emplace_back(server.environment_name, literal_config_json(server.value));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", "1");
     patch.disposition = addon::Launch_disposition{true, true, false};
     return true;
@@ -554,14 +598,14 @@ void prepare_interactive(addon::Invocation_context& context)
         addon::Launch_patch patch;
         patch.profile_storage = request->profile_storage;
         patch.disposition = addon::Launch_disposition{false, false, false};
-        if (request->session_wake) patch.session_wake = prepare_wake(request->profile_storage->root, false);
+        if (request->session_wake) patch.session_wake = prepare_wake(false);
         finish_interactive(std::move(patch), *request, {}, conversation_source, context);
         return;
     }
     const auto instruction = materialize_instruction(request->profile_storage->root, request->title_instruction);
     addon::Launch_patch patch;
     patch.profile_storage = request->profile_storage;
-    if (request->session_wake) patch.session_wake = prepare_wake(request->profile_storage->root, launch.has_value());
+    if (request->session_wake) patch.session_wake = prepare_wake(launch.has_value());
     patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, patch.session_wake));
     patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", launch ? "1" : "0");
     patch.disposition = addon::Launch_disposition{true, launch.has_value(), false};
@@ -647,7 +691,7 @@ void prepare_resume(addon::Invocation_context& context)
     result.process.argv           = *arguments;
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
     result.patch.profile_storage  = launch.profile_storage;
-    if (launch.session_wake) result.patch.session_wake = prepare_wake(launch.profile_storage->root, true);
+    if (launch.session_wake) result.patch.session_wake = prepare_wake(true);
     result.patch.set.emplace_back(config.environment_name, interactive_config(std::move(config.value), instruction, result.patch.session_wake));
     result.patch.set.emplace_back("OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED", "1");
     // The managed plugin reports this session as resumed once the resumed
@@ -758,7 +802,7 @@ void prepare_delegated(addon::Invocation_context& context)
     result.process.environment.erase(std::remove_if(result.process.environment.begin(), result.process.environment.end(),
         [&config](const auto& pair) { return environment_name_equal(pair.first, config.environment_name) || environment_name_equal(pair.first, "OPENCODE_ENABLE_QUESTION_TOOL"); }),
         result.process.environment.end());
-    result.process.environment.emplace_back(config.environment_name, addon::serialize_json(config.value));
+    result.process.environment.emplace_back(config.environment_name, literal_config_json(config.value));
     result.process.environment.emplace_back("OPENCODE_ENABLE_QUESTION_TOOL", "0");
     // OPENCODE_CONFIG and OPENCODE_CONFIG_DIR select the user's configuration,
     // and with it the permission rules the delegated run keeps.

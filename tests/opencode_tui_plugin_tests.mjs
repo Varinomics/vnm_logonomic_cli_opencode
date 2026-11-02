@@ -11,7 +11,7 @@ const { create_tui_integration } = await import(pathToFileURL(resolve(module_pat
 const root = await mkdtemp(join(tmpdir(), "opencode-tui-contract-"))
 const registration = join(root, "wake.json")
 process.env.OPENCODE_LOGONOMIC_EVENT_RELAY_ENABLED = "1"
-process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION = registration
+process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION = JSON.stringify(registration)
 delete process.env.LOGONOMIC_PROVIDER_HELPERS_DIR
 const capture = join(root, "events.jsonl")
 if (process.argv[3] && process.argv[4]) {
@@ -213,7 +213,8 @@ try {
   }
   assert.equal(listener, undefined)
   await assert.rejects(readFile(registration), { code: "ENOENT" })
-  delete process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION
+  // An invalid optional wake field must leave native selection and attention operational.
+  process.env.OPENCODE_LOGONOMIC_WAKE_REGISTRATION = "{invalid"
   if (process.argv[3]) {
     const selected_events = await attention_events(async ({ sessions, permissions, forms, select, event, route }) => {
       permissions.set("ses_root", [permission("per_first"), permission("per_remaining")])
