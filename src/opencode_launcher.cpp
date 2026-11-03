@@ -275,11 +275,17 @@ std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover
     for (const auto& member : request.ambient_environment.as_object()) {
         environment.emplace_back(member.name, member.value.as_string());
     }
-    const auto program = resolve_program("opencode", environment, {}, Launcher_whitespace::ASCII) ? "opencode" : "opencode2";
-    if (!resolve_program(program, environment, {}, Launcher_whitespace::ASCII)) return std::nullopt;
+    auto program = "opencode";
+    auto resolved = resolve_program(program, environment, {}, Launcher_whitespace::ASCII);
+    if (!resolved) {
+        program = "opencode2";
+        resolved = resolve_program(program, environment, {}, Launcher_whitespace::ASCII);
+    }
+    if (!resolved) return std::nullopt;
     return addon::Launcher_candidate{
         "interactive", "OpenCode", program,
-        request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct,
+        addon::preferred_discovery_runner(*resolved,
+            request.platform_id == "windows-x86_64" ? addon::k_runner_powershell : addon::k_runner_direct),
         "", true, addon::Json_value::object(),
     };
 }

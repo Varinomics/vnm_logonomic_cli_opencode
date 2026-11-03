@@ -192,6 +192,19 @@ std::string path_string(const fs::path& path)
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+const addon::Json_value* environment_member(const addon::Json_value& environment, std::string_view name)
+{
+#ifdef _WIN32
+    const auto expected = addon::lower(std::string(name));
+    for (const auto& member : environment.as_object()) {
+        if (addon::lower(member.name) == expected) return &member.value;
+    }
+    return nullptr;
+#else
+    return environment.find(name);
+#endif
+}
+
 void set_host_directory(const std::string& name, const fs::path& directory)
 {
 #ifdef _WIN32
@@ -354,12 +367,7 @@ int main(int argc, char** argv)
 #endif
     discovery.ambient_environment.set("PATH", addon::Json_value(path_string(root)));
     const auto discovered = opencode::discover_launcher(discovery);
-    check(discovered && discovered->script_body == "opencode" && discovered->runner_key ==
-#ifdef _WIN32
-        "powershell",
-#else
-        "direct",
-#endif
+    check(discovered && discovered->script_body == "opencode" && discovered->runner_key == "direct",
         "discover installed CLI with native runner");
     discovery.ambient_environment.set("PATH", addon::Json_value("relative-directory"));
     check(!opencode::discover_launcher(discovery), "discover does not resolve relative PATH without cwd");
@@ -393,7 +401,7 @@ int main(int argc, char** argv)
     delegated.context.launch_environment->platform_id = discovery.platform_id;
     auto& task_environment = delegated.context.launch_environment->effective_environment;
     for (const auto* name : {"PATH", "SystemRoot", "TEMP", "TMP", "OPENCODE_FIXTURE_VERSION"}) {
-        if (const auto* value = effective.find(name)) {
+        if (const auto* value = environment_member(effective, name)) {
             task_environment.set(name, *value);
         }
     }
@@ -538,7 +546,7 @@ int main(int argc, char** argv)
     fs::create_directories(root / "profile");
     auto launch_environment = addon::Json_value::object();
     for (const auto* name : {"SystemRoot", "PATHEXT", "TEMP", "TMP", "OPENCODE_FIXTURE_VERSION"}) {
-        if (const auto* value = effective.find(name)) {
+        if (const auto* value = environment_member(effective, name)) {
             launch_environment.set(name, *value);
         }
     }
@@ -818,7 +826,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     // The host runs a PowerShell launcher as `powershell -NoLogo -Command <script>`.
     // The version evidence must come from what that shell itself runs.
-    const auto system_root = effective.find("SystemRoot");
+    const auto system_root = environment_member(effective, "SystemRoot");
     const auto powershell_directory = (system_root ? system_root->as_string() : std::string("C:\\Windows")) +
         "\\System32\\WindowsPowerShell\\v1.0";
     auto shell_environment = launch_environment;
