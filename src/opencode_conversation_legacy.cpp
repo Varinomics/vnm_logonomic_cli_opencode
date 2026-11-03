@@ -66,11 +66,19 @@ bool append_attachment(const Json& part, std::vector<Block>& blocks,
     {
         return unavailable(failure, "An OpenCode attachment has an unsupported reference.");
     }
-    const auto mime = json::text(part, "mime");
-    const auto url  = json::text(part, "url");
+    const auto& mime = json::member(part, "mime").as_string();
+    const auto& url  = json::member(part, "url").as_string();
     std::string reference = "Media type: " + mime + "\n";
-    reference += url.empty() ? "[Attachment URL is empty]"
-        : data_url(url) ? "Embedded " + mime + " attachment" : url;
+    if (url.empty()) {
+        reference += "[Attachment URL is empty]";
+    }
+    else
+    if (data_url(url)) {
+        reference += "Embedded " + mime + " attachment";
+    }
+    else {
+        reference += url;
+    }
     if (const auto filename = json::text(part, "filename"); !filename.empty()) {
         reference = filename + "\n" + reference;
     }
@@ -80,10 +88,10 @@ bool append_attachment(const Json& part, std::vector<Block>& blocks,
         if ((type != "file" && type != "symbol" && type != "resource") || !text_member(*source, key)) {
             return unavailable(failure, "An OpenCode attachment has an unsupported source reference.");
         }
-        const auto source_reference = json::text(*source, key);
+        const std::string_view source_reference = json::member(*source, key).as_string();
         if (!source_reference.empty()) {
-            reference += "\nSource: " +
-                (data_url(source_reference) ? "Embedded attachment" : source_reference);
+            reference += "\nSource: ";
+            reference += data_url(source_reference) ? "Embedded attachment" : source_reference;
         }
         if (type == "symbol") {
             if (!text_member(*source, "name")) {
