@@ -289,6 +289,14 @@ int main(int argc, char** argv)
         environment->environment.back().second == "{\"theme\": \"dark\"}", "assignment preservation");
     const auto unattached = opencode::recognize_launcher("UNATTACHED=value; opencode");
     check(unattached && unattached->environment.empty(), "bare assignment stays unbound");
+    for (const char* script : {
+            "export EXTRA=one unsupported; opencode", "export -p; opencode",
+            "export EXTRA='unterminated; opencode", "export EXTRA=$(command); opencode"})
+    {
+        check(!opencode::recognize_launcher(script), "unsupported export operands are not assignments");
+    }
+    const auto ordinary = opencode::recognize_launcher("exported EXTRA=one; opencode");
+    check(ordinary && ordinary->environment.empty(), "export requires an exact command word");
     check(addon::literal_argv("\"C:/a b/opencode.exe\" --model test") ==
         std::vector<std::string>{"C:/a b/opencode.exe", "--model", "test"}, "literal host argv");
 
@@ -550,6 +558,26 @@ int main(int argc, char** argv)
     classic_settings.set("plugin", addon::Json_value(addon::Json_value::Array{user_plugin}));
     interactive.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT",
         addon::Json_value(addon::serialize_json(classic_settings)));
+    // Script-owned inline configuration would replace the managed merge when
+    // the shell runs. Every export operand must reach the admission guard.
+    for (const char* prefix : {
+            "export\tOPENCODE_CONFIG_CONTENT='{}'",
+            "export EXTRA=one OPENCODE_CONFIG_CONTENT='{}'",
+            "export \tEXTRA='two words'\tOPENCODE_CONFIG_CONTENT='{}'",
+            "export EXTRA=two\\ words OPENCODE_CONFIG_CONTENT='{}'",
+            "export EXTRA=two' words' OPENCODE_CONFIG_CONTENT=''"})
+    {
+        auto assigned = interactive;
+        assigned.launcher.runner_key = addon::k_runner_bash;
+        assigned.launcher.script_body = std::string(prefix) + "; " + launcher.script_body;
+        assigned.launcher_argv = {"bash", "-lc", assigned.launcher.script_body};
+        Context rejected;
+        rejected.invocation = {"interactive", {"launch-preparation", 3}, "prepare",
+            addon::encode_prepare_request(assigned, 3)};
+        opencode::handle_preparation(rejected);
+        check(!rejected.payload && rejected.reason == "inline_configuration_assignment",
+            "each script export of inline configuration keeps its specific refusal");
+    }
     const auto prepare_interactive = [&interactive]() {
         Context prepared_interactive;
         prepared_interactive.invocation = {"interactive", {"launch-preparation", 3}, "prepare",

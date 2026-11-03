@@ -54,6 +54,46 @@ bool opencode_program(std::string_view program)
     return name == "opencode" || name == "opencode2";
 }
 
+// Export operands are assignment words. Keep their names separate even when
+// quoted fragments or escaped spaces occur in a value; this does not expand it.
+std::optional<Environment> export_assignments(std::string_view operands)
+{
+    Environment result;
+    std::size_t position = 0;
+    while (position < operands.size()) {
+        if (operands[position] == ' ' || operands[position] == '\t') {
+            ++position;
+            continue;
+        }
+        const auto begin = position;
+        char quote = 0;
+        for (; position < operands.size(); ++position) {
+            const char character = operands[position];
+            if (!quote && (character == ' ' || character == '\t')) break;
+            if (character == '\\' && quote != '\'') {
+                if (++position == operands.size()) return std::nullopt;
+                continue;
+            }
+            if (character == quote) quote = 0;
+            else if (!quote && (character == '\'' || character == '"')) quote = character;
+            else if (quote != '\'' && (character == '`' ||
+                (character == '$' && position + 1 < operands.size() && operands[position + 1] == '(')))
+            {
+                return std::nullopt;
+            }
+            else if (!quote && std::string_view("<>()").find(character) != std::string_view::npos) {
+                return std::nullopt;
+            }
+        }
+        if (quote) return std::nullopt;
+        const auto assignment = addon::environment_assignment(
+            operands.substr(begin, position - begin), Launcher_whitespace::ASCII);
+        if (!assignment) return std::nullopt;
+        result.push_back(*assignment);
+    }
+    return result.empty() ? std::nullopt : std::optional(std::move(result));
+}
+
 std::optional<Launcher_command> recognize(std::string_view script, int depth)
 {
     if (depth == 0) return std::nullopt;
@@ -64,12 +104,16 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
         if (line.empty() || line.starts_with('#') || line.starts_with("//") ||
             lower(line).starts_with("rem ")) continue;
         for (std::string segment : addon::launcher_segments(line, Launcher_whitespace::ASCII)) {
+            if (segment == "export" || segment.starts_with("export ") || segment.starts_with("export\t")) {
+                const auto assignments = export_assignments(std::string_view(segment).substr(6));
+                if (!assignments) return std::nullopt;
+                inherited.insert(inherited.end(), assignments->begin(), assignments->end());
+                continue;
+            }
             const std::string normalized = lower(segment);
             std::optional<std::pair<std::string, std::string>> standalone;
             if (normalized.starts_with("set ")) standalone = addon::environment_assignment(
                 segment.substr(4), Launcher_whitespace::ASCII);
-            else if (normalized.starts_with("export ")) standalone = addon::environment_assignment(
-                segment.substr(7), Launcher_whitespace::ASCII);
             else if (normalized.starts_with("$env:")) standalone = addon::environment_assignment(
                 segment.substr(5), Launcher_whitespace::ASCII);
             if (standalone) {
