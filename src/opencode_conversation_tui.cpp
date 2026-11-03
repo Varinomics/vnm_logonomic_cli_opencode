@@ -52,7 +52,7 @@ bool attachment(Message& message, const Json& file, bool prompt)
     if (!mime.is_string() || (name && !name->is_string())) {
         return false;
     }
-    std::string reference;
+    std::string_view reference;
     if (prompt) {
         const auto& source = json::member(file, "source");
         const auto type = json::text(source, "type");
@@ -64,7 +64,7 @@ bool attachment(Message& message, const Json& file, bool prompt)
         }
         else
         if (type == "uri" && json::member(source, "uri").is_string()) {
-            reference = json::text(source, "uri");
+            reference = json::member(source, "uri").as_string();
         }
         else {
             return false;
@@ -74,7 +74,7 @@ bool attachment(Message& message, const Json& file, bool prompt)
         if (!json::member(file, "uri").is_string()) {
             return false;
         }
-        reference = json::text(file, "uri");
+        reference = json::member(file, "uri").as_string();
     }
     if (data_uri(reference)) {
         reference = "[Embedded attachment; binary data not copied]";
@@ -83,7 +83,8 @@ bool attachment(Message& message, const Json& file, bool prompt)
     if (name) {
         description += "\n" + name->as_string();
     }
-    description += "\n" + reference;
+    description += '\n';
+    description += reference;
     message.content.push_back({Kind::ATTACHMENT, std::move(description), {}, prompt});
     return !prompt || optional_text(message, file, "description", "Attachment description");
 }

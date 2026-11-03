@@ -330,7 +330,7 @@ bool apply_update(
             *result_message_id = message_id;
             result->clear();
         }
-        result->append(text(member(member(update, "content"), "text")));
+        result->append(member(member(update, "content"), "text").as_string());
         return result->size() <= k_max_result_bytes;
     }
     if (type == "agent_thought_chunk") {

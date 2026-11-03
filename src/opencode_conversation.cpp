@@ -43,7 +43,7 @@ Statement query(sqlite3* database, const char* sql, std::string_view identity,
     return statement;
 }
 
-std::optional<std::string> column(sqlite3_stmt* statement, int index, addon::Contract_failure* failure)
+std::optional<std::string_view> column_view(sqlite3_stmt* statement, int index, addon::Contract_failure* failure)
 {
     if (sqlite3_column_type(statement, index) != SQLITE_TEXT) {
         fail(failure, "conversation_content_unavailable", "An OpenCode conversation record is not retained text.");
@@ -54,12 +54,18 @@ std::optional<std::string> column(sqlite3_stmt* statement, int index, addon::Con
         fail(failure, "conversation_source_unavailable", "The OpenCode conversation could not be read.");
         return {};
     }
-    return std::string(bytes, static_cast<std::size_t>(sqlite3_column_bytes(statement, index)));
+    return std::string_view(bytes, static_cast<std::size_t>(sqlite3_column_bytes(statement, index)));
+}
+
+std::optional<std::string> column(sqlite3_stmt* statement, int index, addon::Contract_failure* failure)
+{
+    const auto bytes = column_view(statement, index, failure);
+    return bytes ? std::optional(std::string(*bytes)) : std::nullopt;
 }
 
 std::optional<Json> json_column(sqlite3_stmt* statement, int index, addon::Contract_failure* failure)
 {
-    const auto bytes = column(statement, index, failure);
+    const auto bytes = column_view(statement, index, failure);
     if (!bytes) {
         return {};
     }
@@ -232,7 +238,7 @@ bool tui_messages(sqlite3* database, std::string_view session, const Revert& rev
         auto target = query(database,
             "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2", session, failure);
         if (!target || sqlite3_bind_text(target.get(), 2, revert.message.data(),
-                static_cast<int>(revert.message.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
+                static_cast<int>(revert.message.size()), SQLITE_STATIC) != SQLITE_OK ||
             sqlite3_step(target.get()) != SQLITE_ROW || sqlite3_column_type(target.get(), 0) != SQLITE_INTEGER)
         {
             return fail(failure, "conversation_branch_unavailable", "The OpenCode revert boundary is not retained.");

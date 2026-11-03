@@ -123,18 +123,22 @@ export async function create_wake_bridge(native, registration_file) {
       clearTimeout(deadline)
       sockets.delete(socket)
     })
-    let bytes = Buffer.alloc(0)
+    const chunks = []
+    let byte_count = 0
     let received = false
     socket.on("data", (chunk) => {
       if (received) { socket.destroy(); return }
-      if (bytes.length + chunk.length > max_request_bytes) { socket.destroy(); return }
-      bytes = Buffer.concat([bytes, chunk])
-      const newline = bytes.indexOf(10)
+      if (byte_count + chunk.length > max_request_bytes) { socket.destroy(); return }
+      chunks.push(chunk)
+      byte_count += chunk.length
+      const newline = chunk.indexOf(10)
       if (newline < 0) return
       received = true
-      if (newline !== bytes.length - 1) { socket.destroy(); return }
+      if (newline !== chunk.length - 1) { socket.destroy(); return }
+      const bytes = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, byte_count)
+      chunks.length = 0
       let request
-      try { request = JSON.parse(bytes.subarray(0, newline).toString("utf8")) }
+      try { request = JSON.parse(bytes.subarray(0, byte_count - 1).toString("utf8")) }
       catch { socket.destroy(); return }
       void dispatch(request).then(
         (response) => socket.end(`${JSON.stringify(response)}\n`),

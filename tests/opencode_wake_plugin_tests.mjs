@@ -76,6 +76,20 @@ try {
     })
   })
   const inspect = () => send({ operation: "inspect" })
+  const send_bytes = (chunks) => new Promise((resolve, reject) => {
+    const socket = connect(binding.port, "127.0.0.1")
+    let response = ""
+    socket.on("error", reject)
+    socket.on("connect", async () => {
+      for (const chunk of chunks) {
+        if (socket.destroyed) break
+        socket.write(chunk)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    })
+    socket.on("data", (chunk) => { response += chunk.toString("utf8") })
+    socket.on("close", () => resolve(response))
+  })
   const notify = (notification_id) => send({
     operation: "notify", notification_id,
     instruction: "Read the new message in your Logonomic mailbox.",
@@ -109,6 +123,23 @@ try {
   assert.equal((await notify("busy")).disposition, "deferred")
   complete()
   assert.deepEqual(await inspect(), { available: true })
+  const framed = Buffer.from(`${JSON.stringify({
+    ...binding, provider_session_id: "ses_recipient", transition_nonce: "d".repeat(32),
+    operation: "inspect", padding: "résumé",
+  })}\n`)
+  const split = framed.indexOf(Buffer.from("é")) + 1
+  assert.deepEqual(JSON.parse(await send_bytes([
+    framed.subarray(0, split), framed.subarray(split, framed.length - 1), framed.subarray(-1),
+  ])), { available: true }, "fragmented UTF-8 and a separate newline preserve the request")
+  const at_limit = Buffer.concat([
+    framed.subarray(0, framed.length - 1), Buffer.alloc(32768 - framed.length, 32), Buffer.from("\n"),
+  ])
+  assert.deepEqual(JSON.parse(await send_bytes([at_limit])), { available: true })
+  assert.equal(await send_bytes([at_limit.subarray(0, at_limit.length - 1), Buffer.from(" \n")]), "",
+    "the byte limit includes the final newline")
+  assert.equal(await send_bytes([Buffer.concat([framed, framed])]), "",
+    "two records on one connection are rejected")
+  assert.equal(await send_bytes([Buffer.from("{\n")]), "", "malformed JSON is rejected")
   assert.equal((await send({ operation: "inspect", token: "0".repeat(64) })).error, "invalid_binding")
   assert.equal((await send({ operation: "inspect", instance_id: "retired" })).error, "invalid_binding")
   assert.equal((await send({ operation: "inspect", provider_session_id: "ses_other" })).reason,
