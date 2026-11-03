@@ -238,7 +238,7 @@ bool tui_messages(sqlite3* database, std::string_view session, const Revert& rev
         auto target = query(database,
             "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2", session, failure);
         if (!target || sqlite3_bind_text(target.get(), 2, revert.message.data(),
-                static_cast<int>(revert.message.size()), SQLITE_TRANSIENT) != SQLITE_OK ||
+                static_cast<int>(revert.message.size()), SQLITE_STATIC) != SQLITE_OK ||
             sqlite3_step(target.get()) != SQLITE_ROW || sqlite3_column_type(target.get(), 0) != SQLITE_INTEGER)
         {
             return fail(failure, "conversation_branch_unavailable", "The OpenCode revert boundary is not retained.");
