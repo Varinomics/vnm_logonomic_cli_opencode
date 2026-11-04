@@ -369,7 +369,8 @@ resetCapture()
 {
   const sessions = new Map([["root-capacity", { id: "root-capacity" }]])
   const plugin = await Logonomic({ client: clientFor(sessions) })
-  await publishRoot(plugin, "root-capacity")
+  // Seed inactive metadata before publishing so a pending helper delivery cannot
+  // turn this cache-eviction fixture into an event-queue overflow.
   for (let index = 0; index < 129; ++index) {
     const id = `capacity-child-${index}`
     const info = {
@@ -384,6 +385,7 @@ resetCapture()
       await new Promise((resolve) => setImmediate(resolve))
     }
   }
+  await publishRoot(plugin, "root-capacity")
   event(plugin, "session.status", {
     sessionID: "capacity-child-0",
     status: { type: "busy" },
