@@ -104,7 +104,12 @@ export function create_event_delivery(deliveryTimeoutMilliseconds, allowed) {
       child.stdin.once("error", () => {
         terminate("the relay input could not be sent")
       })
-      child.stdin.write(JSON.stringify(projected) + "\n")
+      // The prepared locator belongs to this native process, not to a later
+      // launcher resolution used to inspect or resume its saved conversation.
+      const source = process.env.VNM_OPENCODE_EXPORT_SOURCE
+      child.stdin.write(JSON.stringify({
+        ...projected, ...(source ? { native_source: source } : {}),
+      }) + "\n")
       deliveryTimer = setTimeout(
         terminate,
         deliveryTimeoutMilliseconds,

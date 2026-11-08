@@ -1,6 +1,7 @@
 import { create_wake_bridge, wake_identity, wake_unavailable } from "./logonomic_opencode_bridge.mjs"
 import { create_event_delivery } from "./logonomic_opencode_relay.mjs"
 import { Assistant_reply_evidence } from "./logonomic_opencode_reply.mjs"
+import { randomBytes } from "node:crypto"
 
 const max_pending_events = 32
 const delivery_timeout_ms = 47000
@@ -87,6 +88,9 @@ export async function create_tui_integration(context) {
   let bridge
   let pending_snapshot
   let assistant_reply
+  let activation_nonce
+  let execution_sequence = 0
+  let execution_location
 
   function session_family() {
     return new Set([selected, ...(data.session.family?.(selected) ?? [])])
@@ -213,6 +217,9 @@ export async function create_tui_integration(context) {
     if (session.id !== selected) {
       if (selected) bridge?.revoke(selected)
       selected = session.id
+      activation_nonce = randomBytes(16).toString("hex")
+      execution_sequence = 0
+      execution_location = undefined
       turn_id = undefined
       latest_turn_id = undefined
       assistant_reply = undefined
@@ -222,10 +229,20 @@ export async function create_tui_integration(context) {
     }
     // Returning from a hidden route is new readiness evidence. Its helper
     // commit lets the host retry unread messages without changing the nonce.
-    if (changed) relay.enqueue({
+    // Read the selected root's native default location, never an event's
+    // command-local cwd. Capture its activation and order before queueing.
+    const location = session.location && {
+      directory: session.location.directory, workspaceID: session.location.workspaceID,
+    }
+    const location_key = JSON.stringify(location)
+    const moved = execution_location !== location_key
+    if (changed || moved) relay.enqueue({
       event: "logonomic.session.selected", session_id: selected,
       status_type: data.session.status(selected), api_generation: 2,
+      activation_nonce, execution_sequence: execution_sequence++,
+      ...(location ? { native_location: location } : {}),
     })
+    execution_location = location_key
     // Read every pending identity inside the TUI's reactive selection effect,
     // including when the same selected session finishes hydrating or refreshes.
     const snapshot = {

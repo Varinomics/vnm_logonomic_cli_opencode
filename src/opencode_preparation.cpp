@@ -623,6 +623,53 @@ bool opencode_session_id(const addon::Json_value& value)
         std::all_of(text.begin() + 4, text.end(), [](unsigned char c) { return std::isalnum(c) != 0; });
 }
 
+const addon::Json_value* resume_session(const addon::Json_value& record)
+{
+    if (!record.is_object()) return nullptr;
+    const auto* source = record.find("source");
+    const auto* session = record.find("provider_session_id");
+    if (record.as_object().size() != (source ? 2u : 1u) || !session || !opencode_session_id(*session) ||
+        (source && (!source->is_string() || !is_conversation_source(source->as_string()))))
+    {
+        return nullptr;
+    }
+    return session;
+}
+
+bool source_matches(const addon::Json_value& record, const std::optional<std::string>& source)
+{
+    const auto* retained = record.find("source");
+    return !retained || (source && retained->as_string() == *source);
+}
+
+void inspect_resume(addon::Invocation_context& context)
+{
+    addon::Contract_failure failure;
+    const auto request = addon::decode_resume_inspect_request(context.request().payload, &failure);
+    if (!request) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
+        return;
+    }
+    const auto* session = resume_session(request->resume_record);
+    if (!session) {
+        context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
+        return;
+    }
+    addon::Resume_inspect_result result;
+    const auto& launch = request->context;
+    const auto verified = verified_launch(launch.launcher, launch.launcher_argv,
+        launch.launch_environment->effective_environment, launch.working_directory, false, context);
+    if (verified) {
+        const auto source = prepare_conversation_source(launch.launcher, launch.launcher_argv,
+            launch.launch_environment->effective_environment, launch.working_directory, &*verified);
+        if (request->resume_record.find("source") && source && source_matches(request->resume_record, source)) {
+            result = inspect_conversation(*source, session->as_string(), [&context] { return context.cancel_requested(); });
+        }
+    }
+    result.request_digest_hex = addon::resume_inspect_request_digest_hex(*request);
+    context.succeed(addon::encode_resume_inspect_result(result, context.request().capability.version));
+}
+
 void prepare_resume(addon::Invocation_context& context)
 {
     addon::Contract_failure failure;
@@ -633,9 +680,8 @@ void prepare_resume(addon::Invocation_context& context)
     }
     const auto& launch  = request->context;
     const auto& record  = request->resume_record;
-    const auto* session = record.is_object() && record.as_object().size() == 1
-        ? record.find("provider_session_id") : nullptr;
-    if (!session || !opencode_session_id(*session)) {
+    const auto* session = resume_session(record);
+    if (!session) {
         context.fail(addon::Result_status::FAILED, addon::reason::k_resume_record_invalid);
         return;
     }
@@ -656,6 +702,16 @@ void prepare_resume(addon::Invocation_context& context)
     }
     const auto conversation_source = prepare_conversation_source(launch.launcher, launch.launcher_argv,
         launch.launch_environment->effective_environment, launch.working_directory, &*verified);
+    if (!source_matches(record, conversation_source)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_source_unavailable");
+        return;
+    }
+    if (record.find("source") && conversation_source && inspect_conversation(*conversation_source, session->as_string(),
+            [&context] { return context.cancel_requested(); }).availability == addon::Resume_availability::ABSENT)
+    {
+        context.fail(addon::Result_status::UNAVAILABLE, "resume_target_absent");
+        return;
+    }
     if (uses_tui_plugin(verified->version)) {
         const auto invocation = tui_invocation(launch.launcher, launch.launcher_argv,
             launch.launch_environment->effective_environment, launch.working_directory, session->as_string());
@@ -830,6 +886,14 @@ void handle_preparation(addon::Invocation_context& context)
 {
     const auto& request = context.request();
     if (request.capability.capability_id == "interactive-resume" &&
+        request.operation == addon::k_inspect_resume_operation &&
+        (request.capability.version == 3 || request.capability.version == 4))
+    {
+        inspect_resume(context);
+    }
+    else
+    if (request.capability.capability_id == "interactive-resume" &&
+        request.capability.version == 2 &&
         request.operation == addon::k_prepare_resume_operation)
     {
         prepare_resume(context);

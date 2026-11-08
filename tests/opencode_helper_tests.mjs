@@ -60,6 +60,19 @@ try {
   assert.match(deliveries[0].transition_nonce, /^[a-f0-9]{32}$/)
   assert.deepEqual(deliveries[0].event, { name: event.event, body: event })
 
+  const selected = { event: "logonomic.session.selected", session_id: "ses_A",
+    api_generation: 2, status_type: "idle", activation_nonce: "d".repeat(32), execution_sequence: 0 }
+  const selection = run("retry", selected)
+  assert.equal(selection.status, 0, selection.stderr)
+  const selected_deliveries = readFileSync(requests, "utf8").trim().split("\n").map(JSON.parse)
+  assert.deepEqual(selected_deliveries[0], selected_deliveries[1])
+  assert.equal(selected_deliveries[0].transition_nonce, selected.activation_nonce,
+    "the native source binds the transition before asynchronous delivery")
+  assert.equal(run("", { ...selected, execution_sequence: 1 }).status, 0)
+  assert.notEqual(JSON.parse(readFileSync(requests, "utf8").trim()).transition_nonce, selected.activation_nonce,
+    "later cwd facts retain source attribution without reusing a transition nonce for different evidence")
+  assert.equal(run("", { ...selected, activation_nonce: "invalid" }).status, 2)
+
   const refused = run("refuse")
   assert.equal(refused.status, 1)
   assert.deepEqual(JSON.parse(refused.stdout), { accepted: false, reason: "retired_session" })

@@ -1,4 +1,5 @@
 #include "opencode_lifecycle.h"
+#include "opencode_conversation.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/context_state.h>
@@ -34,6 +35,64 @@ std::optional<std::string> metadata(const addon::Json_value& body, std::string_v
         return std::nullopt;
     }
     return trimmed;
+}
+
+void retain_resume_record(addon::Lifecycle_observation& observation, const addon::Json_value& body)
+{
+    addon::Json_value record = addon::Json_value::object();
+    record.set("provider_session_id", addon::Json_value(observation.provider_session_id));
+    const auto* source = body.find("native_source");
+    if (source && source->is_string() && is_conversation_source(source->as_string())) {
+        record.set("source", *source);
+    }
+    observation.resume_record = std::move(record);
+}
+
+void selected_directory(const addon::Classify_event_request& request, const std::string& session,
+    bool transition, addon::Classify_event_result& result)
+{
+    if (request.execution_context_version != addon::k_execution_context_version ||
+        request.execution_failure)
+    {
+        return;
+    }
+    const auto& body = request.event.body;
+    const auto* nonce = body.find("activation_nonce");
+    const auto* sequence = body.find("execution_sequence");
+    if (!nonce || !nonce->is_string() || !addon::is_valid_transition_nonce_hex(nonce->as_string()) ||
+        !sequence || !sequence->is_integer() || sequence->as_integer() < 0)
+    {
+        return;
+    }
+    // Never attach delayed source evidence to whichever activation happens
+    // to be current when this helper delivery reaches the host.
+    const auto& expected = transition ? request.transition_nonce : request.ledger.current_transition->nonce;
+    if (nonce->as_string() != expected) {
+        return;
+    }
+    addon::Execution_context_update update;
+    update.provider_session_id = session;
+    update.transition_nonce = nonce->as_string();
+    update.sequence = static_cast<std::uint64_t>(sequence->as_integer());
+    update.source = "opencode_tui_session_location";
+    const auto* location = body.find("native_location");
+    if (location && location->is_object()) {
+        const auto* workspace = location->find("workspaceID");
+        const auto* directory = location->find("directory");
+        if (workspace && workspace->is_string() && !workspace->as_string().empty()) {
+            update.status = addon::Execution_context_status::UNAVAILABLE;
+            update.environment = "unsupported";
+        }
+        else
+        if (!workspace && directory && directory->is_string() &&
+            addon::is_execution_local_path(directory->as_string()))
+        {
+            update.status = addon::Execution_context_status::CONFIRMED;
+            update.environment = "local";
+            update.cwd = directory->as_string();
+        }
+    }
+    result.execution_updates.push_back(std::move(update));
 }
 
 std::optional<addon::Classify_event_result> classify(const addon::Classify_event_request& request)
@@ -95,6 +154,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         observation.provider_session_id = *session;
         observation.session_transition  = addon::Session_transition::STARTED;
         observation.session_source      = "resume";
+        retain_resume_record(observation, body);
         result.classification = addon::Classification::TRANSITION;
         result.transition     = addon::Transition_kind::START;
         result.observations.push_back(std::move(observation));
@@ -108,6 +168,22 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         if (!native_inbox || !session || !status || (*status != "running" && *status != "idle")) {
             return std::nullopt;
         }
+        const auto* sequence = body.find("execution_sequence");
+        if (sequence && sequence->is_integer() && sequence->as_integer() > 0 &&
+            (!request.ledger.current_transition || request.ledger.current_transition->provider_session_id != *session))
+        {
+            // Later readiness/directory snapshots belong to the selection
+            // captured at sequence zero. They cannot themselves select A
+            // again after the host has moved to B.
+            return result;
+        }
+        const auto* activation = body.find("activation_nonce");
+        if (request.ledger.current_transition && request.ledger.current_transition->provider_session_id == *session &&
+            activation && (!activation->is_string() || activation->as_string() != request.ledger.current_transition->nonce))
+        {
+            // A delayed A observation must not alter a newer activation of A.
+            return result;
+        }
         addon::Lifecycle_observation observation;
         observation.provider_event_name = name;
         observation.provider_session_id = *session;
@@ -117,12 +193,14 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         result.classification = addon::Classification::EVENT;
         if (!request.ledger.current_transition || request.ledger.current_transition->provider_session_id != *session) {
             observation.session_transition = addon::Session_transition::STARTED;
+            retain_resume_record(observation, body);
             result.classification = addon::Classification::TRANSITION;
             // Explicit native selection can return to a session retired by an
             // earlier selection. The host requires RESUME to re-admit that ID.
             result.transition = request.ledger.current_transition
                 ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
         }
+        selected_directory(request, *session, result.classification == addon::Classification::TRANSITION, result);
         result.observations.push_back(std::move(observation));
         return result;
     }
@@ -204,6 +282,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     // new Session; repeated facts must not manufacture fresh host epochs.
     if (!request.ledger.current_transition || request.ledger.current_transition->provider_session_id != *session) {
         observation.session_transition = addon::Session_transition::STARTED;
+        retain_resume_record(observation, body);
         result.classification = addon::Classification::TRANSITION;
         result.transition = addon::Transition_kind::START;
     }
