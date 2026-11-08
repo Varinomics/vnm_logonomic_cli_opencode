@@ -1,0 +1,18 @@
+{
+  "capability_id": "interactive-resume",
+  "version": 4,
+  "payload": {
+    "environment_names": [
+      "OPENCODE_CONFIG_CONTENT",
+      "OPENCODE_DB",
+      "HOME",
+      "USERPROFILE",
+      "XDG_DATA_HOME",
+      "PWD",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}

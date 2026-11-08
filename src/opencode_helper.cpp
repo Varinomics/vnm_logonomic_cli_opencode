@@ -104,7 +104,19 @@ int run_helper(int argc, char** argv)
         return refuse();
     }
     const auto key   = addon::random_nonce_hex();
-    const auto nonce = addon::random_nonce_hex();
+    const auto* activation = event->find("activation_nonce");
+    if (activation && (!activation->is_string() ||
+        !addon::is_valid_transition_nonce_hex(activation->as_string())))
+    {
+        return refuse();
+    }
+    // The TUI captures this nonce when the native root is selected. Reusing
+    // it for that transition binds queued directory evidence to the same
+    // activation, including when the user later returns A -> B -> A.
+    const auto* sequence = event->find("execution_sequence");
+    const bool selection = activation && sequence && sequence->is_integer() && sequence->as_integer() == 0 &&
+        event->find("event")->as_string() == "logonomic.session.selected";
+    const auto nonce = selection ? activation->as_string() : addon::random_nonce_hex();
     const auto cancelled = [watch_parent] { return watch_parent && parent_pipe_closed(); };
     addon::Helper_client client(std::move(*environment), cancelled);
     auto outcome = client.deliver_provider_event(event->find("event")->as_string(), *event, key, nonce);

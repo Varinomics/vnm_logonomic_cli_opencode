@@ -9,18 +9,20 @@ import { createServer } from "node:http"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
 import { delimiter, dirname, join, resolve } from "node:path"
-import { promisify } from "node:util"
+import { promisify, stripVTControlCharacters } from "node:util"
 
-const [executable, package_directory, preparation_executable] = process.argv.slice(2)
+const [executable, package_directory, preparation_executable, event_wrapper] = process.argv.slice(2)
 assert(executable && package_directory && preparation_executable,
   "expected native OpenCode executable, built package directory and native preparation helper")
 const root = await mkdtemp(join(tmpdir(), "opencode2-native-wake-"))
 let registration
 const snapshot_path = join(root, "native.json")
+const event_path = join(root, "lifecycle.jsonl")
+const move_path = join(root, "move.json")
 const initial_text = "Complete the initial native fixture turn without using tools."
 const wake_text = "The sandbox dependency completed. Read this recipient's mailbox context."
 const draft_text = "Preserve this unsent draft: verify the dependency migration."
-const mailbox_identity = "native-recipient-mailbox"
+const mailbox_identity = "a".repeat(64)
 const observer_directory = join(root, "observer")
 const mailbox_script = join(root, "mailbox_context.mjs")
 let child
@@ -51,7 +53,15 @@ const until = async (check, description) => {
     if (result) return result
     await new Promise((resolve) => setTimeout(resolve, 30))
   }
-  throw new Error(`timed out waiting for ${description}: ${output}`)
+  throw new Error(`timed out waiting for ${description}: ${stripVTControlCharacters(output).slice(-4000)}`)
+}
+
+const submit = async (text) => {
+  output = ""
+  child.stdin.write(text)
+  await until(() => stripVTControlCharacters(output).replace(/\s+/g, "").includes(text.replace(/\s+/g, "")),
+    `native input ${text}`)
+  child.stdin.write("\r")
 }
 
 const shell_quote = (value) => process.platform === "win32"
@@ -78,7 +88,9 @@ const model = createServer(async (request, response) => {
       ? { delta: { role: "assistant", tool_calls: [{
           index: 0, id: "call_native_mailbox", type: "function", function: {
             name: "shell", arguments: JSON.stringify({
-              command: `${shell_quote(process.execPath)} ${shell_quote(mailbox_script)}`,
+              // PowerShell needs its call operator before a quoted executable.
+              command: (process.platform === "win32" ? "& " : "") +
+                `${shell_quote(process.execPath)} ${shell_quote(mailbox_script)}`,
             }),
           },
         }] }, finish_reason: null }
@@ -107,7 +119,7 @@ try {
     'process.stdout.write(JSON.stringify({ mailbox: process.env.LOGONOMIC_SESSION_CAPABILITY }))\n')
   await writeFile(join(observer_directory, "tui.mjs"), `
 import { createEffect, createRoot, createSignal } from "solid-js"
-import { renameSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 
 // Native discovery reruns setup when the combined plugin inventory arrives.
 let initial_session
@@ -150,14 +162,21 @@ export default {
     })()
     const session = await initial_session
     context.ui.router.navigate({ type: "session", sessionID: session.id })
-    return () => { stop_events(); dispose() }
+    const move_timer = setInterval(async () => {
+      if (!existsSync(context.options.move)) return
+      const command = JSON.parse(readFileSync(context.options.move, "utf8"))
+      unlinkSync(context.options.move)
+      try { await context.client.session.move(command) }
+      catch (error) { writeFileSync(context.options.move + ".error", String(error)) }
+    }, 50)
+    return () => { clearInterval(move_timer); stop_events(); dispose() }
   },
 }
 `)
   const config_directory = join(root, "config", "opencode")
   await mkdir(config_directory, { recursive: true })
   await writeFile(join(config_directory, "cli.json"), JSON.stringify({ plugins: [{
-    package: observer_directory, options: { snapshot: snapshot_path, directory: root, initial_text },
+    package: observer_directory, options: { snapshot: snapshot_path, move: move_path, directory: root, initial_text },
   }] }))
   await new Promise((resolve, reject) => {
     model.once("error", reject)
@@ -205,6 +224,17 @@ export default {
   assert.equal(JSON.parse(patch.environment.set.OPENCODE_LOGONOMIC_WAKE_REGISTRATION), registration)
   for (const name of patch.environment.unset) delete environment[name]
   Object.assign(environment, patch.environment.set, { LOGONOMIC_SESSION_CAPABILITY: mailbox_identity })
+  if (event_wrapper) {
+    await writeFile(event_path, "")
+    Object.assign(environment, {
+      LOGONOMIC_VNMCTL_PATH: resolve(event_wrapper),
+      LOGONOMIC_PROVIDER_PACKAGE_ID: "logonomic.cli.opencode",
+      LOGONOMIC_PROVIDER_GENERATION_DIGEST: "b".repeat(64),
+      LOGONOMIC_PROVIDER_GENERATION_NONCE: "c".repeat(32),
+      LOGONOMIC_PROVIDER_HELPERS_DIR: join(resolve(package_directory), "helpers"),
+      OPENCODE_TEST_EVENT_CAPTURE: event_path,
+    })
+  }
   child = spawn(patch.argv[0], patch.argv.slice(1), {
     cwd: root, env: environment, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
   })
@@ -263,18 +293,72 @@ export default {
   child.stdin.write("\r")
   await until(async () => {
     const value = await read_json(snapshot_path)
-    return value?.messages.filter((message) => message.type === "user" && message.text === draft_text).length === 1
+    return value?.status === "idle" && value.session?.time.idle > after.session.time.idle &&
+      value.messages.filter((message) => message.type === "user" && message.text === draft_text).length === 1
   }, "original draft submitted unchanged by the fixture user")
+  if (event_wrapper) {
+    const events = async () => (await readFile(event_path, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse)
+    const selections = async () => (await events()).filter((event) => event.event === "logonomic.session.selected")
+    const original = await until(async () => (await selections()).find((event) => event.session_id === session_id),
+      "native initial selection delivered through packaged helper")
+    assert.equal(original.native_location.directory, root)
+    assert.match(original.native_source, /^v2\|/)
+    await submit("/new")
+    await until(async () => (await read_json(snapshot_path))?.route.type === "home", "manual native /new")
+    assert.equal((await selections()).at(-1).session_id, session_id,
+      "home has no new native identity until the next conversation exists")
+    await submit("Create the second native conversation.")
+    const second = await until(async () => {
+      const value = await read_json(snapshot_path)
+      return value?.session?.id !== session_id && value?.status === "idle" && value.session?.outcome === "succeeded" && value
+    }, "new native root after manual /new")
+    const second_selected = await until(async () => (await selections()).find((event) => event.session_id === second.session.id),
+      "new root delivered through packaged helper")
+    assert.notEqual(second_selected.activation_nonce, original.activation_nonce)
+    const title = before.session.title
+    await submit("/sessions")
+    await until(() => output.includes("Search"), "manual native resume picker")
+    // This isolated picker contains B (current/newest) followed by A. Use its
+    // normal navigation key; search completion is asynchronous in the TUI.
+    output = ""
+    child.stdin.write("\u001b[B")
+    await until(() => stripVTControlCharacters(output).includes(title), "previous native root highlighted in picker")
+    child.stdin.write("\r")
+    await until(async () => (await read_json(snapshot_path))?.session?.id === session_id, "manual native return to A")
+    const returned = await until(async () => {
+      const values = await selections()
+      return values.at(-1)?.session_id === session_id && values.at(-1)?.activation_nonce !== original.activation_nonce && values.at(-1)
+    }, "fresh activation delivered before another prompt")
+    assert.equal(returned.execution_sequence, 0)
+    const count = (await selections()).length
+    await submit("/sessions")
+    await until(() => output.includes("Search"), "native resume picker before cancellation")
+    child.stdin.write("\u001b")
+    await until(async () => (await read_json(snapshot_path))?.session?.id === session_id, "cancelled native resume picker")
+    assert.equal((await selections()).length, count, "cancelling a picker does not switch native identity")
+    const moved = join(root, "native-subdirectory")
+    await mkdir(moved)
+    await writeFile(move_path, JSON.stringify({ sessionID: session_id, directory: moved }))
+    await until(async () => (await read_json(snapshot_path))?.session?.location.directory === moved,
+      "accepted same-id native session_move")
+    const directory = await until(async () => (await selections()).find((event) =>
+      event.session_id === session_id && event.native_location?.directory === moved), "native default-directory update delivered")
+    assert.equal(directory.activation_nonce, returned.activation_nonce)
+    assert(directory.execution_sequence > returned.execution_sequence)
+    assert.equal((await read_json(snapshot_path)).messages.filter((message) => message.type === "user").length, 2,
+      "idle resume and directory movement do not manufacture another user prompt")
+  }
   console.log(JSON.stringify({
     native_version: after.version, session_id,
     result: "passed", prepared_by_packaged_adapter: true, global_cli_plugin_preserved: true,
     busy_deferred: true, duplicate_synthetic_messages: 0,
     agent: after.session.agent, model: after.session.model,
     mailbox_environment_preserved: true, draft_preserved: true,
+    ...(event_wrapper ? { manual_new_resume: true, idle_return_before_prompt: true, native_session_move: true } : {}),
   }))
 }
 catch (error) {
-  console.error(output.slice(-12000))
+  console.error(stripVTControlCharacters(output).slice(-4000))
   throw error
 }
 finally {

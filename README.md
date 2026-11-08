@@ -61,6 +61,10 @@ reactive API. This lets Logonomic confirm the resume before the first turn. A la
 that cannot report lifecycle, or whose options could select another session,
 directory or interface or leave out plugins, cannot resume.
 
+[Native conversation changes](docs/live_conversations.md) describes manual
+selection, saved-content inspection, default-directory observations and the
+generation 1 idle-selection limitation.
+
 The optional `session-wake@1` capability wakes an idle existing interactive
 session through its managed plugin's own native SDK client. A private, launch-owned
 loopback bridge binds delivery to that live plugin instance, native session, and
@@ -167,7 +171,7 @@ The optional seed directory supplies only `node_modules`, `package.json` and
 `package-lock.json` to avoid a first-run dependency download; no native profile
 configuration, authentication or history is copied.
 
-`node tests/opencode2_wake_native_tests.mjs <opencode-executable> <package-directory> <opencode2_native_prepare>`
+`node tests/opencode2_wake_native_tests.mjs <opencode-executable> <package-directory> <opencode2_native_prepare> [opencode_fake_vnmctl]`
 qualifies the OpenCode 2 route using the packaged adapter's actual launch
 preparation. It runs an isolated native TUI and fake model, verifies native queue
 admission, duplicate suppression, Plan/model/variant preservation and the
@@ -175,6 +179,9 @@ recipient's test mailbox environment, then submits a pre-existing test draft
 through normal terminal input to check that wake preserved it exactly. A separate
 observer loaded from the existing `cli.json` verifies that user plugins remain
 active. This fixture creates no real mailbox messages and uses no user credentials.
+Supplying the test event wrapper also checks actual manual new/resume selection,
+idle return before another prompt, picker cancellation and native default-directory
+movement through the packaged helper.
 
 The project is C++20 and uses only the standalone SDK, the standard library and
 platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK

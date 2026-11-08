@@ -1,6 +1,7 @@
 #pragma once
 
 #include <logonomic_cli_addon/conversation_export.h>
+#include <logonomic_cli_addon/session_contracts.h>
 
 #include <functional>
 #include <optional>
@@ -15,6 +16,10 @@ namespace addon = logonomic::cli_addon;
 inline constexpr const char* k_export_source_environment = "VNM_OPENCODE_EXPORT_SOURCE";
 
 struct Verified_launch;
+
+bool is_conversation_source(std::string_view source);
+addon::Resume_inspect_result inspect_conversation(std::string_view source, std::string_view session,
+    const std::function<bool()>& cancelled);
 
 std::optional<std::string> prepare_conversation_source(const addon::Launcher_request& launcher,
     const std::vector<std::string>& launcher_argv, const addon::Json_value& effective_environment,

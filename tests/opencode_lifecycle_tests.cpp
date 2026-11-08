@@ -281,11 +281,80 @@ void declared_profile_admits_every_shape(const std::filesystem::path& package)
 
 } // namespace
 
+void execution_observations()
+{
+    auto request = event("logonomic.session.selected", false);
+    auto& body = request.event.body;
+    body.erase("turn_id");
+    body.set("api_generation", addon::Json_value(2));
+    body.set("status_type", addon::Json_value("idle"));
+    body.set("activation_nonce", addon::Json_value(request.transition_nonce));
+    body.set("execution_sequence", addon::Json_value(0));
+    const std::string cwd = addon::path_to_utf8(std::filesystem::temp_directory_path() / "exact subdirectory ");
+    auto location = addon::Json_value::object();
+    location.set("directory", addon::Json_value(cwd));
+    body.set("native_location", location);
+    body.set("native_source", addon::Json_value("v2|" + cwd + "/native.db"));
+    require(classify(request).execution_updates.empty(), "older hosts receive identity without optional directory data");
+    request.execution_context_version = addon::k_execution_context_version;
+    auto result = classify(request);
+    require(result.classification == addon::Classification::TRANSITION && result.execution_updates.size() == 1 &&
+        result.execution_updates.front().status == addon::Execution_context_status::CONFIRMED &&
+        result.execution_updates.front().cwd == cwd && result.execution_updates.front().sequence == 0 &&
+        result.observations.front().resume_record &&
+        result.observations.front().resume_record->find("source")->as_string() == "v2|" + cwd + "/native.db",
+        "idle native selection starts exact root and retains byte-preserving directory and native storage");
+    addon::Execution_context_state state;
+    state.provider_session_id = "session-primary";
+    state.transition_nonce = request.transition_nonce;
+    require(addon::apply_execution_context_update(state, result.execution_updates.front()), "first source fact applies");
+    require(!addon::apply_execution_context_update(state, result.execution_updates.front()), "same source fact is idempotent");
+    request.ledger.current_epoch = 1;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "session-primary", request.transition_nonce};
+    request.transition_nonce = std::string(32, 'f');
+    body.set("execution_sequence", addon::Json_value(1));
+    location.set("directory", addon::Json_value(cwd + "/moved"));
+    body.set("native_location", location);
+    result = classify(request);
+    require(result.classification == addon::Classification::EVENT && !result.transition &&
+        result.execution_updates.front().transition_nonce == state.transition_nonce &&
+        addon::apply_execution_context_update(state, result.execution_updates.front()) && state.cwd == cwd + "/moved",
+        "accepted same-session default-directory change keeps its original activation");
+    request.ledger.current_transition->provider_session_id = "session-other";
+    require(classify(request).classification == addon::Classification::IGNORED,
+        "later A readiness/cwd evidence cannot reopen A after selection of B");
+    request.ledger.current_transition.reset();
+    request.ledger.current_epoch = 0;
+    require(classify(request).classification == addon::Classification::IGNORED,
+        "later directory evidence cannot invent a missing initial selection");
+    request.ledger.current_epoch = 1;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::RESUME, "session-primary", std::string(32, 'a')};
+    request.ledger.current_transition->nonce = std::string(32, 'a');
+    require(classify(request).classification == addon::Classification::IGNORED,
+        "late facts from the first A cannot mutate phase or directory after A to B to A");
+    body.set("activation_nonce", addon::Json_value(std::string(32, 'a')));
+    body.erase("native_location");
+    result = classify(request);
+    require(result.execution_updates.size() == 1 &&
+        result.execution_updates.front().status == addon::Execution_context_status::UNKNOWN,
+        "missing native cwd does not borrow launch or previous activation context");
+    location.set("workspaceID", addon::Json_value("workspace_remote"));
+    body.set("native_location", location);
+    require(classify(request).execution_updates.front().status == addon::Execution_context_status::UNAVAILABLE,
+        "remote workspace paths do not become local execution directories");
+    request.execution_context_version = addon::k_execution_context_version + 1;
+    require(classify(request).execution_updates.empty() && !classify(request).observations.empty(),
+        "optional directory failure does not reject native identity");
+}
+
 int main(int argc, char** argv)
 {
     require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     context_observations(addon::path_from_utf8(argv[1]));
+    execution_observations();
     auto selected = event("logonomic.session.selected", false);
     selected.event.body.erase("turn_id");
     selected.event.body.set("api_generation", addon::Json_value(2));

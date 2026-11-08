@@ -195,6 +195,16 @@ elseif(NOT WIN32)
 endif()
 add_dependencies(opencode_conversation_tests opencode_package)
 add_test(NAME opencode_conversation_tests COMMAND opencode_conversation_tests)
+add_executable(opencode_resume_tests tests/opencode_resume_tests.cpp)
+target_link_libraries(opencode_resume_tests PRIVATE opencode_provider)
+opencode_target(opencode_resume_tests)
+if(MINGW)
+    target_include_directories(opencode_resume_tests PRIVATE "${opencode_sqlite_include}")
+elseif(NOT WIN32)
+    target_link_libraries(opencode_resume_tests PRIVATE SQLite::SQLite3)
+endif()
+add_dependencies(opencode_resume_tests opencode_package)
+add_test(NAME opencode_resume_tests COMMAND opencode_resume_tests "${OPENCODE_PACKAGE_DIRECTORY}")
 add_executable(opencode_conversation_source_tests tests/opencode_conversation_source_tests.cpp)
 target_link_libraries(opencode_conversation_source_tests PRIVATE opencode_provider)
 opencode_target(opencode_conversation_source_tests)
@@ -250,7 +260,7 @@ add_test(NAME opencode_package_conformance COMMAND logonomic_cli_addon_conforman
     "${OPENCODE_PACKAGE_DIRECTORY}")
 set_tests_properties(
     opencode_preparation_tests opencode_acp_tests opencode_lifecycle_tests opencode_launcher_tests
-    opencode_conversation_tests opencode_conversation_source_tests
+    opencode_conversation_tests opencode_conversation_source_tests opencode_resume_tests
     opencode_plugin_tests opencode_context_plugin_tests opencode_helper_tests
     opencode_helper_cancellation_tests opencode_wake_plugin_tests opencode_tui_plugin_tests
     opencode_package_validation opencode_package_conformance

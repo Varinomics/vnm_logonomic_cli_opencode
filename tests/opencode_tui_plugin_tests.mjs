@@ -85,6 +85,33 @@ async function attention_events(scenario) {
 }
 
 try {
+  if (process.argv[3] && process.argv[4]) {
+    const facts = await attention_events(async ({ sessions, route, select, event }) => {
+      sessions.set("ses_root", { id: "ses_root", location: { directory: "/native/A exact " } })
+      sessions.set("ses_other", { id: "ses_other", location: { directory: "/native/B" } })
+      sessions.set("ses_child", { id: "ses_child", parentID: "ses_root", location: { directory: "/child" } })
+      await select()
+      await select() // Repeated reactive reads do not manufacture selections.
+      route({ type: "home" })
+      await select()
+      await select("ses_root") // Cancelled picker/home return keeps activation.
+      await select("ses_child")
+      await select("ses_root")
+      await event("session.tool.started", { sessionID: "ses_root", cwd: "/command-only" })
+      sessions.get("ses_root").location = { directory: "/native/A moved" }
+      await select()
+      await select("ses_other")
+      await select("ses_root")
+    })
+    const selected = facts.filter((entry) => entry.event === "logonomic.session.selected")
+    assert.deepEqual(selected.map((entry) => entry.session_id), ["ses_root", "ses_root", "ses_root", "ses_root", "ses_other", "ses_root"])
+    assert.deepEqual(selected.map((entry) => entry.execution_sequence), [0, 1, 2, 3, 0, 0])
+    assert(selected.slice(0, 4).every((entry) => entry.activation_nonce === selected[0].activation_nonce))
+    assert.notEqual(selected[0].activation_nonce, selected[5].activation_nonce)
+    assert.equal(selected[3].native_location.directory, "/native/A moved")
+    assert(!selected.some((entry) => entry.native_location?.directory === "/command-only"))
+    await writeFile(capture, "")
+  }
   let selected = "ses_recipient"
   let route_type = "session"
   let status = "idle"
