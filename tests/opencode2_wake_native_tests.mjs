@@ -88,7 +88,9 @@ const model = createServer(async (request, response) => {
       ? { delta: { role: "assistant", tool_calls: [{
           index: 0, id: "call_native_mailbox", type: "function", function: {
             name: "shell", arguments: JSON.stringify({
-              command: `${shell_quote(process.execPath)} ${shell_quote(mailbox_script)}`,
+              // PowerShell needs its call operator before a quoted executable.
+              command: (process.platform === "win32" ? "& " : "") +
+                `${shell_quote(process.execPath)} ${shell_quote(mailbox_script)}`,
             }),
           },
         }] }, finish_reason: null }
