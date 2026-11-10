@@ -35,15 +35,24 @@ constexpr char k_instruction_name[] = "logonomic-title-instruction.md";
 constexpr char k_plugin_asset[] = "assets/logonomic_opencode_plugin.mjs";
 constexpr char k_tui_plugin_asset[] = "assets/opencode_tui/tui.mjs";
 constexpr char k_changed_files_instruction[] =
-    "When the user asks to bring up, open, show, or inspect files changed in "
-    "this Session and the conversation already supplies repository-relative "
-    "paths, call the `logonomic_show_changed_files` tool exactly once with "
-    "exactly those paths in their existing order. Do not use Git, inspect or "
-    "read files for discovery, call `vnmctl` or its help or discover commands, "
-    "use a shell or Python, create a manifest, check path existence, loop per "
-    "file, retry, or supply repository, Session, title, or authority. Use "
-    "`logonomic_show_changes` only when the conversation supplies exact "
-    "unified-diff hunks.";
+    "When the user asks to show a commit, a revision range, or changes in "
+    "another worktree, or the conversation supplies exact unified-diff "
+    "hunks, call `logonomic_show_changes` exactly once with `manifest_json` "
+    "set to JSON text of the form "
+    "`{\"capability\":\"logonomic.session_diff\",\"version\":1,\"entries\":"
+    "[{\"display_path\":\"<path>\",\"unified_diff\":\"<unified diff>\"}]}` "
+    "with one entry per changed file; when the conversation does not already "
+    "supply the diff, read it with `git diff` or `git show` for that revision "
+    "or worktree. For that request, do not call `vnmctl` or its help, and do "
+    "not retry. Otherwise, when the user asks to bring up, open, show, or "
+    "inspect the current changes of files changed in this Session and the "
+    "conversation already supplies repository-relative paths in this "
+    "Session's launch worktree, call the `logonomic_show_changed_files` tool "
+    "exactly once with exactly those paths in their existing order. For that "
+    "request, do not use Git, inspect or read files for discovery, call "
+    "`vnmctl` or its help or discover commands, use a shell or Python, create "
+    "a manifest, check path existence, loop per file, retry, or supply "
+    "repository, Session, title, or authority.";
 
 bool environment_name_equal(std::string_view left, std::string_view right)
 {

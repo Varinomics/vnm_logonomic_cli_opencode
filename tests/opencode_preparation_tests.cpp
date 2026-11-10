@@ -87,6 +87,14 @@ void instruction_tests(const fs::path& root)
     std::ifstream stream(instruction_path, std::ios::binary);
     const std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
     require(bytes.find("logonomic_show_changed_files") != std::string::npos, "changed-file tool instruction retained");
+    require(bytes.find("launch worktree") != std::string::npos, "changed-file tool instruction names its worktree scope");
+    require(bytes.find("`logonomic_show_changes` exactly once with `manifest_json`") != std::string::npos,
+        "supplied-diff route names its tool and argument");
+    require(bytes.find("`git diff` or `git show`") != std::string::npos, "supplied-diff route permits reading the diff");
+    require(bytes.find("\"capability\":\"logonomic.session_diff\"") != std::string::npos,
+        "supplied-diff route gives the manifest root");
+    require(bytes.find("current changes of files changed in this Session") != std::string::npos,
+        "path route is limited to current changes");
     stream.close();
     std::ofstream altered(instruction_path, std::ios::binary | std::ios::trunc);
     altered << "changed";

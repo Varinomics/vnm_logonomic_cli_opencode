@@ -1362,7 +1362,9 @@ export const Logonomic = async ({ client }, options = {}) => {
       manifest_json: {
         type: "string",
         description:
-          "Exact UTF-8 JSON logonomic.session_diff version 1 manifest.",
+          "Exact UTF-8 JSON logonomic.session_diff version 1 manifest: " +
+          '{"capability":"logonomic.session_diff","version":1,"entries":' +
+          '[{"display_path":"<path>","unified_diff":"<unified diff>"}]}',
       },
     },
     async execute({ manifest_json: manifestJson }, context) {
@@ -1394,8 +1396,10 @@ export const Logonomic = async ({ client }, options = {}) => {
       "repository-relative paths already known from this Session's conversation " +
       "context. Use for requests to bring up, open, show, or inspect modified or " +
       "changed files when context already supplies their paths; this tool presents " +
-      "context-selected paths and does not discover repository status. Shared-file " +
-      "rows can include other Sessions' edits.",
+      "context-selected paths and does not discover repository status. It shows " +
+      "current changes in this Session's launch worktree, not a commit, a " +
+      "revision range or another worktree; use logonomic_show_changes for those. " +
+      "Shared-file rows can include other Sessions' edits.",
     args: {
       paths: {
         type: "array",
