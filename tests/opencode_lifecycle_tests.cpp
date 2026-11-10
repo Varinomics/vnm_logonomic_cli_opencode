@@ -6,6 +6,7 @@
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/sidecar.h>
 
 #include <cstdlib>
@@ -55,14 +56,16 @@ public:
         m_status   = addon::Result_status::SUCCESS;
         m_payload  = std::move(payload);
     }
-    void fail(addon::Result_status status, std::string reason, std::string) override
+    void fail(addon::Result_status status, std::string reason, std::string message) override
     {
         m_finished = true;
         m_status   = status;
         m_failure_reason = std::move(reason);
+        m_failure_message = std::move(message);
     }
     addon::Result_status status() const { return m_status; }
     const std::string& failure_reason() const { return m_failure_reason; }
+    const std::string& failure_message() const { return m_failure_message; }
     std::optional<addon::Classify_event_result> result() const
     {
         addon::Contract_failure failure;
@@ -74,6 +77,7 @@ private:
     addon::Json_value m_payload;
     addon::Result_status m_status = addon::Result_status::FAILED;
     std::string m_failure_reason;
+    std::string m_failure_message;
     bool m_finished  = false;
     bool m_cancelled = false;
 };
@@ -113,6 +117,49 @@ addon::Classify_event_result classify(const addon::Classify_event_request& reque
     auto result = call.result();
     require(result.has_value(), "result must satisfy the public SDK codec");
     return *result;
+}
+
+void failure_diagnostics()
+{
+    const auto verify = [](
+            const addon::Classify_event_request& request,
+            const std::string& field,
+            addon::Provider_event_problem problem)
+        {
+            Classification_call call(request);
+            opencode::handle_lifecycle(call);
+            const auto diagnostic = addon::decode_provider_event_diagnostic(call.failure_message());
+            require(call.status() == addon::Result_status::FAILED &&
+                    call.failure_reason() == "invalid_provider_event" && diagnostic &&
+                    diagnostic->event_name == request.event.name && diagnostic->field == field &&
+                    diagnostic->problem == problem,
+                "classification failure preserves its exact event, field and validation reason");
+            require(call.failure_message().find("private-event-value") == std::string::npos,
+                "classification diagnostics retain no private field values");
+        };
+    auto missing = event("session.error");
+    missing.event.body.erase("turn_id");
+    verify(missing, "turn_id", addon::Provider_event_problem::MISSING);
+    auto wrong_type = event("session.idle");
+    wrong_type.event.body.set("session_id", addon::Json_value());
+    verify(wrong_type, "session_id", addon::Provider_event_problem::WRONG_TYPE);
+    auto control = event("session.idle");
+    control.event.body.set("turn_id", addon::Json_value("private-event-value\nsecond-line"));
+    verify(control, "turn_id", addon::Provider_event_problem::CONTROL_CHARACTER);
+    auto large = event("session.idle");
+    large.event.body.set("turn_id", addon::Json_value(std::string(257, 'x')));
+    verify(large, "turn_id", addon::Provider_event_problem::TOO_LARGE);
+    auto invalid_value = event("session.status");
+    invalid_value.event.body.set("status_type", addon::Json_value("private-event-value"));
+    verify(invalid_value, "status_type", addon::Provider_event_problem::INVALID_VALUE);
+    addon::Attention_classification_request attention;
+    attention.base = invalid_value;
+    Classification_call companion(attention);
+    opencode::handle_lifecycle(companion);
+    const auto diagnostic = addon::decode_provider_event_diagnostic(companion.failure_message());
+    require(companion.status() == addon::Result_status::FAILED && diagnostic &&
+            diagnostic->event_name == "session.status" && diagnostic->field == "status_type",
+        "attention classification keeps the same field diagnostic through its companion envelope");
 }
 
 void context_observations(const std::filesystem::path& package)
@@ -351,6 +398,7 @@ void execution_observations()
 
 int main(int argc, char** argv)
 {
+    failure_diagnostics();
     require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
     context_observations(addon::path_from_utf8(argv[1]));
