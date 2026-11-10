@@ -6,6 +6,7 @@
 #include <logonomic_cli_addon/helper_ingress.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 
 #include <cstddef>
 #include <optional>
@@ -17,6 +18,52 @@ namespace opencode {
 namespace {
 
 namespace addon = logonomic::cli_addon;
+
+void diagnose_field(
+    const addon::Classify_event_request& request,
+    std::string field,
+    addon::Provider_event_problem problem,
+    addon::Provider_event_diagnostic* diagnostic,
+    std::string rule = {})
+{
+    if (diagnostic) {
+        *diagnostic = addon::make_provider_event_diagnostic(
+            request.event.name, field, problem, request.event.body.find(field), {}, std::move(rule));
+    }
+}
+
+void diagnose_metadata(
+    const addon::Classify_event_request& request,
+    const std::string& member,
+    addon::Provider_event_diagnostic* diagnostic,
+    std::size_t limit = addon::limits::k_max_lifecycle_identity_bytes)
+{
+    if (!diagnostic) {
+        return;
+    }
+    const auto* value = request.event.body.find(member);
+    auto problem = addon::Provider_event_problem::MISSING;
+    std::optional<std::uint64_t> size;
+    if (value) {
+        problem = addon::Provider_event_problem::WRONG_TYPE;
+        if (value->is_string()) {
+            const auto& text = value->as_string();
+            const auto begin = text.find_first_not_of(" \t\r\n");
+            problem = addon::Provider_event_problem::EMPTY;
+            if (begin != std::string::npos) {
+                const auto trimmed = text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
+                size = trimmed.size();
+                problem = trimmed.size() > limit ? addon::Provider_event_problem::TOO_LARGE
+                                                : addon::Provider_event_problem::CONTROL_CHARACTER;
+            }
+        }
+    }
+    *diagnostic = addon::make_provider_event_diagnostic(
+        request.event.name, member, problem, value, limit, "trimmed_metadata");
+    if (size) {
+        diagnostic->actual_size = size;
+    }
+}
 
 std::optional<std::string> metadata(const addon::Json_value& body, std::string_view member,
     std::size_t limit = addon::limits::k_max_lifecycle_identity_bytes)
@@ -95,13 +142,19 @@ void selected_directory(const addon::Classify_event_request& request, const std:
     result.execution_updates.push_back(std::move(update));
 }
 
-std::optional<addon::Classify_event_result> classify(const addon::Classify_event_request& request)
+std::optional<addon::Classify_event_result> classify(
+    const addon::Classify_event_request& request, addon::Provider_event_diagnostic* diagnostic)
 {
     const auto& body = request.event.body;
     const std::string& name = request.event.name;
     addon::Classify_event_result result;
     const auto body_name = metadata(body, "event");
-    if (!body_name || *body_name != name) {
+    if (!body_name) {
+        diagnose_metadata(request, "event", diagnostic);
+        return std::nullopt;
+    }
+    if (*body_name != name) {
+        diagnose_field(request, "event", addon::Provider_event_problem::MISMATCH, diagnostic, "event_name");
         return std::nullopt;
     }
     if (request.context_failure) {
@@ -130,7 +183,13 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     if (name == "logonomic.turn_correlation_degraded") {
         const auto session = metadata(body, "session_id");
         const auto cause   = metadata(body, "degradation_type");
-        if (!session || !cause || (*cause != "candidate_capacity" && *cause != "conflicting_confirmation")) {
+        if (!session || !cause) {
+            diagnose_metadata(request, !session ? "session_id" : "degradation_type", diagnostic);
+            return std::nullopt;
+        }
+        if (*cause != "candidate_capacity" && *cause != "conflicting_confirmation") {
+            diagnose_field(request, "degradation_type", addon::Provider_event_problem::INVALID_VALUE,
+                diagnostic, "correlation_degradation");
             return std::nullopt;
         }
         addon::Lifecycle_degradation degradation;
@@ -141,6 +200,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     if (name == "logonomic.session.resumed") {
         const auto session = metadata(body, "session_id");
         if (!session) {
+            diagnose_metadata(request, "session_id", diagnostic);
             return std::nullopt;
         }
         // The managed plugin read the resumed session from the resumed OpenCode's
@@ -165,7 +225,20 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     if (name == "logonomic.session.selected") {
         const auto session = metadata(body, "session_id");
         const auto status  = metadata(body, "status_type");
-        if (!native_inbox || !session || !status || (*status != "running" && *status != "idle")) {
+        if (!native_inbox) {
+            diagnose_field(request, "api_generation", !api_generation ? addon::Provider_event_problem::MISSING
+                    : !api_generation->is_integer() ? addon::Provider_event_problem::WRONG_TYPE
+                                                   : addon::Provider_event_problem::INVALID_VALUE,
+                diagnostic, "native_inbox_generation");
+            return std::nullopt;
+        }
+        if (!session || !status) {
+            diagnose_metadata(request, !session ? "session_id" : "status_type", diagnostic);
+            return std::nullopt;
+        }
+        if (*status != "running" && *status != "idle") {
+            diagnose_field(request, "status_type", addon::Provider_event_problem::INVALID_VALUE,
+                diagnostic, "selection_status");
             return std::nullopt;
         }
         const auto* sequence = body.find("execution_sequence");
@@ -231,6 +304,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     }
     const auto session = metadata(body, "session_id");
     if (!session) {
+        diagnose_metadata(request, "session_id", diagnostic);
         return std::nullopt;
     }
     addon::Lifecycle_observation observation;
@@ -240,6 +314,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     if (child_start || child_stop) {
         const auto agent = metadata(body, "agent_id");
         if (!agent) {
+            diagnose_metadata(request, "agent_id", diagnostic);
             return std::nullopt;
         }
         observation.agent_id = *agent;
@@ -248,6 +323,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         if (body.find("agent_label")) {
             const auto label = metadata(body, "agent_label", addon::limits::k_max_lifecycle_label_bytes);
             if (!label) {
+                diagnose_metadata(request, "agent_label", diagnostic, addon::limits::k_max_lifecycle_label_bytes);
                 return std::nullopt;
             }
             observation.agent_label = *label;
@@ -263,6 +339,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     const bool attention = asked || replied || question_asked || question_replied || question_resolved;
     const auto agent     = attention ? metadata(body, "agent_id") : std::nullopt;
     if (attention && body.find("agent_id") && !agent) {
+        diagnose_metadata(request, "agent_id", diagnostic);
         return std::nullopt;
     }
     if (agent) {
@@ -272,6 +349,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     // identities establish attention without attributing it to a root turn.
     const auto turn = metadata(body, "turn_id");
     if (!turn && ((!native_inbox && !agent) || body.find("turn_id"))) {
+        diagnose_metadata(request, "turn_id", diagnostic);
         return std::nullopt;
     }
     // OpenCode 2 terminal events can be observed after attaching to a run.
@@ -299,7 +377,13 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     else
     if (status) {
         const auto type = metadata(body, "status_type");
-        if (!type || (*type != "busy" && *type != "retry" && *type != "idle")) {
+        if (!type) {
+            diagnose_metadata(request, "status_type", diagnostic);
+            return std::nullopt;
+        }
+        if (*type != "busy" && *type != "retry" && *type != "idle") {
+            diagnose_field(request, "status_type", addon::Provider_event_problem::INVALID_VALUE,
+                diagnostic, "session_status");
             return std::nullopt;
         }
         // Only the first working status for newly confirmed user input can
@@ -319,7 +403,13 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
         observation.phase_evidence   = addon::Evidence::CONFIRMED;
         if (error) {
             const auto type = metadata(body, "error_type");
-            if (!type || (*type != "failed" && *type != "aborted")) {
+            if (!type) {
+                diagnose_metadata(request, "error_type", diagnostic);
+                return std::nullopt;
+            }
+            if (*type != "failed" && *type != "aborted") {
+                diagnose_field(request, "error_type", addon::Provider_event_problem::INVALID_VALUE,
+                    diagnostic, "session_error");
                 return std::nullopt;
             }
             observation.outcome_transition = *type == "aborted"
@@ -330,12 +420,21 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     else
     if (question_asked || question_replied || question_resolved) {
         const auto question = metadata(body, "question_id");
-        if (!question || body.find("question_id")->as_string() != *question) {
+        if (!question) {
+            diagnose_metadata(request, "question_id", diagnostic);
+            return std::nullopt;
+        }
+        if (body.find("question_id")->as_string() != *question) {
+            diagnose_field(request, "question_id", addon::Provider_event_problem::INVALID_VALUE,
+                diagnostic, "untrimmed_identity");
             return std::nullopt;
         }
         if (question_replied) {
             const auto* nonempty = body.find("answer_nonempty");
             if (!nonempty || !nonempty->is_boolean()) {
+                diagnose_field(request, "answer_nonempty", !nonempty ? addon::Provider_event_problem::MISSING
+                        : addon::Provider_event_problem::WRONG_TYPE,
+                    diagnostic, "boolean");
                 return std::nullopt;
             }
         }
@@ -348,6 +447,7 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
     if (!submitted) {
         const auto permission = metadata(body, "permission_id");
         if (!permission) {
+            diagnose_metadata(request, "permission_id", diagnostic);
             return std::nullopt;
         }
         observation.attention_request_id = *permission;
@@ -360,9 +460,9 @@ std::optional<addon::Classify_event_result> classify(const addon::Classify_event
 }
 
 std::optional<addon::Attention_classification_result> classify_attention(
-    const addon::Attention_classification_request& request)
+    const addon::Attention_classification_request& request, addon::Provider_event_diagnostic* diagnostic)
 {
-    const auto base = classify(request.base);
+    const auto base = classify(request.base, diagnostic);
     if (!base) {
         return std::nullopt;
     }
@@ -422,11 +522,13 @@ void handle_lifecycle(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
+    addon::Provider_event_diagnostic diagnostic;
     if (context.request().capability.capability_id == addon::k_attention_kind_capability_id) {
         const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
-        const auto result = request ? classify_attention(*request) : std::nullopt;
+        const auto result = request ? classify_attention(*request, &diagnostic) : std::nullopt;
         if (!result) {
-            context.fail(addon::Result_status::FAILED, request ? "invalid_provider_event" : failure.reason_code);
+            context.fail(addon::Result_status::FAILED, request ? "invalid_provider_event" : failure.reason_code,
+                request ? addon::encode_provider_event_diagnostic(diagnostic) : failure.detail);
         }
         else {
             context.succeed(addon::encode_attention_classification_result(*result));
@@ -435,12 +537,13 @@ void handle_lifecycle(addon::Invocation_context& context)
     }
     const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
     if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
-    const auto result = classify(*request);
+    const auto result = classify(*request, &diagnostic);
     if (!result) {
-        context.fail(addon::Result_status::FAILED, "invalid_provider_event");
+        context.fail(addon::Result_status::FAILED, "invalid_provider_event",
+            addon::encode_provider_event_diagnostic(diagnostic));
         return;
     }
     context.succeed(addon::encode_classify_event_result(*result));
