@@ -589,18 +589,37 @@ std::string parse_version_output(std::string_view output, std::string_view error
     return first->empty() ? *second : *first;
 }
 
-std::optional<bool> delegated_auto_approval(const std::vector<std::string>& literal)
+std::optional<Delegated_launcher_options> delegated_launcher_options(const std::vector<std::string>& literal)
 {
     if (literal.empty() || !opencode_program(literal.front())) {
         return std::nullopt;
     }
-    if (literal.size() == 1) {
-        return false;
+    Delegated_launcher_options options;
+    for (std::size_t index = 1; index < literal.size(); ++index) {
+        const auto& argument = literal[index];
+        if (argument == "--auto") {
+            options.auto_approve = true;
+            continue;
+        }
+        const auto equals = argument.find('=');
+        const auto name = argument.substr(0, equals);
+        if (name != "--model" && name != "-m") {
+            return std::nullopt;
+        }
+        if (equals != std::string::npos) {
+            options.model = argument.substr(equals + 1);
+        }
+        else {
+            if (++index == literal.size() || literal[index].starts_with('-')) {
+                return std::nullopt;
+            }
+            options.model = literal[index];
+        }
+        if (options.model->empty()) {
+            return std::nullopt;
+        }
     }
-    if (literal.size() == 2 && literal[1] == "--auto") {
-        return true;
-    }
-    return std::nullopt;
+    return options;
 }
 
 std::optional<Verified_launch> verified_launch(
@@ -612,8 +631,8 @@ std::optional<Verified_launch> verified_launch(
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
     const auto literal = addon::literal_argv(launcher.script_body);
     if (literal.empty() || !opencode_program(literal.front())) return std::nullopt;
-    const auto auto_approve = delegated_auto_approval(literal);
-    if (delegated && !auto_approve) return std::nullopt;
+    const auto options = delegated_launcher_options(literal);
+    if (delegated && !options) return std::nullopt;
     if (launcher.runner_key == "direct") {
         if (launcher_argv.size() != literal.size() ||
             !std::equal(literal.begin() + 1, literal.end(), launcher_argv.begin() + 1)) return std::nullopt;
@@ -804,7 +823,7 @@ std::optional<Verified_launch> verified_launch(
             if ((!package_version.empty() && cached->second != package_version) ||
                 !version_is_at_least(cached->second, 1, 18, delegated ? 25 : 11)) return std::nullopt;
             return Verified_launch{std::move(launch_argv), cached->second, command->environment,
-                delegated && auto_approve.value_or(false)};
+                delegated && options->auto_approve};
         }
     }
     const auto output = addon::probe(probe_argv, environment, working_directory, timeout_ms, context);
@@ -823,7 +842,7 @@ std::optional<Verified_launch> verified_launch(
         cache[cache_key] = version;
     }
     return Verified_launch{std::move(launch_argv), version, command->environment,
-        delegated && auto_approve.value_or(false)};
+        delegated && options->auto_approve};
 }
 
 } // namespace opencode

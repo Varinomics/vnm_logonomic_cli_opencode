@@ -152,6 +152,7 @@ int main()
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {"delegated-session", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
+        {addon::k_delegated_model_selection_capability_id, addon::k_delegated_model_selection_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {addon::k_execution_context_capability_id, addon::k_execution_context_version},

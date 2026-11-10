@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -83,14 +84,15 @@ void require_permission_reply(const std::string& bytes, const Json& id, const ch
 class Session
 {
 public:
-    explicit Session(const fs::path& attestation, bool auto_approve = false)
+    explicit Session(const fs::path& attestation, bool auto_approve = false,
+        const std::optional<addon::Delegated_model_selection>& selection = std::nullopt)
     {
         const auto path = attestation.u8string();
         Json entry = parse("{\"server_id\":\"task_control\",\"nonce\":\"0123456789abcdef0123456789abcdef\"}");
         entry.set("path", Json(std::string(path.begin(), path.end())));
         m_state = opencode::make_acp_inspection(
             "Implement the requested change", ".", "1.2.3", Json::array(),
-            Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)}), auto_approve).protocol_state;
+            Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)}), auto_approve, selection).protocol_state;
     }
 
     void omit_auto_mode()
@@ -140,6 +142,153 @@ std::string foreign_session(std::string record)
 {
     record.replace(record.find("ses_root"), 8, "ses_foreign");
     return record;
+}
+
+void model_selection_contract(const fs::path& attestation)
+{
+    // OpenCode ACP's model and effort configuration changes are per-session;
+    // each set_config_option response reports the resulting currentValue.
+    const auto options = [](const std::string& model, const std::optional<std::string>& effort) {
+        auto values = parse(R"([{"id":"model","type":"select","currentValue":""}])");
+        values.as_array().front().set("currentValue", Json(model));
+        if (effort) {
+            auto option = parse(R"({"id":"effort","type":"select","currentValue":""})");
+            option.set("currentValue", Json(*effort));
+            values.push_back(std::move(option));
+        }
+        return values;
+    };
+    const auto reply = [](int id, const Json& values) {
+        auto response = parse(R"({"jsonrpc":"2.0","id":0,"result":{}})");
+        response.set("id", Json(id));
+        response.find("result")->set("configOptions", values);
+        if (id == 2) response.find("result")->set("sessionId", Json("ses_root"));
+        return addon::serialize_json(response) + '\n';
+    };
+    const auto update = [](const Json& values) {
+        auto frame = parse(R"({"jsonrpc":"2.0","method":"session/update","params":{)"
+            R"("sessionId":"ses_root","update":{"sessionUpdate":"config_option_update"}}})");
+        frame.find("params")->find("update")->set("configOptions", values);
+        return addon::serialize_json(frame) + '\n';
+    };
+    const auto check_request = [](const addon::Structured_inspect_result& result, const char* name, const char* value) {
+        require(!result.complete && result.stdin_bytes && !result.failure_reason,
+            "selection must emit one native configuration request");
+        const auto request = parse(*result.stdin_bytes);
+        require(request.find("method")->as_string() == "session/set_config_option" &&
+            request.find("params")->find("sessionId")->as_string() == "ses_root" &&
+            request.find("params")->find("configId")->as_string() == name &&
+            request.find("params")->find("value")->as_string() == value &&
+            result.stdin_bytes->find("Implement the requested change") == std::string::npos,
+            "the exact native selection must precede task input");
+    };
+    const addon::Delegated_model_selection selected{"provider/requested-model", "future-effort"};
+    const auto initial = reply(2, options("provider/default-model", "default"));
+    const auto model = options(*selected.model, "default");
+    const auto complete = options(*selected.model, *selected.reasoning_effort);
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        check_request(session.feed(initial), "model", "provider/requested-model");
+        const auto waiting = session.feed(update(model));
+        require(!waiting.complete && !waiting.stdin_bytes,
+            "a native config notification alone cannot acknowledge the request");
+        check_request(session.feed(reply(5, model)), "effort", "future-effort");
+        const auto prompt = session.feed(reply(6, complete));
+        require(prompt.stdin_bytes && parse(*prompt.stdin_bytes).find("method")->as_string() == "session/prompt",
+            "both native acknowledgments release the prompt");
+        session.feed(k_message);
+        session.feed(k_end_turn);
+        require(session.feed(k_closed).result_bytes == "Finished", "selected task retains normal completion");
+    }
+    for (const auto selection : {
+            addon::Delegated_model_selection{selected.model, std::nullopt},
+            addon::Delegated_model_selection{std::nullopt, selected.reasoning_effort}})
+    {
+        Session session(attestation, false, selection);
+        session.feed(k_initialize);
+        const bool model_only = selection.model.has_value();
+        check_request(session.feed(initial), model_only ? "model" : "effort",
+            model_only ? "provider/requested-model" : "future-effort");
+        const auto prompt = session.feed(reply(model_only ? 5 : 6,
+            options(model_only ? *selected.model : "provider/default-model",
+                model_only ? "default" : *selected.reasoning_effort)));
+        require(prompt.stdin_bytes && parse(*prompt.stdin_bytes).find("method")->as_string() == "session/prompt",
+            "one requested field needs only its own native acknowledgment");
+    }
+    for (const auto& rejected : {
+            reply(5, options("provider/substituted-model", "default")),
+            std::string("{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32602,\"message\":\"Unavailable model\"}}\n")})
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        const auto result = session.feed(rejected);
+        require(result.failure_reason == "model_selection_unavailable" && !result.stdin_bytes,
+            "native model refusal or substitution cannot run the task on a default");
+    }
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        require(session.feed(k_new).failure_reason == "model_selection_unavailable",
+            "a native session without model configuration refuses that capability");
+    }
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        require(session.feed(reply(5, options(*selected.model, std::nullopt))).failure_reason ==
+            "reasoning_effort_unavailable", "a model without effort configuration refuses effort");
+    }
+    for (const auto& rejected : {
+            reply(6, options("provider/changed-model", *selected.reasoning_effort)),
+            reply(6, options(*selected.model, "substituted-effort")),
+            std::string("{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32602,\"message\":\"Unavailable effort\"}}\n")})
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        session.feed(reply(5, model));
+        const auto refused = session.feed(rejected);
+        require(refused.failure_reason == "reasoning_effort_unavailable" && !refused.stdin_bytes,
+            "effort refusal or substitution cannot run the task with different settings");
+    }
+    {
+        Session session(attestation, false, addon::Delegated_model_selection{std::nullopt, selected.reasoning_effort});
+        session.feed(k_initialize);
+        session.feed(initial);
+        const auto refused = session.feed(reply(6, options("provider/changed-model", *selected.reasoning_effort)));
+        require(refused.failure_reason == "reasoning_effort_unavailable" && !refused.stdin_bytes,
+            "effort-only selection must retain the observed default model");
+    }
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        const auto early = session.feed(reply(5, model) + reply(6, complete));
+        require(early.failure_reason == "reasoning_effort_unavailable" && !early.stdin_bytes,
+            "an effort response cannot acknowledge an unsent request");
+    }
+    const auto model_response = update(model) + reply(5, model);
+    for (std::size_t split = 1; split < model_response.size(); ++split) {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        const auto first = session.feed(model_response.substr(0, split));
+        const auto second = session.feed(model_response.substr(split));
+        require(!first.complete && !second.complete && !first.failure_reason && !second.failure_reason,
+            "fragmented config notifications and acknowledgments retain their causal order");
+        const auto emitted = first.stdin_bytes.value_or("") + second.stdin_bytes.value_or("");
+        require(parse(emitted).find("params")->find("configId")->as_string() == "effort",
+            "fragmented model response emits exactly one effort request");
+    }
+    {
+        Session session(attestation, false, selected);
+        session.feed(k_initialize);
+        session.feed(initial);
+        require(session.feed(foreign_session(update(model))).failure_reason == "acp_unauthenticated_notification",
+            "config notifications must belong to the selected native session");
+    }
 }
 
 void run(const fs::path& attestation)
@@ -709,6 +858,7 @@ int main()
     std::ofstream(attestation, std::ios::binary) << "0123456789abcdef0123456789abcdef";
     int status = 0;
     try {
+        model_selection_contract(attestation);
         run(attestation);
     }
     catch (const std::exception& error) {

@@ -502,6 +502,48 @@ int main(int argc, char** argv)
             "the selected auto mode reaches the delegated permission responder");
         check(applied_config(auto_result->process.environment) == user_config,
             "the delegated host expands no user settings and keeps explicit native denies and asks");
+        check(!auto_result->model_selection && state && !state->find("model_selection"),
+            "an ordinary delegation keeps the native default-selection path");
+    }
+    for (const auto& saved_options : std::vector<std::vector<std::string>>{
+            {"--model", "provider/saved-model"}, {"--model=provider/saved-model"},
+            {"-m", "provider/earlier-model", "-m=provider/saved-model"}})
+    {
+        for (const auto& selection : {
+                std::optional<addon::Delegated_model_selection>{},
+                std::optional<addon::Delegated_model_selection>{{"provider/requested-model", "native-effort"}},
+                std::optional<addon::Delegated_model_selection>{{std::nullopt, "native-effort"}}})
+        {
+            auto selected = automatic;
+            selected.model_selection = selection;
+            for (const auto& option : saved_options) {
+                selected.context.launcher.script_body += " " + option;
+                selected.context.launcher_argv.push_back(option);
+            }
+            Context selected_context;
+            selected_context.invocation = prepared.invocation;
+            selected_context.invocation.payload = addon::encode_delegated_prepare_request(selected);
+            opencode::handle_preparation(selected_context);
+            const auto selected_result = selected_context.payload
+                ? addon::decode_delegated_prepare_result(*selected_context.payload, &failure) : std::nullopt;
+            check(selected_result.has_value(), "saved model options retain a delegatable launcher");
+            if (!selected_result) continue;
+            const auto state = addon::parse_json(selected_result->inspection.protocol_state, {}, nullptr);
+            const auto* model = state ? state->find("model_selection") : nullptr;
+            const auto effective_selection = model
+                ? addon::decode_delegated_model_selection(*model, &failure) : std::nullopt;
+            check(effective_selection && effective_selection->model ==
+                    (selection && selection->model ? selection->model : std::optional<std::string>{"provider/saved-model"}) &&
+                effective_selection->reasoning_effort == (selection ? selection->reasoning_effort : std::nullopt),
+                "requested native fields override only their saved defaults");
+            const auto* approve = state ? state->find("auto_approve") : nullptr;
+            check(auto_result && selected_result->model_selection == selection &&
+                selected_result->process.environment == auto_result->process.environment &&
+                selected_result->process.environment_names == auto_result->process.environment_names &&
+                selected_result->process.argv == auto_result->process.argv &&
+                approve && approve->is_boolean() && approve->as_boolean(),
+                "selection preserves the selected executable, profile and launcher permissions");
+        }
     }
     check(!opencode::verified_launch(automatic.context.launcher, {program_text},
         automatic.context.launch_environment->effective_environment, path_string(root), true, context),
@@ -524,7 +566,7 @@ int main(int argc, char** argv)
     opencode::handle_preparation(unsupported_generation);
     check(!unsupported_generation.payload && unsupported_generation.reason == "opencode_acp_generation_unavailable",
         "the distinct native TUI generation keeps its existing delegated integration limit");
-    for (const auto* option : {"--model=provider/model", "--auto=false", "--no-auto"}) {
+    for (const auto* option : {"--model", "--model=", "--auto=false", "--no-auto"}) {
         auto unsupported = delegated;
         unsupported.context.launcher.script_body += " " + std::string(option);
         unsupported.context.launcher_argv.push_back(option);
@@ -1123,9 +1165,9 @@ int main(int argc, char** argv)
         "a wrapper with multiple different native targets cannot establish launch identity");
     set_host_directory(addon::k_env_package_root, addon::path_from_utf8(saved_package_root));
     set_host_directory(addon::k_env_scratch_dir, addon::path_from_utf8(saved_scratch));
-    launcher.script_body += " --model selected";
-    check(!opencode::verified_launch(launcher, {program_text, "--model", "selected"}, effective,
-        path_string(root), true, context), "delegation refuses changed stock argv");
+    launcher.script_body += " --agent custom";
+    check(!opencode::verified_launch(launcher, {program_text, "--agent", "custom"}, effective,
+        path_string(root), true, context), "delegation refuses unsupported launcher options");
     std::error_code cleanup_error;
     fs::remove_all(root, cleanup_error);
     check(!cleanup_error, "fixture cleanup");

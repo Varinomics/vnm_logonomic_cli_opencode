@@ -780,7 +780,8 @@ void prepare_delegated(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, "invalid_implementation_request");
         return;
     }
-    if (!delegated_auto_approval(addon::literal_argv(request->context.launcher.script_body))) {
+    const auto options = delegated_launcher_options(addon::literal_argv(request->context.launcher.script_body));
+    if (!options) {
         context.fail(addon::Result_status::UNAVAILABLE, "delegated_launcher_options_unavailable");
         return;
     }
@@ -806,6 +807,19 @@ void prepare_delegated(addon::Invocation_context& context)
     }
     addon::Delegated_prepare_result result;
     result.profile_storage = request->context.profile_storage;
+    result.model_selection = request->model_selection;
+    auto selection = request->model_selection;
+    if (options->model && (!selection || !selection->model)) {
+        if (!selection) {
+            selection.emplace();
+        }
+        selection->model = options->model;
+    }
+    const addon::Delegated_model_selection_declaration selection_support{true, true};
+    if (selection && !addon::validate_delegated_model_selection(*selection, &selection_support, &failure)) {
+        context.fail(addon::Result_status::UNAVAILABLE, failure.reason_code, failure.detail);
+        return;
+    }
     auto servers = addon::Json_value::array();
     auto attestations = addon::Json_value::array();
     auto task_tools = addon::Json_value::array();
@@ -870,7 +884,7 @@ void prepare_delegated(addon::Invocation_context& context)
     });
     result.inspection = make_acp_inspection(
         request->prompt, request->context.working_directory, launch->version, servers, attestations, task_tools,
-        launch->auto_approve);
+        launch->auto_approve, selection);
     result.inspection.keep_stdin_open = true;
     auto payload = addon::encode_delegated_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {

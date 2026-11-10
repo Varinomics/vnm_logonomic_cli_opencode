@@ -23,6 +23,15 @@ still apply before a request is emitted. OpenCode fails a rejected tool call
 and continues the turn. A task that needs other tools therefore needs a
 configuration that allows them or the user's explicit `--auto` choice.
 
+Delegated ACP tasks accept provider-native model and reasoning-effort values
+through `delegated-model-selection@1`. A saved `--model` or `-m` supplies the
+default model; a requested model overrides it for that task. The package sets
+the native session's model first and effort second, and requires OpenCode to
+acknowledge the exact values before submitting the prompt. An unavailable model,
+effort or native configuration option refuses the task. Omitted fields retain
+the native defaults, and saved launchers and configuration files remain unchanged.
+The OpenCode 2 TUI integration retains its existing delegated ACP limitation.
+
 The ACP client advertises no filesystem capability. Valid native
 `fs/write_text_file` requests receive JSON-RPC `-32601`; OpenCode owns the
 approved edit. OpenCode 1.18.33 reports that refusal on stderr but completes

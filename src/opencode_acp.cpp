@@ -266,6 +266,57 @@ bool new_session_response(const Json& result, std::string* session_id)
     return true;
 }
 
+std::optional<std::string> configuration_value(const Json& options, std::string_view id)
+{
+    if (!options.is_array()) {
+        return std::nullopt;
+    }
+    std::optional<std::string> value;
+    for (const auto& option : options.as_array()) {
+        if (text(member(option, "id")) != id) {
+            continue;
+        }
+        if (value || text(member(option, "type")) != "select" ||
+            !member(option, "currentValue").is_string())
+        {
+            return std::nullopt;
+        }
+        value = member(option, "currentValue").as_string();
+    }
+    return value;
+}
+
+bool selection_confirmed(const Json& options, const addon::Delegated_model_selection& selection)
+{
+    return (!selection.model || configuration_value(options, "model") == selection.model) &&
+        (!selection.reasoning_effort || configuration_value(options, "effort") == selection.reasoning_effort);
+}
+
+std::string configure_input(Json& state, bool model, const std::string& value)
+{
+    state.set("stage", Json(model ? "await_model" : "await_effort"));
+    return json_line(object({
+        {"jsonrpc", Json("2.0")}, {"id", Json(model ? 5 : 6)}, {"method", Json("session/set_config_option")},
+        {"params", object({
+            {"sessionId", member(state, "session_id")},
+            {"configId", Json(model ? "model" : "effort")}, {"value", Json(value)},
+        })},
+    }));
+}
+
+std::string prompt_input(Json& state, const std::string& prompt)
+{
+    state.set("stage", Json("await_prompt"));
+    state.set("prompt_base64", Json(""));
+    return json_line(object({
+        {"jsonrpc", Json("2.0")}, {"id", Json(3)}, {"method", Json("session/prompt")},
+        {"params", object({
+            {"sessionId", member(state, "session_id")},
+            {"prompt", Json(Json::Array{object({{"type", Json("text")}, {"text", Json(prompt)}})})},
+        })},
+    }));
+}
+
 bool usage_valid(const Json& usage)
 {
     if (!only_keys(usage, {"cachedReadTokens", "cachedWriteTokens", "inputTokens",
@@ -319,7 +370,13 @@ bool apply_update(
     }
     const auto type = text(member(update, "sessionUpdate"));
     if (type == "available_commands_update") {
-        return one_of(stage, {"await_new", "await_prompt", "await_close"}) && available_commands(update);
+        return one_of(stage, {"await_new", "await_model", "await_effort", "await_prompt", "await_close"}) &&
+            available_commands(update);
+    }
+    if (type == "config_option_update") {
+        return one_of(stage, {"await_model", "await_effort", "await_prompt"}) &&
+            only_keys(update, {"_meta", "sessionUpdate", "configOptions"}) && valid_meta(update) &&
+            member(update, "configOptions").is_array();
     }
     if (type == "agent_message_chunk") {
         std::string message_id;
@@ -539,9 +596,10 @@ addon::Inspection_setup make_acp_inspection(
     const Json& mcp_servers,
     const Json& attestations,
     const Json& task_tools,
-    bool auto_approve)
+    bool auto_approve,
+    const std::optional<addon::Delegated_model_selection>& model_selection)
 {
-    const auto state = object({
+    auto state = object({
         {"stage", Json("await_initialize")}, {"pending_base64", Json("")},
         {"deferred_input_base64", Json("")}, {"deferred_input_is_request", Json(false)},
         {"deferred_input_has_permission_reply", Json(false)},
@@ -551,6 +609,9 @@ addon::Inspection_setup make_acp_inspection(
         {"permission_ids", Json::array()}, {"mcp_servers", mcp_servers}, {"attestations", attestations},
         {"task_tools", task_tools}, {"announced", Json::array()}, {"auto_approve", Json(auto_approve)},
     });
+    if (model_selection) {
+        state.set("model_selection", addon::encode_delegated_model_selection(*model_selection));
+    }
     addon::Inspection_setup setup;
     setup.incremental    = true;
     setup.protocol_state = addon::serialize_json(state);
@@ -583,15 +644,23 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             Json(!text(member(*parsed_state, "deferred_input_base64")).empty()));
     }
     if (!parsed_state ||
-        !exact_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
+        !only_keys(*parsed_state, {"stage", "pending_base64", "prompt_base64", "session_id",
                                   "working_directory", "provider_version", "result_base64",
                                   "result_message_id", "permission_ids", "mcp_servers", "attestations",
                                   "deferred_input_base64", "deferred_input_is_request", "deferred_input_has_permission_reply",
-                                  "task_tools", "announced", "auto_approve"}))
+                                  "task_tools", "announced", "auto_approve", "model_selection"}))
     {
         return failure("acp_invalid_state");
     }
     Json state = std::move(*parsed_state);
+    std::optional<addon::Delegated_model_selection> model_selection;
+    if (const auto* selection = state.find("model_selection")) {
+        addon::Contract_failure contract_failure;
+        model_selection = addon::decode_delegated_model_selection(*selection, &contract_failure);
+        if (!model_selection) {
+            return failure("model_selection_unavailable");
+        }
+    }
     if (!member(state, "stage").is_string() || !member(state, "session_id").is_string() ||
         !member(state, "working_directory").is_string() ||
         !bounded_nonempty(member(state, "provider_version"), 64) ||
@@ -673,6 +742,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             if (next_input_contains_request) {
                 const auto type = text(member(member(member(value, "params"), "update"), "sessionUpdate"));
                 if (type != "available_commands_update" &&
+                    !(model_selection && type == "config_option_update" &&
+                      one_of(stage, {"await_model", "await_effort", "await_prompt"})) &&
                     !(stage == "await_close" && one_of(type, {"usage_update", "session_info_update"})))
                 {
                     return failure("acp_out_of_order_notification");
@@ -683,6 +754,12 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 return failure("acp_unauthenticated_notification");
             }
             const auto& update = member(member(value, "params"), "update");
+            if (text(member(update, "sessionUpdate")) == "config_option_update" &&
+                (!model_selection ||
+                 (stage == "await_prompt" && !selection_confirmed(member(update, "configOptions"), *model_selection))))
+            {
+                return failure("model_selection_unavailable");
+            }
             const auto& tools  = member(state, "task_tools").as_array();
             if (text(member(update, "sessionUpdate")) == "tool_call" &&
                 std::find(tools.begin(), tools.end(), member(update, "title")) != tools.end())
@@ -739,18 +816,59 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             if (prompt_bytes->empty() || !addon::is_valid_utf8(*prompt_bytes)) {
                 return failure("acp_invalid_prompt");
             }
-            state.set("stage", Json("await_prompt"));
             state.set("session_id", Json(session));
-            state.set("prompt_base64", Json(""));
             state.set("mcp_servers", Json::array());
             state.set("attestations", Json::array());
-            next_input = json_line(object({
-                {"jsonrpc", Json("2.0")}, {"id", Json(3)}, {"method", Json("session/prompt")},
-                {"params", object({
-                    {"sessionId", Json(session)},
-                    {"prompt", Json(Json::Array{object({{"type", Json("text")}, {"text", Json(*prompt_bytes)}})})},
-                })},
-            }));
+            const bool select_model = model_selection && model_selection->model;
+            const bool select_effort = model_selection && model_selection->reasoning_effort;
+            if (select_model || select_effort) {
+                if (!configuration_value(member(response_result, "configOptions"), select_model ? "model" : "effort")) {
+                    return failure(select_model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
+                }
+                if (!select_model) {
+                    // Setting effort alone must retain the native session's default model.
+                    model_selection->model = configuration_value(member(response_result, "configOptions"), "model");
+                    const addon::Delegated_model_selection_declaration selection_support{true, true};
+                    addon::Contract_failure contract_failure;
+                    if (!model_selection->model ||
+                        !addon::validate_delegated_model_selection(*model_selection, &selection_support, &contract_failure))
+                    {
+                        return failure("reasoning_effort_unavailable");
+                    }
+                    state.set("model_selection", addon::encode_delegated_model_selection(*model_selection));
+                }
+                next_input = configure_input(state, select_model,
+                    select_model ? *model_selection->model : *model_selection->reasoning_effort);
+            }
+            else {
+                next_input = prompt_input(state, *prompt_bytes);
+            }
+        }
+        else
+        if (stage == "await_model" || stage == "await_effort") {
+            const bool model = stage == "await_model";
+            if (!model_selection || (model && !model_selection->model) ||
+                (!model && !model_selection->reasoning_effort) ||
+                !next_input.empty() || !response(value, model ? 5 : 6, &response_result) ||
+                !only_keys(response_result, {"_meta", "configOptions"}) || !valid_meta(response_result))
+            {
+                return failure(model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
+            }
+            const auto& options = member(response_result, "configOptions");
+            if ((model && configuration_value(options, "model") != model_selection->model) ||
+                (!model && !selection_confirmed(options, *model_selection)))
+            {
+                return failure(model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
+            }
+            if (model && model_selection->reasoning_effort) {
+                if (!configuration_value(options, "effort")) {
+                    return failure("reasoning_effort_unavailable");
+                }
+                next_input = configure_input(state, false, *model_selection->reasoning_effort);
+            }
+            else {
+                next_input = prompt_input(state, *prompt_bytes);
+            }
         }
         else
         if (stage == "await_prompt") {
