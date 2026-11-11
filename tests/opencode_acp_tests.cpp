@@ -201,7 +201,7 @@ void model_selection_contract(const fs::path& attestation)
         session.feed(k_end_turn);
         require(session.feed(k_closed).result_bytes == "Finished", "selected task retains normal completion");
     }
-    for (const auto selection : {
+    for (const auto& selection : {
             addon::Delegated_model_selection{selected.model, std::nullopt},
             addon::Delegated_model_selection{std::nullopt, selected.reasoning_effort}})
     {
