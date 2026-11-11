@@ -45,7 +45,7 @@ void recognize(addon::Invocation_context& context)
         return;
     }
     addon::Launcher_recognition recognition;
-    recognition.recognized = opencode::recognize_launcher(request->launcher.script_body).has_value();
+    recognition.recognized = opencode::recognize_launcher(request->launcher.script_body, request->launcher.runner_key).has_value();
     if (recognition.recognized) {
         recognition.display_name = "OpenCode";
     }

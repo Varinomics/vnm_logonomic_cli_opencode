@@ -28,7 +28,7 @@ struct Verified_launch
     bool                                            auto_approve = false;
 };
 
-std::optional<Launcher_command> recognize_launcher(std::string_view script);
+std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner);
 std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request);
 
 // The launcher arguments after its program that reopen OpenCode session

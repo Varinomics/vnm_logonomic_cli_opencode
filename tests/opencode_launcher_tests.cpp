@@ -278,6 +278,10 @@ int main(int argc, char** argv)
         return 0;
     }
     launcher_approval_contract();
+    check(opencode::recognize_launcher(R"cmd($env:OPENCODE_HOME="D:\profiles\work\"; opencode)cmd",
+        "powershell").has_value(), "PowerShell quoted trailing profile path retains OpenCode recognition");
+    check(opencode::recognize_launcher(R"cmd(opencode D:\src\)cmd", "cmd").has_value(),
+        "cmd trailing argument path retains OpenCode recognition");
     for (const char* script : {
             "opencode --model openai/gpt-5", "npx -y opencode-ai@latest --version",
             "opencode2 --standalone", "npx --yes @opencode/cli@2.1.4", "bunx @opencode/cli",
@@ -285,7 +289,7 @@ int main(int argc, char** argv)
             "\"C:/Program Files/OpenCode/opencode.exe\"", "pwsh -Command \"opencode\"",
             "# comment\nopencode", "echo preparing && opencode"})
     {
-        check(opencode::recognize_launcher(script).has_value(), script);
+        check(opencode::recognize_launcher(script, "bash").has_value(), script);
     }
     for (const char* script : {
             "echo \"ask opencode later\"", "npx @opencode-ai/cli@latest",
@@ -293,22 +297,22 @@ int main(int argc, char** argv)
             "npx --package opencode-ai prettier", "npx -p opencode-ai prettier",
             "bunx --unknown opencode-ai", "rem opencode", "// opencode"})
     {
-        check(!opencode::recognize_launcher(script), script);
+        check(!opencode::recognize_launcher(script, "bash"), script);
     }
     const auto environment = opencode::recognize_launcher(
-        "$env:FIRST='one'; export SECOND=two\nOPENCODE_CONFIG_CONTENT='{\"theme\": \"dark\"}' opencode");
+        "$env:FIRST='one'; export SECOND=two\nOPENCODE_CONFIG_CONTENT='{\"theme\": \"dark\"}' opencode", "bash");
     check(environment && environment->environment.size() == 3 &&
         environment->environment.back().first == "OPENCODE_CONFIG_CONTENT" &&
         environment->environment.back().second == "{\"theme\": \"dark\"}", "assignment preservation");
-    const auto unattached = opencode::recognize_launcher("UNATTACHED=value; opencode");
+    const auto unattached = opencode::recognize_launcher("UNATTACHED=value; opencode", "bash");
     check(unattached && unattached->environment.empty(), "bare assignment stays unbound");
     for (const char* script : {
             "export EXTRA=one unsupported; opencode", "export -p; opencode",
             "export EXTRA='unterminated; opencode", "export EXTRA=$(command); opencode"})
     {
-        check(!opencode::recognize_launcher(script), "unsupported export operands are not assignments");
+        check(!opencode::recognize_launcher(script, "bash"), "unsupported export operands are not assignments");
     }
-    const auto ordinary = opencode::recognize_launcher("exported EXTRA=one; opencode");
+    const auto ordinary = opencode::recognize_launcher("exported EXTRA=one; opencode", "bash");
     check(ordinary && ordinary->environment.empty(), "export requires an exact command word");
     check(addon::literal_argv("\"C:/a b/opencode.exe\" --model test") ==
         std::vector<std::string>{"C:/a b/opencode.exe", "--model", "test"}, "literal host argv");

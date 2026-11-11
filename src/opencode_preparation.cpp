@@ -455,7 +455,7 @@ bool interactive_launcher_admitted(
     addon::Invocation_context&             context,
     bool                                   initial_prompt = false)
 {
-    const auto command = recognize_launcher(launcher.script_body);
+    const auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command || !profile_storage) {
         context.fail(addon::Result_status::UNAVAILABLE,
             initial_prompt ? addon::reason::k_initial_prompt_unavailable : "launcher_unavailable");
@@ -599,7 +599,7 @@ void prepare_interactive(addon::Invocation_context& context)
         finish_interactive(std::move(patch), *request, std::move(initial_invocation), conversation_source, context);
         return;
     }
-    const auto command = recognize_launcher(request->launcher.script_body);
+    const auto command = recognize_launcher(request->launcher.script_body, request->launcher.runner_key);
     if (!launch && (addon::base_name(command->program, addon::Launcher_whitespace::ASCII) == "opencode2" ||
         std::any_of(command->prefix_arguments.begin(), command->prefix_arguments.end(),
             [](const auto& value) { return value == "@opencode/cli" || value.starts_with("@opencode/cli@"); })))

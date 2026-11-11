@@ -94,7 +94,7 @@ std::optional<Environment> export_assignments(std::string_view operands)
     return result.empty() ? std::nullopt : std::optional(std::move(result));
 }
 
-std::optional<Launcher_command> recognize(std::string_view script, int depth)
+std::optional<Launcher_command> recognize(std::string_view script, std::string_view runner, int depth)
 {
     if (depth == 0) return std::nullopt;
     Environment inherited;
@@ -103,7 +103,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
         line = addon::trim(line, Launcher_whitespace::ASCII);
         if (line.empty() || line.starts_with('#') || line.starts_with("//") ||
             lower(line).starts_with("rem ")) continue;
-        for (std::string segment : addon::launcher_segments(line, Launcher_whitespace::ASCII)) {
+        for (std::string segment : addon::launcher_segments(line, runner, Launcher_whitespace::ASCII)) {
             if (segment == "export" || segment.starts_with("export ") || segment.starts_with("export\t")) {
                 const auto assignments = export_assignments(std::string_view(segment).substr(6));
                 if (!assignments) return std::nullopt;
@@ -129,7 +129,7 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                 environment.emplace_back(match[1].str(), addon::unquote(match[2].str(), Launcher_whitespace::ASCII));
                 segment.erase(0, match.length());
             }
-            const auto words = addon::launcher_tokens(segment);
+            const auto words = addon::launcher_tokens(segment, runner);
             std::size_t index = 0;
             while (index < words.size()) {
                 const auto value = addon::environment_assignment(words[index], Launcher_whitespace::ASCII);
@@ -171,7 +171,8 @@ std::optional<Launcher_command> recognize(std::string_view script, int depth)
                         if (!tail.empty()) tail += ' ';
                         tail += words[index];
                     }
-                    auto command = recognize(addon::unquote(tail, Launcher_whitespace::ASCII), depth - 1);
+                    auto command = recognize(addon::unquote(tail, Launcher_whitespace::ASCII),
+                        base == "cmd" ? "cmd" : base == "bash" || base == "sh" ? "bash" : "powershell", depth - 1);
                     if (command) {
                         command->environment.insert(command->environment.begin(), environment.begin(), environment.end());
                         return command;
@@ -264,9 +265,9 @@ std::size_t cmd_argument_characters(const std::vector<std::string>& command)
 
 } // namespace
 
-std::optional<Launcher_command> recognize_launcher(std::string_view script)
+std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner)
 {
-    return recognize(script, 8);
+    return recognize(script, runner, 8);
 }
 
 std::optional<addon::Launcher_candidate> discover_launcher(const addon::Discover_request& request)
@@ -368,7 +369,7 @@ std::optional<std::vector<std::string>> session_launcher_arguments(
     std::string_view                working_directory,
     bool                            native_tui)
 {
-    const auto command = recognize_launcher(launcher.script_body);
+    const auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     const auto literal = addon::literal_argv(launcher.script_body);
     if (!command || !command->prefix_arguments.empty() || !command->environment.empty() ||
         literal.empty() || !opencode_program(literal.front()) ||
@@ -627,7 +628,7 @@ std::optional<Verified_launch> verified_launch(
     const addon::Json_value& effective_environment, std::string_view working_directory,
     bool delegated, addon::Invocation_context& context)
 {
-    auto command = recognize_launcher(launcher.script_body);
+    auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
     const auto literal = addon::literal_argv(launcher.script_body);
     if (literal.empty() || !opencode_program(literal.front())) return std::nullopt;
