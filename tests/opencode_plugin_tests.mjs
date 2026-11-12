@@ -2,7 +2,7 @@
 // projection contract while exercising the packaged SDK helper subprocess.
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -28,14 +28,17 @@ const { Logonomic } = await import(pathToFileURL(resolve(pluginPath)))
 const privateCanary = "PRIVATE_OPENCODE_CHILD_CONTENT_MUST_NOT_LEAK"
 
 const resetCapture = () => writeFileSync(capturePath, "")
-const captured = () => {
-  const text = readFileSync(capturePath, "utf8").trim()
-  return text ? text.split("\n").map(JSON.parse) : []
+const captured = ({ writing = false } = {}) => {
+  const text = readFileSync(capturePath, "utf8")
+  const end = text.lastIndexOf("\n") + 1
+  // A live append can expose its tail before the record's newline is visible.
+  assert(writing || end === text.length, "captured event record is incomplete after delivery settled")
+  return text.slice(0, end).split("\n").slice(0, -1).map(JSON.parse)
 }
 const waitForCapturedLength = async (length) => {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
-    if (captured().length >= length) return
+    if (captured({ writing: true }).length >= length) return
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   assert.fail(`timed out waiting for ${length} captured events`)
@@ -85,6 +88,23 @@ const clientFor = (sessions, failedSessions = new Set()) => ({
     },
   },
 })
+
+{
+  const first = { event: "session.status" }
+  const second = { event: "logonomic.subagent.started", agent_id: "capture-child" }
+  const prefix = '{"event":"logonomic.subagent.started",'
+  writeFileSync(capturePath, JSON.stringify(first) + "\n" + prefix)
+  assert.deepEqual(captured({ writing: true }), [first])
+  assert.throws(() => captured(), /captured event record is incomplete/)
+  appendFileSync(capturePath, '"agent_id":"capture-child"}')
+  assert.deepEqual(captured({ writing: true }), [first], "a record requires its newline")
+  assert.throws(() => captured(), /captured event record is incomplete/)
+  appendFileSync(capturePath, "\n")
+  assert.deepEqual(captured(), [first, second])
+  writeFileSync(capturePath, '{"event":}\n' + prefix)
+  assert.throws(() => captured({ writing: true }), SyntaxError,
+    "a partial tail does not hide a malformed complete record")
+}
 
 resetCapture()
 {
@@ -1069,7 +1089,7 @@ resetCapture()
   const plugin = await resumedPlugin(undefined, "ses_resumed",
     slowClient({ id: "ses_resumed" }, 11_000))
   const deadline = Date.now() + 20_000
-  while (captured().length === 0 && Date.now() < deadline) {
+  while (captured({ writing: true }).length === 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   await settle(plugin)
