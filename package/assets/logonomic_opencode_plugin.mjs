@@ -516,6 +516,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   // A delayed observation of A must retain A's nonce after A -> B -> A.
   const native_model_parents = new Map()
   const native_models = new Map()
+  const native_model_children = new Set()
   let native_model_activation
   let native_model_sequence = 0n
 
@@ -525,10 +526,24 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (removed) {
       native_model_parents.delete(id)
       native_models.delete(id)
+      native_model_children.delete(id)
       if (native_model_activation?.id === id) native_model_activation = undefined
       return
     }
-    if (!native_model_parents.has(id) && native_model_parents.size >= maxChildSessions) return
+    if (!native_model_parents.has(id) && native_model_parents.size >= maxChildSessions + 1) {
+      const retained = new Set([native_model_activation?.id])
+      for (const child of native_model_children) {
+        let ancestor = child
+        for (let depth = 0; ancestor && depth <= maxChildParentDepth; ++depth) {
+          retained.add(ancestor)
+          ancestor = native_model_parents.get(ancestor)
+        }
+      }
+      const inactive = [...native_model_parents.keys()].find((key) => !retained.has(key))
+      if (!inactive) return
+      native_model_parents.delete(inactive)
+      native_models.delete(inactive)
+    }
     native_model_parents.set(id, metadata(info.parentID) ?? "")
   }
 
@@ -537,6 +552,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     native_model_activation = { id, nonce: randomBytes(16).toString("hex") }
     native_model_sequence = 0n
     native_models.clear()
+    native_model_children.clear()
   }
 
   const capture_model_event = (event) => {
@@ -556,6 +572,16 @@ export const Logonomic = async ({ client }, options = {}) => {
       if (!root) return
     }
     if (root !== activation.id) return
+    if (actor !== activation.id) {
+      const starts = event.type === "session.status" &&
+        ["busy", "retry"].includes(event.properties?.status?.type)
+      if (starts && !native_model_children.has(actor)) {
+        if (native_model_children.size >= maxChildSessions) return
+        native_model_children.add(actor)
+        native_models.delete(actor)
+      }
+      if (event.type === "message.updated" && !native_model_children.has(actor)) return
+    }
     if (event.type === "message.updated" && info?.role === "assistant" && info.summary !== true &&
         metadata(info.id) && metadata(info.parentID)) {
       const provider = info.providerID
@@ -580,6 +606,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (actor !== activation.id && (event.type === "session.idle" || event.type === "session.error" ||
         (event.type === "session.status" && event.properties?.status?.type === "idle"))) {
       native_models.delete(actor)
+      native_model_children.delete(actor)
     }
     return captured
   }

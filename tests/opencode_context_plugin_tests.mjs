@@ -70,6 +70,84 @@ assert.deepEqual(measured, [{ event: "message.updated", session_id: "session-roo
   provider_session_id: "session-root", event_id: "evt-usage", used_tokens: 1330, context_window: 4000,
 }] }], "capture native step usage before mutable message updates; summary billing is not occupancy")
 
+const model_facts = await run(async (plugin) => {
+  root(plugin)
+  await plugin["chat.message"]({ sessionID: "session-root" }, {
+    message: { id: "turn-user" }, parts: [{ synthetic: false }],
+  })
+  const root_model = assistant("session-root", usage(), "root-model")
+  event(plugin, "evt-root-model", "message.updated", { info: root_model })
+  root_model.modelID = "mutated-after-observation"
+  event(plugin, "evt-root-start", "session.status", { sessionID: "session-root", status: { type: "busy" } })
+  event(plugin, "evt-child-created", "session.created", { info: { id: "session-child", parentID: "session-root" } })
+  event(plugin, "evt-child-start", "session.status", { sessionID: "session-child", status: { type: "busy" } })
+  event(plugin, "evt-child-model", "message.updated", { info: assistant("session-child", usage(), "child-model") })
+  event(plugin, "evt-child-stop", "session.status", { sessionID: "session-child", status: { type: "idle" } })
+  event(plugin, "evt-child-late-model", "message.updated", {
+    info: assistant("session-child", usage(), "late-stopped-model"),
+  })
+  event(plugin, "evt-child-restart", "session.status", { sessionID: "session-child", status: { type: "busy" } })
+  event(plugin, "evt-child-restop", "session.status", { sessionID: "session-child", status: { type: "idle" } })
+  event(plugin, "evt-summary-model", "message.updated", {
+    info: { ...assistant("session-root", usage(), "summary-model"), summary: true },
+  })
+  root(plugin, "session-other")
+  await plugin["chat.message"]({ sessionID: "session-other" }, {
+    message: { id: "turn-user" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "evt-other-model", "message.updated", { info: assistant("session-other", usage(), "other-model") })
+  event(plugin, "evt-other-start", "session.status", { sessionID: "session-other", status: { type: "busy" } })
+  await plugin["chat.message"]({ sessionID: "session-root" }, {
+    message: { id: "turn-returned" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "evt-return-model", "message.updated", {
+    info: { ...assistant("session-root", usage(), "returned-model"), parentID: "turn-returned" },
+  })
+  event(plugin, "evt-return-start", "session.status", { sessionID: "session-root", status: { type: "busy" } })
+})
+const model_updates = model_facts.flatMap((entry) => entry.model_state?.updates ?? [])
+assert.deepEqual([...new Set(model_updates.map((update) => update.model))], [
+  "provider-context/root-model", "provider-context/child-model", "provider-context/other-model",
+  "provider-context/returned-model",
+], "native immutable model identity excludes mutable later values, summary calls and parent inheritance")
+const child_models = model_updates.filter((update) => update.agent_id)
+assert(child_models.every((update) => update.agent_id === "session-child" &&
+  update.provider_session_id === "session-root" && update.model === "provider-context/child-model"))
+const starts = model_facts.filter((entry) => entry.event === "session.status" && entry.fresh_user_turn)
+assert.deepEqual(starts.map((entry) => entry.session_id), ["session-root", "session-other", "session-root"])
+assert.notEqual(starts[0].activation_nonce, starts[2].activation_nonce)
+assert(starts.every((entry) => entry.activation_nonce === entry.model_state.updates[0].transition_nonce),
+  "initial model evidence uses the same captured nonce as its root transition")
+const child_starts = model_facts.filter((entry) => entry.event === "logonomic.subagent.started")
+assert.equal(child_starts.length, 2)
+assert.equal(child_starts[1].model_state, undefined, "a repeated child run starts without inherited model evidence")
+
+const sequential_children = await run(async (plugin) => {
+  root(plugin)
+  await plugin["chat.message"]({ sessionID: "session-root" }, {
+    message: { id: "turn-user" }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "evt-root-confirmed", "message.updated", { info: assistant("session-root", usage()) })
+  event(plugin, "evt-root-busy", "session.status", { sessionID: "session-root", status: { type: "busy" } })
+  // Drain each real helper delivery before the next native child. This tests
+  // inactive source eviction rather than the independent event-queue bound.
+  for (let index = 0; index < 130; ++index) {
+    const id = `sequential-child-${index}`
+    event(plugin, `evt-create-${id}`, "session.created", { info: { id, parentID: "session-root" } })
+    event(plugin, `evt-start-${id}`, "session.status", { sessionID: id, status: { type: "busy" } })
+    event(plugin, `evt-model-${id}`, "message.updated", { info: assistant(id, usage(), `model-${index}`) })
+    event(plugin, `evt-stop-${id}`, "session.status", { sessionID: id, status: { type: "idle" } })
+    const deadline = Date.now() + 5000
+    while (!captured().some((entry) => entry.event === "logonomic.subagent.stopped" && entry.agent_id === id)) {
+      assert(Date.now() < deadline, `native child ${id} did not drain`)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+})
+const sequential_models = sequential_children.flatMap((entry) => entry.model_state?.updates ?? [])
+assert.equal(new Set(sequential_models.filter((entry) => entry.agent_id).map((entry) => entry.agent_id)).size, 130,
+  "stopped child mappings must not exhaust a lifetime-only 128-session model cache")
+
 const compactions = await run((plugin) => {
   root(plugin)
   event(plugin, "evt-summary-attempt", "message.updated", {

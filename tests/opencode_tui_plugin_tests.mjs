@@ -86,6 +86,37 @@ async function attention_events(scenario) {
 
 try {
   if (process.argv[3] && process.argv[4]) {
+    // Oracle: native SessionEvent.Step.Started carries its dispatched Model.Ref;
+    // the current integration admits root executions only, so child facts cannot
+    // introduce lifecycle or Session Log rows as a side effect of model telemetry.
+    const model_facts = await attention_events(async ({ sessions, families, select, event }) => {
+      sessions.set("ses_child", { id: "ses_child", parentID: "ses_root" })
+      families.set("ses_root", ["ses_root", "ses_child"])
+      await select()
+      await event("session.step.started", { sessionID: "ses_root", assistantMessageID: "msg_root",
+        model: { providerID: "native", id: "root-model" } })
+      await event("session.execution.started", { sessionID: "ses_child" })
+      await event("session.step.started", { sessionID: "ses_child", assistantMessageID: "msg_child",
+        model: { providerID: "native", id: "child-model" } })
+      await event("session.compaction.started", { sessionID: "ses_root", assistantMessageID: "msg_summary",
+        model: { providerID: "native", id: "summary-model" } })
+      await event("session.execution.succeeded", { sessionID: "ses_child" })
+      await event("session.step.started", { sessionID: "ses_child", assistantMessageID: "msg_late",
+        model: { providerID: "native", id: "late-model" } })
+      await select("ses_other")
+      await select("ses_root")
+      await event("session.step.started", { sessionID: "ses_root", assistantMessageID: "msg_returned",
+        model: { providerID: "native", id: "returned-model" } })
+    })
+    const models = model_facts.flatMap((entry) => entry.model_state?.updates ?? [])
+    assert.deepEqual(models.map((entry) => [entry.agent_id, entry.model]), [
+      ["", "native/root-model"], ["", "native/returned-model"],
+    ])
+    const activations = model_facts.filter((entry) => entry.event === "logonomic.session.selected")
+    assert.equal(models[0].transition_nonce, activations[0].activation_nonce)
+    assert.notEqual(models[1].transition_nonce, models[0].transition_nonce)
+    assert.equal(models[1].transition_nonce, activations.at(-1).activation_nonce)
+    assert.equal(model_facts.filter((entry) => entry.event.startsWith("logonomic.subagent.")).length, 0)
     const facts = await attention_events(async ({ sessions, route, select, event }) => {
       sessions.set("ses_root", { id: "ses_root", location: { directory: "/native/A exact " } })
       sessions.set("ses_other", { id: "ses_other", location: { directory: "/native/B" } })

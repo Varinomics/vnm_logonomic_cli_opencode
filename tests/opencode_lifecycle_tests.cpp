@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -160,6 +161,39 @@ void failure_diagnostics()
     require(companion.status() == addon::Result_status::FAILED && diagnostic &&
             diagnostic->event_name == "session.status" && diagnostic->field == "status_type",
         "attention classification keeps the same field diagnostic through its companion envelope");
+}
+
+void model_observations()
+{
+    auto request = event("session.status");
+    request.event.body.set("status_type", addon::Json_value("busy"));
+    addon::Model_update root{
+        "session-primary", std::string(32, 'e'), 3, {}, addon::Model_status::CONFIRMED,
+        "provider-native", "provider-native/model-native", std::nullopt, "opencode.message.updated"};
+    addon::encode_model_updates(request.event.body, {root});
+    require(classify(request).model_updates.empty(), "native model envelope requires capability negotiation");
+    request.model_state_version = addon::k_model_state_version;
+    const auto combined = classify(request);
+    require(combined.model_updates == std::vector<addon::Model_update>{root} && !combined.observations.empty(),
+        "native model and adjacent lifecycle evidence share one accepted carrier");
+
+    auto child = root;
+    child.agent_id = "child-native";
+    child.model = "provider-native/child-model";
+    request.event.name = "message.updated";
+    request.event.body.set("event", addon::Json_value("message.updated"));
+    addon::encode_model_updates(request.event.body, {child});
+    const auto child_result = classify(request);
+    require(child_result.model_updates == std::vector<addon::Model_update>{child} &&
+            child_result.observations.empty(),
+        "a child model retains its actor without manufacturing lifecycle or needing context telemetry");
+
+    request.event.name = "session.status";
+    request.event.body.set("event", addon::Json_value("session.status"));
+    request.event.body.set("model_state", addon::Json_value("invalid"));
+    const auto malformed = classify(request);
+    require(malformed.model_updates.empty() && malformed.model_failure && !malformed.observations.empty(),
+        "malformed optional model facts do not discard valid lifecycle evidence");
 }
 
 void context_observations(const std::filesystem::path& package)
@@ -398,6 +432,7 @@ void execution_observations()
 
 int main(int argc, char** argv)
 {
+    model_observations();
     failure_diagnostics();
     require(argc == 2, "usage: opencode_lifecycle_tests <package directory>");
     declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));

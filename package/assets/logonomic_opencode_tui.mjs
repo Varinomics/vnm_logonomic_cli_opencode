@@ -91,6 +91,7 @@ export async function create_tui_integration(context) {
   let activation_nonce
   let execution_sequence = 0
   let execution_location
+  let model_sequence = 0n
 
   function session_family() {
     return new Set([selected, ...(data.session.family?.(selected) ?? [])])
@@ -220,6 +221,7 @@ export async function create_tui_integration(context) {
       activation_nonce = randomBytes(16).toString("hex")
       execution_sequence = 0
       execution_location = undefined
+      model_sequence = 0n
       turn_id = undefined
       latest_turn_id = undefined
       assistant_reply = undefined
@@ -302,6 +304,26 @@ export async function create_tui_integration(context) {
     }
     const session_id = value?.sessionID ?? value?.form?.sessionID
     const root_event = session_id === selected
+    if (type === "session.step.started" && root_event && wake_identity(selected)) {
+      // Native Step.Started names the dispatched model. Compaction and title
+      // generation have separate events and never enter this projection.
+      const provider = value.model?.providerID
+      const id = value.model?.id
+      const native_text = (text) => typeof text === "string" && text.length > 0 &&
+        Buffer.byteLength(text, "utf8") <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(text) &&
+        Buffer.from(text, "utf8").toString("utf8") === text
+      const model = `${provider}/${id}`
+      if (wake_identity(value.assistantMessageID) && native_text(provider) && native_text(id) &&
+          native_text(model) && model_sequence < 18446744073709551615n) {
+        relay.enqueue({ event: "message.updated", session_id: selected, model_state: {
+          version: 1, updates: [{
+            provider_session_id: selected, transition_nonce: activation_nonce,
+            sequence: String(++model_sequence), agent_id: "",
+            state: "confirmed", provider, model, source: "opencode.session.step.started",
+          }],
+        } })
+      }
+    }
     const asked = type === "permission.asked" || type === "form.created"
     const replied = type === "permission.replied" || type === "form.replied" || type === "form.cancelled"
     if (!root_event && type === "session.deleted") {
