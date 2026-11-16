@@ -161,6 +161,13 @@ std::optional<addon::Classify_event_result> classify(
         result.context_failure = addon::Context_failure{
             metadata(body, "session_id").value_or(""), *request.context_failure};
     }
+    if (request.model_failure) {
+        result.model_failure = request.model_failure;
+    }
+    else
+    if (request.model_state_version == addon::k_model_state_version) {
+        addon::decode_model_updates(body, result.model_updates, result.model_failure);
+    }
     if (name == "message.updated" || name == "session.compacted") {
         if (request.context_state_version != addon::k_context_state_capability_version ||
             !request.ledger.current_transition)

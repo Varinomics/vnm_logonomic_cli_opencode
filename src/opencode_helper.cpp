@@ -116,7 +116,11 @@ int run_helper(int argc, char** argv)
     const auto* sequence = event->find("execution_sequence");
     const bool selection = activation && sequence && sequence->is_integer() && sequence->as_integer() == 0 &&
         event->find("event")->as_string() == "logonomic.session.selected";
-    const auto nonce = selection ? activation->as_string() : addon::random_nonce_hex();
+    const auto* fresh_turn = event->find("fresh_user_turn");
+    const auto& name = event->find("event")->as_string();
+    const bool source_transition = activation && (selection || name == "logonomic.session.resumed" ||
+        (name == "session.status" && fresh_turn && *fresh_turn == addon::Json_value(true)));
+    const auto nonce = source_transition ? activation->as_string() : addon::random_nonce_hex();
     const auto cancelled = [watch_parent] { return watch_parent && parent_pipe_closed(); };
     addon::Helper_client client(std::move(*environment), cancelled);
     auto outcome = client.deliver_provider_event(event->find("event")->as_string(), *event, key, nonce);

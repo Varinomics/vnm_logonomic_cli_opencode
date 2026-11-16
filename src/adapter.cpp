@@ -155,6 +155,7 @@ int main()
         {addon::k_delegated_model_selection_capability_id, addon::k_delegated_model_selection_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
+        {addon::k_model_state_capability_id, addon::k_model_state_version},
         {addon::k_execution_context_capability_id, addon::k_execution_context_version},
         {"interactive-resume", 2}, {"interactive-resume", 3}, {"interactive-resume", 4},
         {"session-wake", 1},

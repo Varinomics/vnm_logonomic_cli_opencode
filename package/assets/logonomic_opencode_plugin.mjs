@@ -5,6 +5,7 @@ import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { create_session_wake } from "./logonomic_opencode_wake.mjs"
 import { create_event_delivery } from "./logonomic_opencode_relay.mjs"
+import { randomBytes } from "node:crypto"
 import { Assistant_reply_evidence } from "./logonomic_opencode_reply.mjs"
 
 const maxMetadataCharacters = 256
@@ -510,6 +511,78 @@ export const Logonomic = async ({ client }, options = {}) => {
   let context_model
   let input_sequence = 0
   let selected_input_sequence = 0
+
+  // Keep source attribution ahead of asynchronous lookups and helper delivery.
+  // A delayed observation of A must retain A's nonce after A -> B -> A.
+  const native_model_parents = new Map()
+  const native_models = new Map()
+  let native_model_activation
+  let native_model_sequence = 0n
+
+  const observe_model_session = (info, removed = false) => {
+    const id = metadata(info?.id)
+    if (!id) return
+    if (removed) {
+      native_model_parents.delete(id)
+      native_models.delete(id)
+      if (native_model_activation?.id === id) native_model_activation = undefined
+      return
+    }
+    if (!native_model_parents.has(id) && native_model_parents.size >= maxChildSessions) return
+    native_model_parents.set(id, metadata(info.parentID) ?? "")
+  }
+
+  const select_model_root = (id) => {
+    if (native_model_parents.get(id) !== "" || native_model_activation?.id === id) return
+    native_model_activation = { id, nonce: randomBytes(16).toString("hex") }
+    native_model_sequence = 0n
+    native_models.clear()
+  }
+
+  const capture_model_event = (event) => {
+    const activation = native_model_activation
+    if (!activation) return
+    const info = event.properties?.info
+    const actor = metadata(info?.sessionID ?? event.properties?.sessionID)
+    if (!actor) return
+    if (event.type === "message.updated" &&
+        (info?.role !== "assistant" || info.summary === true || !metadata(info.parentID))) return
+    let root = actor
+    const visited = new Set()
+    while (root !== activation.id && visited.size < maxChildParentDepth) {
+      if (visited.has(root)) return
+      visited.add(root)
+      root = native_model_parents.get(root)
+      if (!root) return
+    }
+    if (root !== activation.id) return
+    if (event.type === "message.updated" && info?.role === "assistant" && info.summary !== true &&
+        metadata(info.id) && metadata(info.parentID)) {
+      const provider = info.providerID
+      const model = typeof provider === "string" && typeof info.modelID === "string"
+        ? `${provider}/${info.modelID}` : undefined
+      const native_text = (value) => typeof value === "string" && value.length > 0 &&
+        Buffer.byteLength(value, "utf8") <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value) &&
+        Buffer.from(value, "utf8").toString("utf8") === value
+      if (native_text(provider) && native_text(info.modelID) && native_text(model) &&
+          native_model_sequence < 18446744073709551615n &&
+          (native_models.has(actor) || native_models.size < maxChildSessions)) {
+        native_models.set(actor, {
+          provider_session_id: activation.id, transition_nonce: activation.nonce,
+          sequence: String(++native_model_sequence), agent_id: actor === activation.id ? "" : actor,
+          state: "confirmed", provider, model, source: "opencode.message.updated",
+        })
+      }
+    }
+    const update = native_models.get(actor)
+    const captured = { id: activation.id, nonce: activation.nonce,
+      ...(update ? { update: { ...update } } : {}) }
+    if (actor !== activation.id && (event.type === "session.idle" || event.type === "session.error" ||
+        (event.type === "session.status" && event.properties?.status?.type === "idle"))) {
+      native_models.delete(actor)
+    }
+    return captured
+  }
 
   const evictInactiveChildSession = () => {
     for (const [childSessionID, record] of sessionRecords) {
@@ -1272,7 +1345,10 @@ export const Logonomic = async ({ client }, options = {}) => {
   const confirmResumedSession = async (sessionID) => {
     const info = await sessionInfo(sessionID, null)
     if (metadata(info?.id) !== sessionID) return
-    enqueue({ kind: "resumed", info: { id: info.id, parentID: info.parentID } })
+    observe_model_session(info)
+    if (!native_model_activation) select_model_root(sessionID)
+    enqueue({ kind: "resumed", info: { id: info.id, parentID: info.parentID },
+      model_sample: native_model_activation?.id === sessionID ? { ...native_model_activation } : undefined })
   }
 
   const projectResumedSession = ({ info }) => {
@@ -1285,7 +1361,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   )
   const deliver = event_delivery.deliver
 
-  const project = async (item) => {
+  const project_native = async (item) => {
     if (item.kind === "overflow") {
       return { event: "logonomic.delivery_overflow" }
     }
@@ -1301,6 +1377,26 @@ export const Logonomic = async ({ client }, options = {}) => {
       return lifecycle && context ? [lifecycle, context] : lifecycle ?? context
     }
     return projectEvent(item.event, item.wake_record)
+  }
+
+  const project = async (item) => {
+    const native = await project_native(item)
+    const sample = item.model_sample
+    if (!sample) return native
+    const deliveries = Array.isArray(native) ? native : native ? [native] : []
+    const actor = sample.update?.agent_id ?? ""
+    const matching = deliveries.find((delivery) => delivery.session_id === sample.id &&
+      (delivery.agent_id ?? "") === actor)
+    if (matching) {
+      if (matching.fresh_user_turn || matching.event === "logonomic.session.resumed") {
+        matching.activation_nonce = sample.nonce
+      }
+      if (sample.update) matching.model_state = { version: 1, updates: [sample.update] }
+    } else if (sample.update && item.event?.type === "message.updated") {
+      deliveries.push({ event: "message.updated", session_id: sample.id,
+        model_state: { version: 1, updates: [sample.update] } })
+    }
+    return deliveries.length === 1 ? deliveries[0] : deliveries.length ? deliveries : undefined
   }
 
   const startWorker = () => {
@@ -1515,6 +1611,11 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
   hooks.event = ({ event }) => {
     try {
+      if (event?.type === "session.created" || event?.type === "session.updated" ||
+          event?.type === "session.deleted") {
+        observe_model_session(event.properties?.info, event.type === "session.deleted")
+      }
+      const model_sample = capture_model_event(event)
       const wake_record = session_wake?.event(event)
       // Release native text state at native event order, before queued helper
       // delivery. An older queued completion must not erase a newer reply.
@@ -1547,7 +1648,7 @@ export const Logonomic = async ({ client }, options = {}) => {
             } : {}),
           } }
         }
-        enqueue({ kind: "event", event, wake_record,
+        enqueue({ kind: "event", event, wake_record, model_sample,
           ...(["message.updated", "session.compacted"].includes(event.type)
             ? { context_sample: context_sample(event) } : {}),
         })
@@ -1558,6 +1659,10 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
   hooks["chat.message"] = async (input, output) => {
     try {
+      if (Array.isArray(output?.parts) && output.parts.some((part) =>
+          part && typeof part === "object" && part.synthetic !== true)) {
+        select_model_root(metadata(input?.sessionID))
+      }
       session_wake?.chat_message(input, output)
       enqueue({ kind: "chat.message", input, output })
     } catch {
