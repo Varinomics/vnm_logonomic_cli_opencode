@@ -97,6 +97,34 @@ const context_sample = (event) => {
   }
 }
 
+const native_model_value = (value) => typeof value === "string" && value.length > 0 &&
+  Buffer.byteLength(value, "utf8") <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value) &&
+  Buffer.from(value, "utf8").toString("utf8") === value
+
+// Native message objects mutate after an event; keep the observed model text.
+const native_model_text = (event) => {
+  const info = event?.properties?.info
+  if (event?.type !== "message.updated" || info?.role !== "assistant" || info.summary === true) return
+  const actor = metadata(info.sessionID)
+  const turn_id = metadata(info.parentID)
+  const provider = info.providerID
+  const model = `${provider}/${info.modelID}`
+  const message_id = metadata(info.id)
+  if (!actor || !turn_id || !message_id || !native_model_value(provider) ||
+      !native_model_value(info.modelID) || !native_model_value(model)) return
+  return { actor, turn_id, message_id, provider, model }
+}
+
+// OpenCode's processor publishes a step-start part for the assistant message it
+// dispatches. Task wrappers and shell records are assistant messages with no step.
+const native_model_step = (event) => {
+  const part = event?.properties?.part
+  if (event?.type !== "message.part.updated" || part?.type !== "step-start") return
+  const actor = metadata(part.sessionID)
+  const message_id = metadata(part.messageID)
+  return actor && message_id ? { actor, message_id } : undefined
+}
+
 const millisecondsUntil = (deadline) =>
   Math.max(0, deadline - Date.now())
 
@@ -497,13 +525,15 @@ export const Logonomic = async ({ client }, options = {}) => {
   const stoppedChildRuns = new Map()
   const context_samples = new Map()
   const pendingItems = []
+  const pending_deliveries = []
   const lookupControllers = new Set()
   const lookupPromises = new Set()
   const activeSessionDiffInvocations = new Set()
   let accepting = true
   let lookupsAllowed = true
   let deliveryCutoffReached = false
-  let workerPromise
+  let projection_promise
+  let delivery_promise
   let stopLookupsPromise
   let disposePromise
   let sessionDiffDisposalStarted = false
@@ -512,103 +542,53 @@ export const Logonomic = async ({ client }, options = {}) => {
   let input_sequence = 0
   let selected_input_sequence = 0
 
-  // Keep source attribution ahead of asynchronous lookups and helper delivery.
-  // A delayed observation of A must retain A's nonce after A -> B -> A.
-  const native_model_parents = new Map()
+  // Model facts follow the lifecycle's own serial root selections and child
+  // runs. Hooks capture each input's nonce and immutable native model text
+  // before asynchronous work; projection binds them in native arrival order, so
+  // a delayed observation of A cannot use A's nonce after A -> B -> A.
   const native_models = new Map()
-  const native_model_children = new Set()
+  // Each actor's latest assistant record awaits its own step. It keeps the
+  // activation that admitted it and the pending input its parent names.
+  const model_candidates = new Map()
   let native_model_activation
   let native_model_sequence = 0n
+  // A fact with no lifecycle carrier waits in one queued carrier per actor. Its
+  // newest fact replaces the older one until delivery, so optional evidence
+  // never occupies core lifecycle capacity.
+  const open_model_carriers = new Map()
+  const queued_model_carriers = new Map()
+  // A native model step is optional. It waits in a slot at its arrival position
+  // among core items, shared by a repeated step of the same actor and message
+  // until the next core item arrives. Slots never count toward core capacity.
+  const open_step_slots = new Map()
+  let queued_step_slots = 0
 
-  const observe_model_session = (info, removed = false) => {
-    const id = metadata(info?.id)
-    if (!id) return
-    if (removed) {
-      native_model_parents.delete(id)
-      native_models.delete(id)
-      native_model_children.delete(id)
-      if (native_model_activation?.id === id) native_model_activation = undefined
-      return
-    }
-    if (!native_model_parents.has(id) && native_model_parents.size >= maxChildSessions + 1) {
-      const retained = new Set([native_model_activation?.id])
-      for (const child of native_model_children) {
-        let ancestor = child
-        for (let depth = 0; ancestor && depth <= maxChildParentDepth; ++depth) {
-          retained.add(ancestor)
-          ancestor = native_model_parents.get(ancestor)
-        }
-      }
-      const inactive = [...native_model_parents.keys()].find((key) => !retained.has(key))
-      if (!inactive) return
-      native_model_parents.delete(inactive)
-      native_models.delete(inactive)
-    }
-    native_model_parents.set(id, metadata(info.parentID) ?? "")
+  const clear_pending_items = () => {
+    pendingItems.length = 0
+    open_step_slots.clear()
+    queued_step_slots = 0
   }
 
-  const select_model_root = (id) => {
-    if (native_model_parents.get(id) !== "" || native_model_activation?.id === id) return
-    native_model_activation = { id, nonce: randomBytes(16).toString("hex") }
+  const record_model = (actor, text) => {
+    const activation = native_model_activation
+    if (native_model_sequence >= 18446744073709551615n ||
+        (!native_models.has(actor) && native_models.size >= maxChildSessions)) return false
+    native_models.set(actor, {
+      provider_session_id: activation.id, transition_nonce: activation.nonce,
+      sequence: String(++native_model_sequence), agent_id: actor === activation.id ? "" : actor,
+      state: "confirmed", provider: text.provider, model: text.model, source: "opencode.message.updated",
+    })
+    return true
+  }
+
+  // The host opens a root transition only for a selected input or a first
+  // resume; the model activation changes exactly there, under that source's nonce.
+  const select_model_root = (session_id, nonce, text) => {
+    native_model_activation = { id: session_id, nonce }
     native_model_sequence = 0n
     native_models.clear()
-    native_model_children.clear()
-  }
-
-  const capture_model_event = (event) => {
-    const activation = native_model_activation
-    if (!activation) return
-    const info = event.properties?.info
-    const actor = metadata(info?.sessionID ?? event.properties?.sessionID)
-    if (!actor) return
-    if (event.type === "message.updated" &&
-        (info?.role !== "assistant" || info.summary === true || !metadata(info.parentID))) return
-    let root = actor
-    const visited = new Set()
-    while (root !== activation.id && visited.size < maxChildParentDepth) {
-      if (visited.has(root)) return
-      visited.add(root)
-      root = native_model_parents.get(root)
-      if (!root) return
-    }
-    if (root !== activation.id) return
-    if (actor !== activation.id) {
-      const starts = event.type === "session.status" &&
-        ["busy", "retry"].includes(event.properties?.status?.type)
-      if (starts && !native_model_children.has(actor)) {
-        if (native_model_children.size >= maxChildSessions) return
-        native_model_children.add(actor)
-        native_models.delete(actor)
-      }
-      if (event.type === "message.updated" && !native_model_children.has(actor)) return
-    }
-    if (event.type === "message.updated" && info?.role === "assistant" && info.summary !== true &&
-        metadata(info.id) && metadata(info.parentID)) {
-      const provider = info.providerID
-      const model = typeof provider === "string" && typeof info.modelID === "string"
-        ? `${provider}/${info.modelID}` : undefined
-      const native_text = (value) => typeof value === "string" && value.length > 0 &&
-        Buffer.byteLength(value, "utf8") <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value) &&
-        Buffer.from(value, "utf8").toString("utf8") === value
-      if (native_text(provider) && native_text(info.modelID) && native_text(model) &&
-          native_model_sequence < 18446744073709551615n &&
-          (native_models.has(actor) || native_models.size < maxChildSessions)) {
-        native_models.set(actor, {
-          provider_session_id: activation.id, transition_nonce: activation.nonce,
-          sequence: String(++native_model_sequence), agent_id: actor === activation.id ? "" : actor,
-          state: "confirmed", provider, model, source: "opencode.message.updated",
-        })
-      }
-    }
-    const update = native_models.get(actor)
-    const captured = { id: activation.id, nonce: activation.nonce,
-      ...(update ? { update: { ...update } } : {}) }
-    if (actor !== activation.id && (event.type === "session.idle" || event.type === "session.error" ||
-        (event.type === "session.status" && event.properties?.status?.type === "idle"))) {
-      native_models.delete(actor)
-      native_model_children.delete(actor)
-    }
-    return captured
+    open_model_carriers.clear()
+    if (text) record_model(session_id, text)
   }
 
   const evictInactiveChildSession = () => {
@@ -639,7 +619,7 @@ export const Logonomic = async ({ client }, options = {}) => {
 
   const childObservationLoss = () => {
     accepting = false
-    pendingItems.length = 0
+    clear_pending_items()
     return { event: "logonomic.delivery_overflow" }
   }
 
@@ -1133,6 +1113,11 @@ export const Logonomic = async ({ client }, options = {}) => {
       forgetChildrenOfRoot(sessionID)
       sessionRecords.delete(sessionID)
       clearSessionProjectionState(sessionID)
+      if (native_model_activation?.id === sessionID) {
+        native_model_activation = undefined
+        native_models.clear()
+        open_model_carriers.clear()
+      }
       if (kind !== "root" || !publishedRoot) return
       const deletion = { event: event.type, session_id: sessionID }
       return projected ? [projected, deletion] : deletion
@@ -1255,7 +1240,8 @@ export const Logonomic = async ({ client }, options = {}) => {
       if (statusType === "busy" || statusType === "retry") {
         const pending = pendingRootTurns.get(sessionID)
         // A late confirmation of an older input must not reclaim another root.
-        const input_order = pending?.turns.get(pending.confirmedTurnID)
+        const input = pending?.turns.get(pending.confirmedTurnID)
+        const input_order = input?.order
         if (input_order < selected_input_sequence && !sessionRecords.get(sessionID)?.published) {
           // The host cannot fence a session it has never admitted.
           pendingRootTurns.delete(sessionID)
@@ -1273,6 +1259,9 @@ export const Logonomic = async ({ client }, options = {}) => {
         if (fresh_user_turn) {
           selected_input_sequence = input_order
           session_wake?.select_root(sessionID, wake_record)
+          if (native_model_activation?.id !== sessionID) {
+            select_model_root(sessionID, input.nonce, input.model)
+          }
         }
         sessionRecords.set(sessionID, {
           ...root,
@@ -1328,7 +1317,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     }
   }
 
-  const projectChatMessage = async ({ input, output }) => {
+  const projectChatMessage = async ({ input, output, activation_nonce }) => {
     const sessionID = metadata(input?.sessionID)
     const turnID = metadata(output?.message?.id)
     if (!sessionID || !turnID || !Array.isArray(output?.parts)) return
@@ -1343,7 +1332,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     const pending = pendingRootTurns.get(sessionID)
     if (!pending) {
       pendingRootTurns.set(sessionID, {
-        turns: new Map([[turnID, ++input_sequence]]),
+        turns: new Map([[turnID, { order: ++input_sequence, nonce: activation_nonce }]]),
       })
       return submitted
     }
@@ -1354,7 +1343,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (pending.turns.size >= maxPendingTurnCandidates) {
       return markTurnCorrelationAmbiguous(sessionID, "candidate_capacity")
     }
-    pending.turns.set(turnID, ++input_sequence)
+    pending.turns.set(turnID, { order: ++input_sequence, nonce: activation_nonce })
     return submitted
   }
 
@@ -1372,14 +1361,14 @@ export const Logonomic = async ({ client }, options = {}) => {
   const confirmResumedSession = async (sessionID) => {
     const info = await sessionInfo(sessionID, null)
     if (metadata(info?.id) !== sessionID) return
-    observe_model_session(info)
-    if (!native_model_activation) select_model_root(sessionID)
     enqueue({ kind: "resumed", info: { id: info.id, parentID: info.parentID },
-      model_sample: native_model_activation?.id === sessionID ? { ...native_model_activation } : undefined })
+      activation_nonce: randomBytes(16).toString("hex") })
   }
 
-  const projectResumedSession = ({ info }) => {
+  const projectResumedSession = ({ info, activation_nonce }) => {
     if (reduceSessionFact(info, "lookup") !== "root") return
+    // Like the host, a resume selects only a runtime's first root.
+    if (!native_model_activation) select_model_root(info.id, activation_nonce)
     return { event: "logonomic.session.resumed", session_id: info.id }
   }
 
@@ -1395,6 +1384,7 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (item.kind === "chat.message") return projectChatMessage(item)
     if (item.kind === "completed_text") return project_completed_text(item)
     if (item.kind === "resumed") return projectResumedSession(item)
+    if (item.kind === "model_step") return
     if (item.event.type === "session.compacted") {
       return project_context(item.event.type, item.context_sample)
     }
@@ -1406,62 +1396,169 @@ export const Logonomic = async ({ client }, options = {}) => {
     return projectEvent(item.event, item.wake_record)
   }
 
+  // Bind model facts after the lifecycle has projected this item: its root
+  // selection and child runs are then decided, including by native lookups.
   const project = async (item) => {
     const native = await project_native(item)
-    const sample = item.model_sample
-    if (!sample) return native
-    const deliveries = Array.isArray(native) ? native : native ? [native] : []
-    const actor = sample.update?.agent_id ?? ""
-    const matching = deliveries.find((delivery) => delivery.session_id === sample.id &&
-      (delivery.agent_id ?? "") === actor)
-    if (matching) {
-      if (matching.fresh_user_turn || matching.event === "logonomic.session.resumed") {
-        matching.activation_nonce = sample.nonce
+    const activation = native_model_activation
+    const admitted = (text) => activation && (text.actor === activation.id ||
+      activeChildRuns.get(text.actor)?.rootSessionID === activation.id)
+    const input_of = (text) => pendingRootTurns.get(text.actor)?.turns.get(text.turn_id)
+    // An assistant record names its model before any model step runs. Only the
+    // native step of that same message confirms the model, under the activation
+    // that admitted the record or the one its input's own nonce opened.
+    const text = item.model_text
+    const admitted_text = text && admitted(text)
+    const pending_input = text ? input_of(text) : undefined
+    if (admitted_text || pending_input) {
+      model_candidates.delete(text.actor)
+      model_candidates.set(text.actor, {
+        text, activation: admitted_text ? activation : undefined, input: pending_input,
+      })
+      if (model_candidates.size > maxChildSessions) {
+        model_candidates.delete(model_candidates.keys().next().value)
       }
-      if (sample.update) matching.model_state = { version: 1, updates: [sample.update] }
-    } else if (sample.update && item.event?.type === "message.updated") {
-      deliveries.push({ event: "message.updated", session_id: sample.id,
-        model_state: { version: 1, updates: [sample.update] } })
+    }
+    const step = item.model_step
+    const candidate = step && model_candidates.get(step.actor)
+    let recorded
+    if (candidate && candidate.text.message_id === step.message_id) {
+      model_candidates.delete(step.actor)
+      const served = candidate.text
+      if (admitted(served) && (activation === candidate.activation ||
+          activation.nonce === candidate.input?.nonce))
+      {
+        recorded = record_model(served.actor, served) ? served.actor : undefined
+      }
+      else
+      if (candidate.input && input_of(served) === candidate.input) {
+        // A reply establishes its input's model before that input selects its
+        // root. A session that proves to be a child discards it with the input.
+        candidate.input.model = served
+      }
+    }
+    if (!activation) return native
+    const deliveries = Array.isArray(native) ? native : native ? [native] : []
+    const carried = new Set()
+    for (const delivery of deliveries) {
+      if (delivery.session_id !== activation.id) continue
+      const actor = delivery.agent_id ?? activation.id
+      if (actor === activation.id &&
+          (delivery.fresh_user_turn || delivery.event === "logonomic.session.resumed"))
+      {
+        delivery.activation_nonce = activation.nonce
+      }
+      // Each child run starts without a model or an unserved record, so none is
+      // inherited, and a late update or step after its stop has no run to belong to.
+      if (delivery.event.startsWith("logonomic.subagent.")) model_candidates.delete(actor)
+      if (delivery.event === "logonomic.subagent.started") native_models.delete(actor)
+      // A later fact for this actor is delivered after this lifecycle fact.
+      open_model_carriers.delete(actor)
+      const update = native_models.get(actor)
+      if (update && !carried.has(actor)) {
+        delivery.model_state = { version: 1, updates: [update] }
+        carried.add(actor)
+      }
+      if (delivery.event === "logonomic.subagent.stopped") native_models.delete(actor)
+    }
+    if (recorded && !carried.has(recorded)) {
+      const update = native_models.get(recorded)
+      const open = open_model_carriers.get(recorded)
+      if (open) {
+        open.model_state.updates[0] = update
+      }
+      else {
+        const carrier = { event: "message.updated", session_id: activation.id,
+          model_state: { version: 1, updates: [update] } }
+        open_model_carriers.set(recorded, carrier)
+        queued_model_carriers.set(carrier, recorded)
+        deliveries.push(carrier)
+      }
     }
     return deliveries.length === 1 ? deliveries[0] : deliveries.length ? deliveries : undefined
   }
 
-  const startWorker = () => {
-    if (workerPromise || deliveryCutoffReached) return
-    workerPromise = (async () => {
-      while (!deliveryCutoffReached && pendingItems.length > 0) {
-        const projected = await project(pendingItems.shift())
-        if (!projected || deliveryCutoffReached) continue
-        const deliveries = Array.isArray(projected)
-          ? projected
-          : [projected]
-        for (const delivery of deliveries) {
-          if (deliveryCutoffReached) break
-          await deliver(delivery)
+  // Deliveries leave in projection order, one helper at a time.
+  const start_delivery = () => {
+    if (delivery_promise || deliveryCutoffReached) return
+    delivery_promise = (async () => {
+      while (!deliveryCutoffReached && pending_deliveries.length > 0) {
+        const delivery = pending_deliveries.shift()
+        // A sent carrier is closed; a later fact for its actor needs a new one.
+        const carried_actor = queued_model_carriers.get(delivery)
+        if (carried_actor !== undefined) {
+          queued_model_carriers.delete(delivery)
+          if (open_model_carriers.get(carried_actor) === delivery) {
+            open_model_carriers.delete(carried_actor)
+          }
         }
+        await deliver(delivery)
       }
     })().finally(() => {
-      workerPromise = undefined
-      if (!deliveryCutoffReached && pendingItems.length > 0) startWorker()
+      delivery_promise = undefined
+      if (!deliveryCutoffReached && pending_deliveries.length > 0) start_delivery()
+    })
+  }
+
+  // Projection follows native arrival order without waiting for earlier helper
+  // deliveries, so an item that projects no delivery releases its capacity.
+  const start_projection = () => {
+    if (projection_promise || deliveryCutoffReached) return
+    projection_promise = (async () => {
+      while (!deliveryCutoffReached && pendingItems.length > 0) {
+        const item = pendingItems.shift()
+        if (item.kind === "model_step") {
+          --queued_step_slots
+          if (open_step_slots.get(item.model_step.actor) === item) open_step_slots.delete(item.model_step.actor)
+        }
+        const projected = await project(item)
+        if (!projected || deliveryCutoffReached) continue
+        pending_deliveries.push(...(Array.isArray(projected) ? projected : [projected]))
+        start_delivery()
+      }
+    })().finally(() => {
+      projection_promise = undefined
+      if (!deliveryCutoffReached && pendingItems.length > 0) start_projection()
     })
   }
 
   const enqueue = (item) => {
     if (!accepting) return false
-    if (pendingItems.length >= maxPendingItems) {
+    // The bound counts retained core work: unprojected core items and
+    // undelivered lifecycle facts. Model step slots and carriers are bounded apart.
+    const retained = pendingItems.length - queued_step_slots +
+      pending_deliveries.length - queued_model_carriers.size
+    if (retained >= maxPendingItems) {
       accepting = false
-      pendingItems.length = 0
+      clear_pending_items()
       pendingItems.push({ kind: "overflow" })
-      startWorker()
+      start_projection()
       return false
     }
+    // Later steps follow this core item in their own slots.
+    open_step_slots.clear()
     pendingItems.push(item)
-    startWorker()
+    start_projection()
     return true
   }
 
+  // Steps with no core item between them are projected under the same
+  // activation and records, so a repeated step of the same message adds nothing.
+  // A step of another message keeps its own slot; projection confirms the one
+  // that matches its actor's latest record.
+  const enqueue_step = (model_step) => {
+    if (!accepting) return
+    if (open_step_slots.get(model_step.actor)?.model_step.message_id === model_step.message_id) return
+    if (queued_step_slots >= maxChildSessions) return
+    const slot = { kind: "model_step", model_step }
+    open_step_slots.set(model_step.actor, slot)
+    ++queued_step_slots
+    pendingItems.push(slot)
+    start_projection()
+  }
+
   const awaitIdle = async () => {
-    while (workerPromise) await workerPromise
+    while (projection_promise || delivery_promise) await (projection_promise ?? delivery_promise)
   }
 
   const reachDeliveryCutoff = () => {
@@ -1469,7 +1566,10 @@ export const Logonomic = async ({ client }, options = {}) => {
     if (!deliveryCutoffReached) {
       deliveryCutoffReached = true
       accepting = false
-      pendingItems.length = 0
+      clear_pending_items()
+      pending_deliveries.length = 0
+      open_model_carriers.clear()
+      queued_model_carriers.clear()
       cutoffStarted = true
     }
     const lookupsStopped = stopLookupsOnce()
@@ -1576,7 +1676,7 @@ export const Logonomic = async ({ client }, options = {}) => {
         const deadline = Date.now() + disposeTimeoutMilliseconds
         const drainDeadline =
           deadline - finalCleanupReservationMilliseconds
-        let drained = !workerPromise || await settlesBeforeDeadline(
+        let drained = (!projection_promise && !delivery_promise) || await settlesBeforeDeadline(
           awaitIdle(),
           drainDeadline,
         )
@@ -1638,11 +1738,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
   hooks.event = ({ event }) => {
     try {
-      if (event?.type === "session.created" || event?.type === "session.updated" ||
-          event?.type === "session.deleted") {
-        observe_model_session(event.properties?.info, event.type === "session.deleted")
-      }
-      const model_sample = capture_model_event(event)
+      const model_text = native_model_text(event)
       const wake_record = session_wake?.event(event)
       // Release native text state at native event order, before queued helper
       // delivery. An older queued completion must not erase a newer reply.
@@ -1656,6 +1752,8 @@ export const Logonomic = async ({ client }, options = {}) => {
           (event?.type === "session.status" && event.properties?.status?.type === "idle")) {
         reply_text.delete(event.properties?.sessionID)
       }
+      const model_step = native_model_step(event)
+      if (model_step) enqueue_step(model_step)
       if (relevantEvents.has(event?.type)) {
         if (event.type.startsWith("question.")) {
           const properties = event.properties
@@ -1675,7 +1773,7 @@ export const Logonomic = async ({ client }, options = {}) => {
             } : {}),
           } }
         }
-        enqueue({ kind: "event", event, wake_record, model_sample,
+        enqueue({ kind: "event", event, wake_record, model_text,
           ...(["message.updated", "session.compacted"].includes(event.type)
             ? { context_sample: context_sample(event) } : {}),
         })
@@ -1686,12 +1784,9 @@ export const Logonomic = async ({ client }, options = {}) => {
   }
   hooks["chat.message"] = async (input, output) => {
     try {
-      if (Array.isArray(output?.parts) && output.parts.some((part) =>
-          part && typeof part === "object" && part.synthetic !== true)) {
-        select_model_root(metadata(input?.sessionID))
-      }
       session_wake?.chat_message(input, output)
-      enqueue({ kind: "chat.message", input, output })
+      // The input's own nonce opens its root transition if it selects one.
+      enqueue({ kind: "chat.message", input, output, activation_nonce: randomBytes(16).toString("hex") })
     } catch {
       // The editor lifecycle must not depend on Logonomic availability.
     }

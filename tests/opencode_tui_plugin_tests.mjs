@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { mock } from "node:test"
 import { pathToFileURL } from "node:url"
 
 const module_path = process.argv[2] ?? "package/assets/logonomic_opencode_tui.mjs"
@@ -42,12 +43,13 @@ async function attention_events(scenario) {
   const permissions = new Map()
   const forms = new Map()
   const families = new Map()
+  const statuses = new Map()
   integration = await create_tui_integration({
     ui: { router: { current: () => route } },
     data: {
       listen(callback) { listener = callback; return () => { listener = undefined } },
       session: {
-        get: (id) => sessions.get(id), status: () => "running", pending: { list: () => [] },
+        get: (id) => sessions.get(id), status: (id) => statuses.get(id) ?? "running", pending: { list: () => [] },
         family: (id) => families.get(id) ?? [id],
         permission: { list: (id) => permissions.get(id) }, form: { list: (id) => forms.get(id) },
       },
@@ -61,7 +63,7 @@ async function attention_events(scenario) {
     },
   })
   await scenario({
-    sessions, permissions, forms, families,
+    sessions, permissions, forms, families, statuses,
     route(value) { route = value },
     async select(sessionID) {
       if (sessionID) route = { type: "session", sessionID }
@@ -82,6 +84,23 @@ async function attention_events(scenario) {
   const text = await readFile(capture, "utf8")
   assert.equal(text.includes(private_canary), false, "native prompt and answer prose must stay in OpenCode")
   return text.trim().split("\n").filter(Boolean).map(JSON.parse)
+}
+
+// The Logonomic host's wake readiness request to the live integration's bridge.
+async function inspect_wake(session_id) {
+  const binding = JSON.parse(await readFile(registration, "utf8"))
+  return new Promise((resolve, reject) => {
+    const socket = connect(binding.port, "127.0.0.1")
+    let response = ""
+    socket.on("error", reject)
+    socket.on("connect", () => socket.write(`${JSON.stringify({
+      ...binding, operation: "inspect", provider_session_id: session_id, transition_nonce: "d".repeat(32),
+    })}\n`))
+    socket.on("data", (chunk) => { response += chunk.toString("utf8") })
+    socket.on("end", () => {
+      try { resolve(JSON.parse(response)) } catch (error) { reject(error) }
+    })
+  })
 }
 
 try {
@@ -141,6 +160,87 @@ try {
     assert.notEqual(selected[0].activation_nonce, selected[5].activation_nonce)
     assert.equal(selected[3].native_location.directory, "/native/A moved")
     assert(!selected.some((entry) => entry.native_location?.directory === "/command-only"))
+
+    // Oracle: native2 publishes Step.Started once per model step with that
+    // step's Model.Ref, so one long execution emits many optional model facts,
+    // and each can name a different model. The fake wrapper holds the first
+    // helper delivery and writes its PID only after recording that delivery; the
+    // relay's own delivery deadline, captured as in the disposal fixture, later
+    // cancels it through the helper. Admission is decided at enqueue, while that
+    // delivery is held.
+    const held_pid = join(root, "held-wrapper.pid")
+    const tool_steps = 40
+    let held_wake
+    const held_burst = await attention_events(async ({ sessions, permissions, forms, statuses, select, event }) => {
+      permissions.set("ses_root", [])
+      forms.set("ses_root", [])
+      const deadlines = []
+      const schedule = globalThis.setTimeout
+      Object.assign(process.env, {
+        OPENCODE_TEST_DELIVERY_MODE: "wait-for-cancellation", OPENCODE_TEST_WRAPPER_PID: held_pid,
+      })
+      const timers = mock.method(globalThis, "setTimeout", (callback, delay, ...arguments_) => {
+        const timer = schedule(callback, delay, ...arguments_)
+        deadlines.push(() => {
+          clearTimeout(timer)
+          callback(...arguments_)
+        })
+        return timer
+      })
+      try {
+        await select() // Starts the selection delivery that the wrapper holds.
+      } finally {
+        timers.mock.restore()
+        delete process.env.OPENCODE_TEST_DELIVERY_MODE
+        delete process.env.OPENCODE_TEST_WRAPPER_PID
+      }
+      try {
+        assert.equal(deadlines.length, 1, "the held selection delivery arms its own delivery deadline")
+        const handshake = Date.now() + 5000
+        while (!(Number(await readFile(held_pid, "utf8").catch(() => "")) > 0)) {
+          assert(Date.now() < handshake, "the held helper must record its delivery and start holding it")
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+        await event("session.execution.started", { sessionID: "ses_root" }, "evt_long")
+        for (let index = 0; index < tool_steps; ++index) {
+          const owner = { sessionID: "ses_root", assistantMessageID: `msg_tool_${index}` }
+          await event("session.step.started", { ...owner, model: { providerID: "native", id: `tool-model-${index}` } })
+          await event("session.step.ended", { ...owner, finish: "tool-calls" })
+        }
+        const reply = { sessionID: "ses_root", assistantMessageID: "msg_reply" }
+        await event("session.step.started", { ...reply, model: { providerID: "native", id: "reply-model" } })
+        await event("session.text.started", { ...reply, ordinal: 0 })
+        await event("session.text.ended", { ...reply, ordinal: 0, text: "Completed." })
+        await event("session.step.ended", { ...reply, finish: "stop" })
+        // The native store settles before its event listeners run.
+        statuses.set("ses_root", "idle")
+        sessions.get("ses_root").outcome = "succeeded"
+        await event("session.execution.succeeded", { sessionID: "ses_root" })
+        held_wake = await inspect_wake("ses_root")
+      } finally {
+        for (const expire of deadlines) expire()
+      }
+    })
+    const held_models = held_burst.filter((entry) => entry.model_state)
+    const held_completion = held_burst.find((entry) => entry.event === "session.execution.succeeded")
+    const held_facts = new Map(held_models.flatMap((entry) => entry.model_state.updates)
+      .map((update) => [`${update.transition_nonce}/${update.sequence}`, update]))
+    assert.deepEqual({
+      wake: held_wake,
+      overflow: held_burst.some((entry) => entry.event === "logonomic.delivery_overflow"),
+      completion: held_completion && [held_completion.turn_id, held_completion.normal_completion],
+      models: [...held_facts.values()].map((update) => [update.model, update.transition_nonce]),
+      models_before_completion: held_models.every((entry) =>
+        held_burst.indexOf(entry) <= held_burst.indexOf(held_completion)),
+    }, {
+      wake: { available: true },
+      overflow: false,
+      completion: ["evt_long", true],
+      models: [["native/reply-model",
+        held_burst.find((entry) => entry.event === "logonomic.session.selected")?.activation_nonce]],
+      models_before_completion: true,
+    }, "changing optional model facts behind a held delivery coalesce to the latest without displacing core " +
+      "completion or wake")
     await writeFile(capture, "")
   }
   let selected = "ses_recipient"

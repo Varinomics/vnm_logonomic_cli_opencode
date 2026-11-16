@@ -9,6 +9,12 @@ const drain_timeout_ms = 96000
 
 function create_lifecycle_relay() {
   const pending = []
+  // Optional model facts wait in carriers outside the lifecycle capacity. Only
+  // the newest carrier stays open for replacement; a lifecycle event or its own
+  // delivery closes it. Each activation change enqueues its lifecycle selection
+  // first, so every closed carrier precedes a lifecycle event in the queue.
+  const model_carriers = new Set()
+  let open_model_carrier
   let accepting = true
   let cutoff = false
   let worker
@@ -17,7 +23,12 @@ function create_lifecycle_relay() {
   function start() {
     if (worker || cutoff) return
     worker = (async () => {
-      while (!cutoff && pending.length) await delivery.deliver(pending.shift())
+      while (!cutoff && pending.length) {
+        const event = pending.shift()
+        model_carriers.delete(event)
+        if (event === open_model_carrier) open_model_carrier = undefined
+        await delivery.deliver(event)
+      }
     })().finally(() => {
       worker = undefined
       if (!cutoff && pending.length) start()
@@ -28,13 +39,31 @@ function create_lifecycle_relay() {
     available: () => accepting,
     enqueue(event) {
       if (!accepting) return
-      if (pending.length >= max_pending_events) {
+      open_model_carrier = undefined
+      if (pending.length - model_carriers.size >= max_pending_events) {
         accepting = false
         pending.length = 0
+        model_carriers.clear()
         pending.push({ event: "logonomic.delivery_overflow" })
       } else {
         pending.push(event)
       }
+      start()
+    },
+    // An unsent fact of the same actor and activation is replaced by the newer
+    // one, which the native source emits only after it.
+    enqueue_model(event) {
+      if (!accepting) return
+      const update = event.model_state.updates[0]
+      const open = open_model_carrier?.model_state.updates[0]
+      if (open && open.provider_session_id === update.provider_session_id &&
+          open.agent_id === update.agent_id && open.transition_nonce === update.transition_nonce) {
+        open_model_carrier.model_state = event.model_state
+        return
+      }
+      open_model_carrier = event
+      model_carriers.add(event)
+      pending.push(event)
       start()
     },
     async dispose() {
@@ -315,7 +344,7 @@ export async function create_tui_integration(context) {
       const model = `${provider}/${id}`
       if (wake_identity(value.assistantMessageID) && native_text(provider) && native_text(id) &&
           native_text(model) && model_sequence < 18446744073709551615n) {
-        relay.enqueue({ event: "message.updated", session_id: selected, model_state: {
+        relay.enqueue_model({ event: "message.updated", session_id: selected, model_state: {
           version: 1, updates: [{
             provider_session_id: selected, transition_nonce: activation_nonce,
             sequence: String(++model_sequence), agent_id: "",

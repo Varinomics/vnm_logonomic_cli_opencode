@@ -469,6 +469,321 @@ resetCapture()
   })
 }
 
+// Each relay delivery runs helper processes, while native events arrive one
+// event-loop turn apart. These schedules therefore arrive while one real
+// delivery is still in flight, as the OpenCode 1.18.33 queue trace observed.
+const native_turn = () => new Promise((resolve) => setImmediate(resolve))
+const unused_tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+// OpenCode's processor starts the step of each assistant record it dispatches.
+const step_start = (plugin, session_id, message_id) => event(plugin, "message.part.updated", {
+  part: { id: `step-${message_id}`, sessionID: session_id, messageID: message_id, type: "step-start" },
+})
+
+resetCapture()
+{
+  // Observed native order: root A's first reply completes, a mailbox wake turn
+  // runs in A, and a new root B is created and prompted, all behind A's start.
+  const root_a = "ses_native_a"
+  const root_b = "ses_native_b"
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  const user = (session_id, id) =>
+    ({ info: { id, sessionID: session_id, role: "user", time: { created: 1 } } })
+  const reply = (session_id, id, parent_id, completed = false) => ({ info: {
+    id, sessionID: session_id, parentID: parent_id, role: "assistant",
+    providerID: "fixture", modelID: "wake", tokens: unused_tokens,
+    ...(completed ? { finish: "stop", time: { created: 1, completed: 2 } } : { time: { created: 1 } }),
+  } })
+  const touch = (session_id) => () =>
+    event(plugin, "session.updated", { info: { id: session_id, title: privateCanary } })
+  const status = (session_id, type) => () =>
+    event(plugin, "session.status", { sessionID: session_id, status: { type } })
+  const idle = (session_id) => () => event(plugin, "session.idle", { sessionID: session_id })
+  const updated = (value) => () => event(plugin, "message.updated", value)
+  const step = (session_id, message_id) => () => step_start(plugin, session_id, message_id)
+  const prompt = (session_id, id) => () => plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id }, parts: [{ type: "text", text: "Read the new mailbox notification." }],
+  })
+  const text = (session_id, message_id) => () => plugin["experimental.text.complete"](
+    { sessionID: session_id, messageID: message_id, partID: `part-${message_id}` },
+    { text: "The isolated mailbox notification was received." })
+  // The processor publishes busy before the step of the record it dispatches.
+  const turn = (session_id, user_id, reply_id) => [
+    updated(user(session_id, user_id)), touch(session_id), status(session_id, "busy"),
+    updated(reply(session_id, reply_id, user_id)), touch(session_id),
+    updated(reply(session_id, reply_id, user_id)), status(session_id, "busy"), step(session_id, reply_id),
+  ]
+  const completion = (session_id, user_id, reply_id) => [
+    text(session_id, reply_id), updated(reply(session_id, reply_id, user_id)),
+    updated(reply(session_id, reply_id, user_id, true)), status(session_id, "busy"),
+    status(session_id, "idle"), idle(session_id), touch(session_id),
+  ]
+  const schedule = [
+    () => event(plugin, "session.created", { info: { id: root_a } }), touch(root_a),
+    prompt(root_a, "msg_a_user_1"), ...turn(root_a, "msg_a_user_1", "msg_a_reply_1").slice(0, 4),
+    touch(root_a), updated(reply(root_a, "msg_a_reply_1", "msg_a_user_1")), touch(root_a),
+    // A's confirmed start is delivered while every following arrival is queued.
+    status(root_a, "busy"), step(root_a, "msg_a_reply_1"),
+    ...completion(root_a, "msg_a_user_1", "msg_a_reply_1"), updated(user(root_a, "msg_a_user_1")),
+    prompt(root_a, "msg_a_user_2"), ...turn(root_a, "msg_a_user_2", "msg_a_reply_2"),
+    ...completion(root_a, "msg_a_user_2", "msg_a_reply_2"), updated(user(root_a, "msg_a_user_2")),
+    () => event(plugin, "session.created", { info: { id: root_b } }), touch(root_b),
+    prompt(root_b, "msg_b_user_1"), ...turn(root_b, "msg_b_user_1", "msg_b_reply_1"), touch(root_b),
+    ...completion(root_b, "msg_b_user_1", "msg_b_reply_1").slice(0, 6), touch(root_b),
+  ]
+  for (const arrival of schedule) {
+    await arrival()
+    await native_turn()
+  }
+  await settle(plugin)
+  const delivered = captured()
+  assert(!delivered.some((item) => item.event === "logonomic.delivery_overflow"),
+    "accepted native work within the bound must not degrade lifecycle while one delivery is in flight")
+  assert.deepEqual(delivered.filter((item) => item.event === "session.status" &&
+      (item.fresh_user_turn || item.status_type === "idle"))
+    .map((item) => [item.session_id, item.turn_id, item.status_type, item.fresh_user_turn === true]), [
+    [root_a, "msg_a_user_1", "busy", true],
+    [root_a, "msg_a_user_1", "idle", false],
+    [root_a, "msg_a_user_2", "busy", true],
+    [root_a, "msg_a_user_2", "idle", false],
+    [root_b, "msg_b_user_1", "busy", true],
+    [root_b, "msg_b_user_1", "idle", false],
+  ], "every observed root turn starts and completes, and the new root B is selected")
+  const starts = delivered.filter((item) => item.fresh_user_turn)
+  const [nonce_a, continued_a, nonce_b] = starts.map((item) => item.activation_nonce)
+  assert.match(nonce_a, /^[a-f0-9]{32}$/)
+  assert.match(nonce_b, /^[a-f0-9]{32}$/)
+  assert.equal(continued_a, nonce_a, "a later input in the same root keeps its activation")
+  assert.notEqual(nonce_b, nonce_a, "root B opens its own transition")
+  const b_selected = delivered.indexOf(starts[2])
+  const facts = delivered.flatMap((item, index) =>
+    (item.model_state?.updates ?? []).map((update) => [index, update]))
+  assert.deepEqual([...new Set(facts.map(([, update]) => update.provider_session_id))], [root_a, root_b],
+    "each root's served model is reported")
+  assert(facts.every(([index, update]) => update.agent_id === "" && (update.provider_session_id === root_a
+    ? update.transition_nonce === nonce_a
+    : update.provider_session_id === root_b && update.transition_nonce === nonce_b && index >= b_selected)),
+  "optional model facts stay with their own root activation")
+}
+
+resetCapture()
+{
+  // Repeated native observations of one serving model are optional evidence and
+  // cannot consume the capacity that the core lifecycle depends on.
+  const session_id = "model-pressure-root"
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  await publishRoot(plugin, session_id)
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "busy" } })
+  await native_turn()
+  for (let index = 0; index < 40; ++index) {
+    const message_id = `assistant-${index}-published-turn-${session_id}`
+    event(plugin, "message.updated", { info: {
+      id: message_id, sessionID: session_id,
+      parentID: `published-turn-${session_id}`, role: "assistant",
+      providerID: "fixture", modelID: "wake", tokens: unused_tokens, time: { created: 1 },
+    } })
+    step_start(plugin, session_id, message_id)
+    await native_turn()
+  }
+  event(plugin, "session.status", { sessionID: session_id, status: { type: "idle" } })
+  await settle(plugin)
+  const delivered = captured()
+  assert(!delivered.some((item) => item.event === "logonomic.delivery_overflow"),
+    "optional model observations must not degrade the core lifecycle")
+  assert(delivered.some((item) => item.event === "session.status" && item.status_type === "idle" &&
+    item.turn_id === `published-turn-${session_id}`), "the turn's completion is delivered")
+  const updates = delivered.flatMap((item) => item.model_state?.updates ?? [])
+  assert(updates.length > 0, "the served model is reported")
+  assert(updates.every((update, index) => update.provider_session_id === session_id &&
+    update.agent_id === "" && update.transition_nonce === updates[0].transition_nonce &&
+    (index === 0 || BigInt(update.sequence) >= BigInt(updates[index - 1].sequence))),
+  "any delivered model fact keeps its root activation and source order")
+}
+
+resetCapture()
+{
+  // A root usage update holds serial projection in the native catalogue lookup
+  // until the explicit release, which runs before any timer can. Model steps
+  // keep their arrival positions among core events meanwhile:
+  // - repeated parts of one dispatched message share one slot, so beyond the
+  //   128 step slots another child's step still keeps its own;
+  // - each root record and loop status stays a core barrier for its step, so
+  //   every root status carries the model served before it, ending with the newest.
+  const root_id = "slot-root"
+  let lookup_started
+  const lookup_called = new Promise((resolve) => { lookup_started = resolve })
+  let release_lookup
+  const plugin = await Logonomic({ client: { ...clientFor(new Map()), provider: { list: () => {
+    lookup_started()
+    return new Promise((resolve) => {
+      release_lookup = () => resolve({ data: { all: [{
+        id: "fixture", models: { "root-model": { limit: { context: 4000 } } },
+      }] } })
+    })
+  } } } })
+  const record = (session_id, id, model_id, update = {}) => ({ info: {
+    id, sessionID: session_id, parentID: `turn-${session_id}`, role: "assistant",
+    providerID: "fixture", modelID: model_id, tokens: unused_tokens, time: { created: 1 }, ...update,
+  } })
+  const status = (session_id, type) => event(plugin, "session.status", { sessionID: session_id, status: { type } })
+  event(plugin, "session.created", { info: { id: root_id } })
+  await plugin["chat.message"]({ sessionID: root_id }, {
+    message: { id: `turn-${root_id}` }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", record(root_id, "slot-root-reply", "root-model"))
+  status(root_id, "busy")
+  step_start(plugin, root_id, "slot-root-reply")
+  for (const id of ["slot-child-a", "slot-child-b"]) {
+    event(plugin, "session.created", { info: { id, parentID: root_id } })
+    status(id, "busy")
+    event(plugin, "message.updated", record(id, `${id}-reply`, `${id}-model`))
+    const deadline = Date.now() + 5000
+    while (!captured({ writing: true }).some((item) =>
+      item.event === "logonomic.subagent.started" && item.agent_id === id)) {
+      assert(Date.now() < deadline, `child ${id} did not start`)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  const usage = { input: 1000, output: 80, reasoning: 20, cache: { read: 200, write: 30 } }
+  plugin.event({ event: { id: "evt-slot-root-usage", type: "message.updated", properties: record(root_id,
+    "slot-root-reply", "root-model", { tokens: usage, finish: "tool-calls", time: { created: 1, completed: 2 } }) } })
+  let handshake
+  await Promise.race([lookup_called, new Promise((_, reject) => {
+    handshake = setTimeout(() => reject(new Error("the root usage projection must start its catalogue lookup")), 5000)
+  })]).finally(() => clearTimeout(handshake))
+  for (let index = 0; index < 256; ++index) step_start(plugin, "slot-child-a", "slot-child-a-reply")
+  step_start(plugin, "slot-child-b", "slot-child-b-reply")
+  for (let index = 1; index <= 3; ++index) {
+    status(root_id, "busy")
+    event(plugin, "message.updated", record(root_id, `slot-root-step-${index}`, `root-model-${index}`))
+    status(root_id, "busy")
+    step_start(plugin, root_id, `slot-root-step-${index}`)
+  }
+  status(root_id, "busy")
+  status(root_id, "idle")
+  release_lookup()
+  await settle(plugin)
+  const delivered = captured()
+  const nonce = delivered.find((item) => item.fresh_user_turn)?.activation_nonce
+  const facts = [...new Map(delivered.flatMap((item) => item.model_state?.updates ?? [])
+    .map((update) => [`${update.transition_nonce}/${update.sequence}`, update])).values()]
+  assert.deepEqual({
+    overflow: delivered.some((item) => item.event === "logonomic.delivery_overflow"),
+    core: delivered.filter((item) => item.event !== "message.updated").map((item) =>
+      [item.event, item.agent_id ?? "", item.status_type ?? "", item.fresh_user_turn === true]),
+    root_carried: delivered.filter((item) => item.event === "session.status" && !item.fresh_user_turn)
+      .map((item) => item.model_state?.updates.find((update) => !update.agent_id)?.model),
+    children: facts.filter((update) => update.agent_id)
+      .map((update) => [update.agent_id, update.model, update.transition_nonce]),
+  }, {
+    overflow: false,
+    core: [
+      ["session.status", "", "busy", true],
+      ["logonomic.subagent.started", "slot-child-a", "", false],
+      ["logonomic.subagent.started", "slot-child-b", "", false],
+      ...Array.from({ length: 7 }, () => ["session.status", "", "busy", false]),
+      ["session.status", "", "idle", false],
+    ],
+    root_carried: ["root-model", "root-model", "root-model-1", "root-model-1", "root-model-2", "root-model-2",
+      "root-model-3", "root-model-3"].map((model) => `fixture/${model}`),
+    children: [
+      ["slot-child-a", "fixture/slot-child-a-model", nonce],
+      ["slot-child-b", "fixture/slot-child-b-model", nonce],
+    ],
+  }, "model steps keep their own slots and arrival positions among core events while projection is held")
+}
+
+resetCapture()
+{
+  // Two observed roots run their loops concurrently, and OpenCode hands each
+  // event to the plugin without waiting (plugin/index.ts:255-262). Each loop
+  // publishes busy (prompt.ts:1089), writes its assistant record (1186-1201),
+  // yields while it prepares the request (1213-1263), publishes the processor's
+  // busy (processor.ts:653), then starts that record's step (424-432). A's second
+  // record arrives while A's first activation remains current; B, then A, are
+  // selected before their steps. Each arrival drains before the next.
+  const root_a = "pending-turn-a"
+  const root_b = "pending-turn-b"
+  const plugin = await Logonomic({ client: clientFor(new Map()) })
+  const record = (session_id, id, parent_id, model_id, update = {}) => ({ info: {
+    id, sessionID: session_id, parentID: parent_id, role: "assistant",
+    providerID: "fixture", modelID: model_id, tokens: unused_tokens, time: { created: 1 }, ...update,
+  } })
+  const created = (session_id) => () => event(plugin, "session.created", { info: { id: session_id } })
+  const prompt = (session_id, id) => () => plugin["chat.message"]({ sessionID: session_id }, {
+    message: { id }, parts: [{ synthetic: false }],
+  })
+  const updated = (value) => () => event(plugin, "message.updated", value)
+  const status = (session_id, type) => () =>
+    event(plugin, "session.status", { sessionID: session_id, status: { type } })
+  const step = (session_id, message_id) => () => step_start(plugin, session_id, message_id)
+  const schedule = [
+    created(root_a), prompt(root_a, "a1"), updated(record(root_a, "ma1", "a1", "model-a1")),
+    status(root_a, "busy"), step(root_a, "ma1"), status(root_a, "idle"),
+    created(root_b), prompt(root_b, "b1"),
+    status(root_b, "busy"), // B's loop: no input is confirmed yet.
+    updated(record(root_b, "mb1", "b1", "model-b1")),
+    prompt(root_a, "a2"),
+    status(root_a, "busy"), // A's loop: its first turn ended, and a2 is not yet confirmed.
+    updated(record(root_a, "ma2", "a2", "model-a2")),
+    status(root_b, "busy"), // B's processor selects B.
+    step(root_b, "mb1"),
+    status(root_a, "busy"), // A's processor selects A for a2.
+    step(root_a, "ma2"),
+    updated(record(root_a, "ma2", "a2", "model-a2", {
+      tokens: { input: 1000, output: 80, reasoning: 20, cache: { read: 200, write: 30 } },
+      finish: "stop", time: { created: 1, completed: 2 },
+    })),
+    status(root_a, "busy"), status(root_a, "idle"),
+  ]
+  for (const arrival of schedule) {
+    await arrival()
+    await native_turn()
+  }
+  await settle(plugin)
+  const delivered = captured()
+  const starts = delivered.filter((item) => item.fresh_user_turn)
+  const facts = [...new Map(delivered.flatMap((item) => item.model_state?.updates ?? [])
+    .map((update) => [`${update.transition_nonce}/${update.sequence}`, update])).values()]
+  assert.deepEqual({
+    starts: starts.map((item) => [item.session_id, item.turn_id]),
+    nonces: new Set(starts.map((item) => item.activation_nonce)).size,
+    facts: facts.map((update) => [update.provider_session_id, update.agent_id, update.model, update.transition_nonce]),
+  }, {
+    starts: [[root_a, "a1"], [root_b, "b1"], [root_a, "a2"]],
+    nonces: 3,
+    facts: [
+      [root_a, "", "fixture/model-a1", starts[0]?.activation_nonce],
+      [root_b, "", "fixture/model-b1", starts[1]?.activation_nonce],
+      [root_a, "", "fixture/model-a2", starts[2]?.activation_nonce],
+    ],
+  }, "a record of a root's next input confirms its model under the activation that input opens")
+}
+
+resetCapture()
+{
+  // Distinct core lifecycle work beyond the bound still degrades honestly
+  // instead of retaining an unbounded backlog behind a delivery in flight.
+  const root_id = "burst-capacity-root"
+  const plugin = await Logonomic({ client: clientFor(new Map([[root_id, { id: root_id }]])) })
+  await publishRoot(plugin, root_id)
+  const children = Array.from({ length: 40 }, (_, index) => `burst-capacity-child-${index}`)
+  for (const id of children) {
+    event(plugin, "session.created", { info: { id, parentID: root_id, title: privateCanary } })
+    await native_turn()
+  }
+  event(plugin, "session.status", { sessionID: root_id, status: { type: "busy" } })
+  await native_turn()
+  for (const id of children) {
+    event(plugin, "session.status", { sessionID: id, status: { type: "busy" } })
+    await native_turn()
+  }
+  await settle(plugin)
+  const delivered = captured()
+  assert.deepEqual(delivered.at(-1), { event: "logonomic.delivery_overflow" },
+    "a backlog of distinct child starts beyond the bound degrades the lifecycle")
+  assert(delivered.filter((item) => item.event === "logonomic.subagent.started").length < children.length)
+}
+
 for (const terminalEvent of [
   {
     type: "session.status",
@@ -1054,8 +1369,11 @@ resetCapture()
   )
   await waitForCapturedLength(1)
   await settle(plugin)
+  const nonce = captured()[0].activation_nonce
+  assert.match(nonce, /^[a-f0-9]{32}$/,
+    "a resume opens its root transition under the plugin's source-captured activation nonce")
   assert.deepEqual(captured(), [
-    { event: "logonomic.session.resumed", session_id: "ses_resumed" },
+    { event: "logonomic.session.resumed", session_id: "ses_resumed", activation_nonce: nonce },
   ])
 }
 for (const [sessions, description] of [
@@ -1093,8 +1411,11 @@ resetCapture()
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   await settle(plugin)
+  const nonce = captured()[0]?.activation_nonce
+  assert.match(nonce, /^[a-f0-9]{32}$/,
+    "a resume confirmed after a slow bootstrap opens its transition under the source-captured nonce")
   assert.deepEqual(captured(), [
-    { event: "logonomic.session.resumed", session_id: "ses_resumed" },
+    { event: "logonomic.session.resumed", session_id: "ses_resumed", activation_nonce: nonce },
   ], "a resume confirmed after a slow bootstrap is reported")
 }
 resetCapture()

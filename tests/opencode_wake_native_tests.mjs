@@ -143,8 +143,17 @@ try {
       ...binding, operation, provider_session_id: id, transition_nonce: nonce,
       ...(operation === "notify" ? { notification_id: "native_mail", instruction: "Read the new mailbox notification." } : {}),
     })}\n`))
-    socket.on("data", (chunk) => { bytes += chunk })
-    socket.once("end", () => { try { resolve(JSON.parse(bytes)) } catch (error) { reject(error) } })
+    socket.on("data", (chunk) => {
+      bytes += chunk
+      const newline = bytes.indexOf("\n")
+      if (newline < 0) return
+      // Like the adapter, accept the reply at its newline frame. The native
+      // bridge's close can then arrive as a reset; it cannot void that frame.
+      socket.destroy()
+      if (newline !== bytes.length - 1) { reject(new Error(`bridge reply is not one frame: ${bytes}`)); return }
+      try { resolve(JSON.parse(bytes)) } catch (error) { reject(error) }
+    })
+    socket.once("end", () => reject(new Error(`bridge closed before a complete reply: ${bytes}`)))
   })
   await until(async () => (await bridge("inspect")).available, "native turn completion")
   const accepted = await bridge("notify")
