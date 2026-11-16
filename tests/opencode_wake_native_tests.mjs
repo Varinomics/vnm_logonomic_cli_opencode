@@ -7,13 +7,15 @@ import { cp, mkdtemp, mkdir, readFile, rm } from "node:fs/promises"
 import { createServer } from "node:http"
 import { connect, createServer as create_tcp_server } from "node:net"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 
-const [executable, plugin_path, dependency_seed] = process.argv.slice(2)
+const [executable, plugin_path, dependency_seed, helper_path, event_wrapper] = process.argv.slice(2)
 assert(executable && plugin_path, "expected native OpenCode executable and managed plugin")
+assert(Boolean(helper_path) === Boolean(event_wrapper), "model gate requires both the real helper and fixture transport")
 const root = await mkdtemp(join(tmpdir(), "opencode-native-wake-"))
 const registration = join(root, "wake.json")
+const event_capture = join(root, "events.jsonl")
 const server_password = randomBytes(24).toString("hex")
 let child
 let child_exit
@@ -32,13 +34,13 @@ const model = createServer(async (request, response) => {
       { delta: {}, finish_reason: "stop" },
     ]) response.write(`data: ${JSON.stringify({
       id: `fixture-${model_calls}`, object: "chat.completion.chunk", created: 1700000000,
-      model: "wake", choices: [{ index: 0, ...chunk }],
+      model: prompt.model, choices: [{ index: 0, ...chunk }],
     })}\n\n`)
     response.end("data: [DONE]\n\n")
   } else {
     response.writeHead(200, { "Content-Type": "application/json" })
     response.end(JSON.stringify({
-      id: `fixture-${model_calls}`, object: "chat.completion", created: 1700000000, model: "wake",
+      id: `fixture-${model_calls}`, object: "chat.completion", created: 1700000000, model: prompt.model,
       choices: [{ index: 0, message: { role: "assistant", content: "Isolated mailbox" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     }))
@@ -63,7 +65,7 @@ try {
   await mkdir(join(root, "config"))
   // Optional installed public dependencies avoid a first-run npm fetch. Never
   // copy configuration, authentication, history, or any other profile material.
-  if (dependency_seed) {
+  if (dependency_seed && dependency_seed !== "-") {
     const destination = join(root, "config", "opencode")
     await mkdir(destination)
     for (const name of ["node_modules", "package.json", "package-lock.json"]) {
@@ -82,6 +84,10 @@ try {
         options: { baseURL: `http://127.0.0.1:${model.address().port}/v1`, apiKey: "local-fixture" },
         models: { wake: {
           name: "Wake fixture", limit: { context: 32000, output: 1024 }, variants: { "deliberate reasoning": {} },
+        }, child: {
+          name: "Child fixture", limit: { context: 32000, output: 1024 },
+        }, switched: {
+          name: "Switched fixture", limit: { context: 32000, output: 1024 },
         } },
       } },
       plugin: [[pathToFileURL(resolve(plugin_path)).href, { session_wake: { registration_file: registration } }]],
@@ -91,6 +97,15 @@ try {
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
     OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     OPENCODE_SERVER_PASSWORD: server_password,
+  })
+  if (helper_path) Object.assign(environment, {
+    LOGONOMIC_VNMCTL_PATH: resolve(event_wrapper),
+    LOGONOMIC_SESSION_CAPABILITY: "a".repeat(64),
+    LOGONOMIC_PROVIDER_PACKAGE_ID: "com.varinomics.cli.opencode",
+    LOGONOMIC_PROVIDER_GENERATION_DIGEST: "b".repeat(64),
+    LOGONOMIC_PROVIDER_GENERATION_NONCE: "c".repeat(32),
+    LOGONOMIC_PROVIDER_HELPERS_DIR: dirname(resolve(helper_path)),
+    OPENCODE_TEST_EVENT_CAPTURE: event_capture,
   })
   child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(native_port), "--print-logs"], {
     cwd: root, env: environment, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -111,8 +126,8 @@ try {
     assert(response.ok, `native API ${path}: ${response.status} ${await response.clone().text()}`)
     return response.status === 204 ? undefined : response.json()
   }
-  const send_turn = (id) => api(`/session/${id}/message`, {
-    agent: "plan", model: { providerID: "fixture", modelID: "wake" }, variant: "deliberate reasoning",
+  const send_turn = (id, modelID = "wake") => api(`/session/${id}/message`, {
+    agent: "plan", model: { providerID: "fixture", modelID }, variant: "deliberate reasoning",
     parts: [{ type: "text", text: "Reply with a short sentence; do not use tools." }],
   })
   const session = await api("/session", {})
@@ -157,6 +172,38 @@ try {
   assert.equal((await bridge("inspect", second.id, second_nonce)).reason, "provider_correlation_changed")
   assert.equal((await bridge("inspect")).reason, "provider_correlation_changed")
   assert.deepEqual(await bridge("notify", session.id, return_nonce), accepted)
+
+  if (helper_path) {
+    const read_events = async () => {
+      try { return (await readFile(event_capture, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse) }
+      catch (error) { if (error.code === "ENOENT") return []; throw error }
+    }
+    const child_session = await api("/session", { parentID: session.id })
+    assert.equal(child_session.parentID, session.id)
+    await send_turn(child_session.id, "child")
+    await until(async () => (await read_events()).some((entry) =>
+      entry.event === "logonomic.subagent.stopped" && entry.agent_id === child_session.id), "native child completion relay")
+    await send_turn(session.id, "switched")
+    const events = await until(async () => {
+      const entries = await read_events()
+      return entries.some((entry) => entry.model_state?.updates.some((update) =>
+        update.agent_id === "" && update.model === "fixture/switched")) && entries
+    }, "native root model change relay")
+    const updates = events.flatMap((entry) => entry.model_state?.updates ?? [])
+    const child_updates = updates.filter((update) => update.agent_id)
+    assert(child_updates.length > 0 && child_updates.every((update) =>
+      update.agent_id === child_session.id && update.provider_session_id === session.id &&
+      update.provider === "fixture" && update.model === "fixture/child"),
+    "native child evidence must identify its own serving model and parent root")
+    const starts = events.filter((entry) => entry.event === "session.status" && entry.fresh_user_turn)
+    const activations = starts.filter((entry, index) => index === 0 || entry.session_id !== starts[index - 1].session_id)
+    assert.deepEqual(activations.map((entry) => entry.session_id), [session.id, second.id, session.id])
+    assert.notEqual(activations[0].activation_nonce, activations[2].activation_nonce,
+      "native A-to-B-to-A selection must not authorize prior model callbacks")
+    assert(updates.filter((update) => !update.agent_id).every((update) =>
+      update.provider === "fixture" && ["fixture/wake", "fixture/switched"].includes(update.model)))
+    console.log("Native OpenCode model producer: own root and child models, root change, and fresh A-to-B-to-A activation passed")
+  }
 
   console.log("Native OpenCode: same live session woke once, Plan/model/variant retained, second response observed through native API")
 } catch (error) {
