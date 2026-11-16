@@ -572,7 +572,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const record_model = (actor, text) => {
     const activation = native_model_activation
     if (native_model_sequence >= 18446744073709551615n ||
-        (!native_models.has(actor) && native_models.size >= maxChildSessions)) return false
+        (!native_models.has(actor) && native_models.size >= maxChildSessions + 1)) return false
     native_models.set(actor, {
       provider_session_id: activation.id, transition_nonce: activation.nonce,
       sequence: String(++native_model_sequence), agent_id: actor === activation.id ? "" : actor,
