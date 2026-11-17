@@ -176,6 +176,32 @@ const sequential_models = sequential_children.flatMap((entry) => entry.model_sta
 assert.equal(new Set(sequential_models.filter((entry) => entry.agent_id).map((entry) => entry.agent_id)).size, 130,
   "stopped child mappings must not exhaust a lifetime-only 128-session model cache")
 
+// Lifecycle admits 128 active children beside the root. Each admitted actor's
+// own confirmed model remains available through that complete supported set.
+const concurrent_children = await run(async (plugin) => {
+  root(plugin)
+  await plugin["chat.message"]({ sessionID: "session-root" }, {
+    message: { id: "turn-user" }, parts: [{ synthetic: false }],
+  })
+  first_dispatched(plugin, "evt-root-confirmed", "evt-root-busy", assistant("session-root", usage()))
+  for (let index = 0; index < 128; ++index) {
+    const id = `concurrent-child-${index}`
+    event(plugin, `evt-create-${id}`, "session.created", { info: { id, parentID: "session-root" } })
+    event(plugin, `evt-start-${id}`, "session.status", { sessionID: id, status: { type: "busy" } })
+    dispatched(plugin, `evt-model-${id}`, assistant(id, usage(), `model-${index}`))
+    const deadline = Date.now() + 5000
+    while (!captured().some((entry) => entry.event === "logonomic.subagent.started" && entry.agent_id === id)) {
+      assert(Date.now() < deadline, `concurrent child ${id} did not start`)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+})
+assert.equal(concurrent_children.filter((entry) => entry.event === "logonomic.subagent.started").length, 128)
+assert.deepEqual(distinct_facts(concurrent_children).filter((update) => update.agent_id).map((update) =>
+  [update.agent_id, update.model]),
+Array.from({ length: 128 }, (_, index) => [`concurrent-child-${index}`, `provider-context/model-${index}`]),
+"the root model must not consume one of the 128 admitted children's model slots")
+
 // OpenCode 1.18.33 emits chat.message before session.updated for a pre-existing
 // session. The lifecycle still admits it as a root through the native lookup,
 // so the host retires the previous root transition while the plugin has no
