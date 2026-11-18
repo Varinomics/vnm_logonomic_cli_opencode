@@ -12,6 +12,7 @@ const maxMetadataCharacters = 256
 const maxPendingItems = 32
 const maxPendingTurnCandidates = 8
 const maxChildSessions = 128
+const maxModelActors = maxChildSessions + 1
 const maxChildParentDepth = 16
 const childObservationCapacityLost = Symbol("child observation capacity lost")
 const maxSessionDiffManifestBytes = Number(
@@ -572,7 +573,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const record_model = (actor, text) => {
     const activation = native_model_activation
     if (native_model_sequence >= 18446744073709551615n ||
-        (!native_models.has(actor) && native_models.size >= maxChildSessions + 1)) return false
+        (!native_models.has(actor) && native_models.size >= maxModelActors)) return false
     native_models.set(actor, {
       provider_session_id: activation.id, transition_nonce: activation.nonce,
       sequence: String(++native_model_sequence), agent_id: actor === activation.id ? "" : actor,
@@ -1415,8 +1416,15 @@ export const Logonomic = async ({ client }, options = {}) => {
       model_candidates.set(text.actor, {
         text, activation: admitted_text ? activation : undefined, input: pending_input,
       })
-      if (model_candidates.size > maxChildSessions) {
-        model_candidates.delete(model_candidates.keys().next().value)
+      // Future inputs can have assistant records before they select a root.
+      // Those records may use spare slots, but never displace an admitted actor.
+      if (model_candidates.size > maxModelActors + maxPendingItems) {
+        for (const [actor, candidate] of model_candidates) {
+          if (!admitted(candidate.text)) {
+            model_candidates.delete(actor)
+            break
+          }
+        }
       }
     }
     const step = item.model_step
@@ -1549,7 +1557,7 @@ export const Logonomic = async ({ client }, options = {}) => {
   const enqueue_step = (model_step) => {
     if (!accepting) return
     if (open_step_slots.get(model_step.actor)?.model_step.message_id === model_step.message_id) return
-    if (queued_step_slots >= maxChildSessions) return
+    if (queued_step_slots >= maxModelActors) return
     const slot = { kind: "model_step", model_step }
     open_step_slots.set(model_step.actor, slot)
     ++queued_step_slots

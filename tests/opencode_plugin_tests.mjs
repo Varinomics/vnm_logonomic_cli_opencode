@@ -2,7 +2,7 @@
 // projection contract while exercising the packaged SDK helper subprocess.
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -478,6 +478,63 @@ const unused_tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, wri
 const step_start = (plugin, session_id, message_id) => event(plugin, "message.part.updated", {
   part: { id: `step-${message_id}`, sessionID: session_id, messageID: message_id, type: "step-start" },
 })
+
+resetCapture()
+{
+  const root_id = "capacity-root"
+  const children = Array.from({ length: 128 }, (_, i) => `capacity-child-${i}`)
+  // A collecting transport lets all 129 actors progress independently of helper process startup.
+  const assets = join(scratch, "model-capacity")
+  cpSync(dirname(resolve(pluginPath)), assets, { recursive: true })
+  const relay = join(assets, "logonomic_opencode_relay.mjs")
+  writeFileSync(relay, `export const delivered = []
+    export const create_event_delivery = () => ({ deliver: async value => { delivered.push(value) }, cancel() {} })`)
+  const { delivered } = await import(pathToFileURL(relay))
+  const { Logonomic: create_plugin } = await import(pathToFileURL(join(assets, "logonomic_opencode_plugin.mjs")))
+  const plugin = await create_plugin({ client: clientFor(new Map()) })
+  event(plugin, "session.created", { info: { id: root_id } })
+  await plugin["chat.message"]({ sessionID: root_id }, {
+    message: { id: `turn-${root_id}` }, parts: [{ synthetic: false }],
+  })
+  event(plugin, "message.updated", { info: {
+    id: "first-reply", sessionID: root_id, parentID: `turn-${root_id}`, role: "assistant",
+  } })
+  event(plugin, "session.status", { sessionID: root_id, status: { type: "busy" } })
+  for (const id of children) {
+    event(plugin, "session.created", { info: { id, parentID: root_id } })
+    event(plugin, "session.status", { sessionID: id, status: { type: "busy" } })
+    await native_turn()
+  }
+  const actors = [root_id, ...children]
+  const assistant = (id) => {
+    event(plugin, "message.updated", { info: {
+      id: `reply-${id}`, sessionID: id, parentID: `turn-${id}`, role: "assistant",
+      providerID: "fixture", modelID: id, tokens: unused_tokens, time: { created: 1 },
+    } })
+  }
+  for (const id of actors) {
+    assistant(id)
+    await native_turn()
+  }
+  const next_root = "next-root"
+  event(plugin, "session.created", { info: { id: next_root } })
+  await plugin["chat.message"]({ sessionID: next_root }, {
+    message: { id: `turn-${next_root}` }, parts: [{ synthetic: false }],
+  })
+  assistant(next_root)
+  await native_turn()
+  event(plugin, "session.updated", { info: { id: root_id } })
+  for (const id of actors) {
+    step_start(plugin, id, `reply-${id}`)
+  }
+  await native_turn()
+  event(plugin, "session.status", { sessionID: next_root, status: { type: "busy" } })
+  step_start(plugin, next_root, `reply-${next_root}`)
+  await plugin.dispose()
+  const facts = delivered.flatMap(item => item.model_state?.updates ?? [])
+  assert.deepEqual(new Set(facts.map(update => update.model)), new Set([...actors, next_root].map(id => `fixture/${id}`)),
+    "root selection preserves pending confirmations across the full roster's native step batch")
+}
 
 resetCapture()
 {
