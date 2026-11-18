@@ -20,6 +20,7 @@
 #include <iterator>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -582,7 +583,11 @@ int main(int argc, char** argv)
     opencode::handle_preparation(newer_prepared);
     const auto newer_result = newer_prepared.payload
         ? addon::decode_delegated_prepare_result(*newer_prepared.payload, &failure) : std::nullopt;
-    check(newer_result && newer_result->process.argv == std::vector<std::string>{program_text, "acp"},
+    std::error_code newer_program_error;
+    check(newer_result && newer_result->process.argv.size() == 2 &&
+        newer_result->process.argv[1] == "acp" &&
+        fs::equivalent(addon::path_from_utf8(newer_result->process.argv[0]), program, newer_program_error) &&
+        !newer_program_error,
         "OpenCode 2 starts its own ACP server and receives the exact workspace in session/new");
     if (newer_result) {
         const auto merged = applied_config(newer_result->process.environment);
