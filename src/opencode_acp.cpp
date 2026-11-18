@@ -44,6 +44,11 @@ bool valid_meta(const Json& value)
     return meta.is_null() || meta.is_object();
 }
 
+bool child_projection(const Json& value)
+{
+    return member(value, "_meta").find("opencode/child-session") != nullptr;
+}
+
 // ACP's native adapter bounds decoded strings in UTF-16 code units.
 std::size_t utf16_size(std::string_view value)
 {
@@ -185,9 +190,10 @@ bool tool_locations(const Json& locations)
 
 bool tool_update(const Json& update)
 {
-    if (!only_keys(update, {"_meta", "content", "kind", "locations", "rawInput", "rawOutput",
+    if (!only_keys(update, {"_meta", "content", "kind", "locations", "name", "rawInput", "rawOutput",
                           "sessionUpdate", "status", "title", "toolCallId"}) ||
-        !valid_meta(update) || !bounded_nonempty(member(update, "toolCallId"), 512))
+        !valid_meta(update) || !bounded_nonempty(member(update, "toolCallId"), 512) ||
+        (update.find("name") && !bounded_nonempty(member(update, "name"), 512)))
     {
         return false;
     }
@@ -383,6 +389,8 @@ bool apply_update(
         if (stage != "await_prompt" || !text_chunk(update, type, &message_id)) {
             return false;
         }
+        // OpenCode 2 can project a subagent's text into the root ACP session.
+        if (child_projection(update)) return true;
         if (*result_message_id != message_id) {
             *result_message_id = message_id;
             result->clear();
@@ -464,7 +472,8 @@ bool announced_task_tool(const Json& tool, const Json& announced)
 {
     const auto call  = text(member(tool, "toolCallId"));
     const auto title = text(member(tool, "title"));
-    return text(member(tool, "kind")) == "other" &&
+    return !child_projection(tool) && text(member(tool, "kind")) == "other" &&
+        (!tool.find("name") || text(member(tool, "name")) == title) &&
         std::any_of(announced.as_array().begin(), announced.as_array().end(), [&](const Json& entry) {
             return text(member(entry, "toolCallId")) == call && text(member(entry, "title")) == title;
         });
@@ -683,11 +692,14 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     if (!pending_bytes || !prompt_bytes || !result_bytes || !deferred_input) {
         return failure("acp_invalid_state");
     }
+    if (inspection.timed_out) return failure("acp_timed_out");
+    if (inspection.final && inspection.exit_code != 0) return failure("acp_nonzero_exit");
     auto pending    = std::move(*pending_bytes);
     auto result     = std::move(*result_bytes);
     auto message_id = text(member(state, "result_message_id"));
     auto permissions = member(state, "permission_ids");
     pending.append(inspection.stdout_bytes);
+    if (text(member(state, "stage")) == "await_exit" && !pending.empty()) return failure("acp_invalid_close");
     if (pending.size() > k_max_record_bytes && pending.find('\n') == std::string::npos) {
         return failure("acp_record_bound_exceeded");
     }
@@ -761,7 +773,9 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                 return failure("model_selection_unavailable");
             }
             const auto& tools  = member(state, "task_tools").as_array();
-            if (text(member(update, "sessionUpdate")) == "tool_call" &&
+            if (text(member(update, "sessionUpdate")) == "tool_call" && !child_projection(update) &&
+                text(member(update, "kind")) == "other" &&
+                (!update.find("name") || member(update, "name") == member(update, "title")) &&
                 std::find(tools.begin(), tools.end(), member(update, "title")) != tools.end())
             {
                 auto announced = member(state, "announced");
@@ -892,21 +906,13 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         }
         else
         if (stage == "await_close") {
-            if (inspection.timed_out) {
-                return failure("acp_timed_out");
-            }
             if (!next_input.empty() || !response(value, 4, &response_result) ||
                 !only_keys(response_result, {"_meta"}) || !valid_meta(response_result) || !remaining.empty())
             {
                 return failure("acp_invalid_close");
             }
-            if (inspection.final && inspection.exit_code != 0) {
-                return failure("acp_nonzero_exit");
-            }
-            addon::Structured_inspect_result complete;
-            complete.complete     = true;
-            complete.result_bytes = std::move(result);
-            return complete;
+            state.set("stage", Json("await_exit"));
+            break;
         }
         else {
             return failure("acp_out_of_order_output");
@@ -920,14 +926,22 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
     state.set("deferred_input_base64", Json(defer_input ? addon::encode_base64(next_input) : ""));
     state.set("deferred_input_is_request", Json(defer_input && next_input_contains_request));
     state.set("deferred_input_has_permission_reply", Json(defer_input && next_input_has_permission_reply));
-    if (!next_input.empty() && !defer_input) {
-        return partial(state, next_input);
+    if (text(member(state, "stage")) == "await_exit") {
+        if (inspection.final) {
+            addon::Structured_inspect_result complete;
+            complete.complete     = true;
+            complete.result_bytes = std::move(result);
+            return complete;
+        }
+        auto waiting = partial(state, {});
+        waiting.close_stdin = true;
+        return waiting;
     }
     if (inspection.final) {
-        if (inspection.timed_out) {
-            return failure("acp_timed_out");
-        }
-        return failure(inspection.exit_code != 0 ? "acp_nonzero_exit" : "acp_exit_before_close");
+        return failure("acp_exit_before_close");
+    }
+    if (!next_input.empty() && !defer_input) {
+        return partial(state, next_input);
     }
     return partial(state, {});
 }

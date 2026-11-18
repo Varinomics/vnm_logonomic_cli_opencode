@@ -404,6 +404,10 @@ int main(int argc, char** argv)
     delegated.context.launch_environment = addon::Launch_environment{};
     delegated.context.launch_environment->platform_id = discovery.platform_id;
     auto& task_environment = delegated.context.launch_environment->effective_environment;
+    task_environment.set("OPENCODE_CONFIG", addon::Json_value(path_string(root / "user.json")));
+    task_environment.set("OPENCODE_CONFIG_DIR", addon::Json_value(path_string(root / "config")));
+    task_environment.set("XDG_STATE_HOME", addon::Json_value(path_string(root / "state")));
+    task_environment.set("AUTHORED_TASK_SETTING", addon::Json_value("frozen-value"));
     for (const auto* name : {"PATH", "SystemRoot", "TEMP", "TMP", "OPENCODE_FIXTURE_VERSION"}) {
         if (const auto* value = environment_member(effective, name)) {
             task_environment.set(name, *value);
@@ -461,6 +465,9 @@ int main(int argc, char** argv)
             "the user's configuration selectors reach the delegated OpenCode");
         check(std::find(names.begin(), names.end(), "OPENCODE_CONFIG_CONTENT") == names.end(),
             "the package's own inline configuration is not also inherited");
+        check(std::find(names.begin(), names.end(), "XDG_STATE_HOME") != names.end() &&
+            std::find(names.begin(), names.end(), "AUTHORED_TASK_SETTING") != names.end(),
+            "the selected storage and authored task settings reach the delegated native process");
         check(addon::validate_structured_process_proposal(result->process, &failure),
             "the host admits the delegated process proposal");
         check(!fs::exists(addon::path_from_utf8(attestation.find("path")->as_string())),
@@ -563,13 +570,41 @@ int main(int argc, char** argv)
     check(!missing.payload && missing.reason == "launcher_program_unavailable",
         "an unavailable executable retains its own refusal");
     auto newer = automatic;
+    const auto standalone_config = *addon::parse_json(
+        R"({"permissions":[{"action":"shell","resource":"*","effect":"deny"}],"mcp":{"servers":{"existing":{"type":"remote","url":"https://example.invalid","codemode":true}}}})",
+        {}, nullptr);
     newer.context.launch_environment->effective_environment.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("2.1.4"));
-    Context unsupported_generation;
-    unsupported_generation.invocation = prepared.invocation;
-    unsupported_generation.invocation.payload = addon::encode_delegated_prepare_request(newer);
-    opencode::handle_preparation(unsupported_generation);
-    check(!unsupported_generation.payload && unsupported_generation.reason == "opencode_acp_generation_unavailable",
-        "the distinct native TUI generation keeps its existing delegated integration limit");
+    newer.context.launch_environment->effective_environment.set("OPENCODE_CONFIG_CONTENT",
+        addon::Json_value(addon::serialize_json(standalone_config)));
+    Context newer_prepared;
+    newer_prepared.invocation = prepared.invocation;
+    newer_prepared.invocation.payload = addon::encode_delegated_prepare_request(newer);
+    opencode::handle_preparation(newer_prepared);
+    const auto newer_result = newer_prepared.payload
+        ? addon::decode_delegated_prepare_result(*newer_prepared.payload, &failure) : std::nullopt;
+    check(newer_result && newer_result->process.argv == std::vector<std::string>{program_text, "acp"},
+        "OpenCode 2 starts its own ACP server and receives the exact workspace in session/new");
+    if (newer_result) {
+        const auto merged = applied_config(newer_result->process.environment);
+        const auto* mcp = merged ? merged->find("mcp") : nullptr;
+        const auto* servers = mcp ? mcp->find("servers") : nullptr;
+        const auto* relay = servers ? servers->find("logonomic-task-catalog-task-control") : nullptr;
+        const auto* command = relay ? relay->find("command") : nullptr;
+        const auto* codemode = relay ? relay->find("codemode") : nullptr;
+        check(servers && servers->find("existing") &&
+            *servers->find("existing") == *standalone_config.find("mcp")->find("servers")->find("existing") &&
+            merged->find("permissions") && *merged->find("permissions") == *standalone_config.find("permissions"),
+            "OpenCode 2 keeps existing servers and permission rules");
+        check(codemode && codemode->is_boolean() && !codemode->as_boolean() &&
+            command && command->is_array() && command->as_array().size() == 9 &&
+            command->as_array()[0].as_string() == newer.control.connection->relay_program &&
+            command->as_array()[2].as_string() == newer.control.connection->descriptor_path,
+            "OpenCode 2 exposes the selected relay's exact tools directly in its private server");
+        const auto state = addon::parse_json(newer_result->inspection.protocol_state, {}, nullptr);
+        check(state && state->find("mcp_servers")->as_array().empty() &&
+            state->find("attestations")->as_array().size() == 1,
+            "the ACP session verifies the host receipt without re-registering a generic execute tool");
+    }
     for (const auto* option : {"--model", "--model=", "--auto=false", "--no-auto"}) {
         auto unsupported = delegated;
         unsupported.context.launcher.script_body += " " + std::string(option);

@@ -186,6 +186,7 @@ export default {
     .filter((name) => process.env[name]).map((name) => [name, process.env[name]]))
   Object.assign(environment, {
     PATH: dirname(resolve(executable)) + delimiter + (environment.PATH ?? ""),
+    HOME: root, USERPROFILE: root, APPDATA: root, LOCALAPPDATA: root,
     TERM: "xterm-256color",
     XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"),
     XDG_STATE_HOME: join(root, "state"), XDG_CACHE_HOME: join(root, "cache"),

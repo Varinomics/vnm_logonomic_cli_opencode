@@ -7,6 +7,10 @@
     ],
     "environment_names": [
       "OPENCODE_CONFIG_CONTENT",
+      "OPENCODE_CONFIG",
+      "OPENCODE_CONFIG_DIR",
+      "XDG_STATE_HOME",
+      "XDG_CACHE_HOME",
       "SystemRoot",
       "WINDIR",
       "TEMP",

@@ -494,7 +494,7 @@ std::optional<std::vector<std::string>> prepare_initial_prompt(
     for (const auto& [name, value] : launch.environment) {
         addon::set_environment(environment, name, value);
     }
-    const auto help = addon::probe(probe, environment, request.working_directory, 3000, context);
+    const auto help = addon::probe(probe, environment, request.working_directory, 10000, context);
     static const std::regex prompt_option(R"((^|\n)[^\n]*[ \t]--prompt([ \t=<]|$))");
     if (!help || (!std::regex_search(help->output, prompt_option) &&
                  !std::regex_search(help->errors, prompt_option)))
@@ -801,10 +801,6 @@ void prepare_delegated(addon::Invocation_context& context)
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
         return;
     }
-    if (uses_tui_plugin(launch->version)) {
-        context.fail(addon::Result_status::UNAVAILABLE, "opencode_acp_generation_unavailable");
-        return;
-    }
     auto config = inline_config(request->context.launch_environment->effective_environment);
     if (const auto* permission = config.value.find("permission")) {
         if (!permission->is_object() &&
@@ -832,6 +828,18 @@ void prepare_delegated(addon::Invocation_context& context)
     auto servers = addon::Json_value::array();
     auto attestations = addon::Json_value::array();
     auto task_tools = addon::Json_value::array();
+    const bool standalone = uses_tui_plugin(launch->version);
+    addon::Json_value* native_servers = nullptr;
+    if (standalone) {
+        if (!config.value.find("mcp")) config.value.set("mcp", addon::Json_value::object());
+        auto* mcp = config.value.find("mcp");
+        if (mcp->is_object() && !mcp->find("servers")) mcp->set("servers", addon::Json_value::object());
+        native_servers = mcp->find("servers");
+        if (!native_servers || !native_servers->is_object()) {
+            context.fail(addon::Result_status::UNAVAILABLE, "invalid_mcp_configuration");
+            return;
+        }
+    }
     for (const auto& server : request->control.servers) {
         const auto nonce = addon::random_nonce_hex();
         const auto stem = "mcp/server-" + nonce;
@@ -850,17 +858,32 @@ void prepare_delegated(addon::Invocation_context& context)
         // Materialization creates the parent; the host exclusively reserves the ready file.
         result.private_artifacts.push_back({stem + ".connection", nonce});
         result.acknowledgment.server_ids.push_back(server.server_id);
-        auto mcp = addon::Json_value::object();
         const auto name = "logonomic-task-" + request->control.task_id + "-" + server.server_id;
         // OpenCode names an MCP tool <server>_<tool>.
         for (const auto& action : server.actions) {
             task_tools.push_back(addon::Json_value(name + "_" + action));
         }
-        mcp.set("name", addon::Json_value(name));
-        mcp.set("command", addon::Json_value(connection.relay_program));
-        mcp.set("args", addon::Json_value(std::move(arguments)));
-        mcp.set("env", addon::Json_value::array());
-        servers.push_back(std::move(mcp));
+        auto mcp = addon::Json_value::object();
+        if (native_servers) {
+            // OpenCode 2 exposes session/new MCP servers through its general execute tool.
+            // A per-server setting in its private process exposes only the named Task tools directly.
+            arguments.insert(arguments.begin(), addon::Json_value(connection.relay_program));
+            mcp.set("type", addon::Json_value("local"));
+            mcp.set("command", addon::Json_value(std::move(arguments)));
+            mcp.set("codemode", addon::Json_value(false));
+            if (native_servers->find(name)) {
+                context.fail(addon::Result_status::UNAVAILABLE, "task_server_name_conflict");
+                return;
+            }
+            native_servers->set(name, std::move(mcp));
+        }
+        else {
+            mcp.set("name", addon::Json_value(name));
+            mcp.set("command", addon::Json_value(connection.relay_program));
+            mcp.set("args", addon::Json_value(std::move(arguments)));
+            mcp.set("env", addon::Json_value::array());
+            servers.push_back(std::move(mcp));
+        }
         auto attestation = addon::Json_value::object();
         attestation.set("server_id", addon::Json_value(server.server_id));
         attestation.set("path", addon::Json_value(ready_path));
@@ -883,18 +906,20 @@ void prepare_delegated(addon::Invocation_context& context)
         result.process.environment.end());
     result.process.environment.emplace_back(config.environment_name, literal_config_json(config.value));
     result.process.environment.emplace_back("OPENCODE_ENABLE_QUESTION_TOOL", "0");
-    // OPENCODE_CONFIG and OPENCODE_CONFIG_DIR select the user's configuration,
-    // and with it the permission rules the delegated run keeps.
-    result.process.environment_names = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
-        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"};
-    std::erase_if(result.process.environment_names, [&result](const std::string& name) {
-        return std::any_of(result.process.environment.begin(), result.process.environment.end(),
-            [&name](const auto& entry) { return environment_name_equal(entry.first, name); });
-    });
+    for (const auto& member : request->context.launch_environment->effective_environment.as_object()) {
+        if (std::none_of(result.process.environment.begin(), result.process.environment.end(),
+                [&](const auto& entry) { return environment_name_equal(entry.first, member.name); })) {
+            result.process.environment_names.push_back(member.name);
+        }
+    }
     result.inspection = make_acp_inspection(
         request->prompt, request->context.working_directory, launch->version, servers, attestations, task_tools,
         launch->auto_approve, selection);
     result.inspection.keep_stdin_open = true;
+    if (!addon::validate_structured_process_proposal(result.process, &failure)) {
+        context.fail(addon::Result_status::UNAVAILABLE, failure.reason_code);
+        return;
+    }
     auto payload = addon::encode_delegated_prepare_result(result);
     if (!addon::validate_session_exchange_payload(payload, &failure)) {
         context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);

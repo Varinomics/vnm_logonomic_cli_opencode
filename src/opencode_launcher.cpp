@@ -743,12 +743,15 @@ std::optional<Verified_launch> verified_launch(
         probe_argv.insert(probe_argv.begin() + 1, path_to_utf8(*node_script));
         launch_argv.emplace_back(path_to_utf8(*node_script));
     }
-    int timeout_ms = 3000;
+    std::vector<std::string> standalone_acp_argv;
+    int timeout_ms = 10000;
     // The stock Node launcher selects a platform package at runtime, so its
     // selected native image cannot participate in our file-identity cache.
     bool cacheable = !node_script;
     if (delegated) {
         launch_argv = {path_to_utf8(*selected), "acp", "--cwd", std::string(working_directory)};
+        // OpenCode 2 starts its own private server and takes the directory in session/new.
+        standalone_acp_argv = {path_to_utf8(*selected), "acp"};
         probe_argv  = {path_to_utf8(*selected), "--version"};
         if (launcher.runner_key == "powershell" || !native_image(*selected)) {
 #ifdef _WIN32
@@ -763,8 +766,8 @@ std::optional<Verified_launch> verified_launch(
             };
             probe_argv  = make_shell({"--version"});
             launch_argv = make_shell({"acp", "--cwd", std::string(working_directory)});
+            standalone_acp_argv = make_shell({"acp"});
             files.push_back(*shell);
-            timeout_ms = 10000;
 #else
             return std::nullopt;
 #endif
@@ -780,7 +783,6 @@ std::optional<Verified_launch> verified_launch(
         if (!shell || !native_image(*shell)) return std::nullopt;
         probe_argv = {path_to_utf8(*shell), "-NoLogo", "-Command", literal.front() + " --version; exit $LASTEXITCODE"};
         files.push_back(*shell);
-        timeout_ms = 10000;
         cacheable  = false;
 #else
         return std::nullopt;
@@ -815,6 +817,11 @@ std::optional<Verified_launch> verified_launch(
         append(addon::file_time_ticks_text(identities[index].second));
     }
     const auto cache_key = addon::to_hex(digest.finish());
+    const auto result = [&](const std::string& version) {
+        return Verified_launch{
+            delegated && uses_tui_plugin(version) ? std::move(standalone_acp_argv) : std::move(launch_argv),
+            version, command->environment, delegated && options->auto_approve};
+    };
     static std::mutex cache_mutex;
     static std::map<std::string, std::string> cache;
     if (cacheable) {
@@ -823,8 +830,7 @@ std::optional<Verified_launch> verified_launch(
         if (cached != cache.end() && !context.cancel_requested()) {
             if ((!package_version.empty() && cached->second != package_version) ||
                 !version_is_at_least(cached->second, 1, 18, delegated ? 25 : 11)) return std::nullopt;
-            return Verified_launch{std::move(launch_argv), cached->second, command->environment,
-                delegated && options->auto_approve};
+            return result(cached->second);
         }
     }
     const auto output = addon::probe(probe_argv, environment, working_directory, timeout_ms, context);
@@ -842,8 +848,7 @@ std::optional<Verified_launch> verified_launch(
         if (cache.size() >= 32) cache.erase(cache.begin());
         cache[cache_key] = version;
     }
-    return Verified_launch{std::move(launch_argv), version, command->environment,
-        delegated && options->auto_approve};
+    return result(version);
 }
 
 } // namespace opencode

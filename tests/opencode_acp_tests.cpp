@@ -199,7 +199,7 @@ void model_selection_contract(const fs::path& attestation)
             "both native acknowledgments release the prompt");
         session.feed(k_message);
         session.feed(k_end_turn);
-        require(session.feed(k_closed).result_bytes == "Finished", "selected task retains normal completion");
+        require(session.feed(k_closed, true).result_bytes == "Finished", "selected task retains normal completion");
     }
     for (const auto& selection : {
             addon::Delegated_model_selection{selected.model, std::nullopt},
@@ -321,7 +321,7 @@ void run(const fs::path& attestation)
         automatic.feed(k_message);
         const auto ended = automatic.feed(k_end_turn);
         require(!ended.complete && ended.stdin_bytes, "native edit completion must request close");
-        const auto closed = automatic.feed(k_closed);
+        const auto closed = automatic.feed(k_closed, true);
         require(closed.complete && closed.result_bytes == "Finished",
             "refusing the client write must preserve native prompt completion");
     }
@@ -351,7 +351,7 @@ void run(const fs::path& attestation)
         require(parse(completed.stdin_bytes->substr(0, refusal_end)) == unsupported &&
                 parse(completed.stdin_bytes->substr(refusal_end + 1)).find("method")->as_string() == "session/close",
             "the combined continuation must send the write refusal before the close request");
-        require(automatic.feed(k_closed).result_bytes == "Finished",
+        require(automatic.feed(k_closed, true).result_bytes == "Finished",
             "the coalesced native edit must close and deliver its result");
         const auto transcript = write_bytes + k_message + k_end_turn;
         for (std::size_t split = 1; split < transcript.size(); ++split) {
@@ -364,7 +364,7 @@ void run(const fs::path& attestation)
                     first.stdin_bytes.value_or("") + second.stdin_bytes.value_or("") == *completed.stdin_bytes &&
                     second.protocol_state == completed.protocol_state,
                 "every split of write, message and end_turn must preserve replies and continuation");
-            require(fragmented.feed(k_closed).result_bytes == "Finished",
+            require(fragmented.feed(k_closed, true).result_bytes == "Finished",
                 "a split native edit must close and deliver the same result");
         }
     }
@@ -523,6 +523,24 @@ void run(const fs::path& attestation)
         result = session.feed(k_closed, true);
         require(result.complete && result.result_bytes == "Finished",
             "either announcement order must deliver the result");
+    }
+    {
+        // OpenCode 2 projects a subagent's text under the root sessionId.
+        auto child = parse(k_message);
+        auto* update = child.find("params")->find("update");
+        update->set("_meta", parse(R"({"opencode/child-session":{"id":"ses_child","parentID":"ses_root","depth":1}})"));
+        update->set("messageId", Json("msg_child"));
+        update->find("content")->set("text", Json("Child answer"));
+        const auto child_bytes = addon::serialize_json(child) + '\n';
+        Session session(attestation);
+        session.reach_prompt();
+        session.feed(k_message + child_bytes + k_end_turn);
+        require(session.feed(k_closed, true).result_bytes == "Finished",
+            "a projected child cannot replace the root result");
+        Session child_only(attestation);
+        child_only.reach_prompt();
+        require(child_only.feed(child_bytes + k_end_turn).failure_reason == "acp_invalid_prompt_completion",
+            "a projected child cannot supply a missing root answer");
     }
     {
         Session session(attestation);
@@ -761,7 +779,7 @@ void run(const fs::path& attestation)
         const auto ended = session.feed(replacement.substr(split) + k_end_turn);
         require(ended.stdin_bytes && ended.stdin_bytes->find("session/close") != std::string::npos,
             "end_turn after a split message chunk must request close");
-        const auto result = session.feed(k_closed);
+        const auto result = session.feed(k_closed, true);
         require(result.complete && result.result_bytes == "RevisedRevised",
             "a new message replaces earlier chunks and keeps its own chunks across reads");
     }
@@ -770,6 +788,23 @@ void run(const fs::path& attestation)
         session.reach_prompt();
         const auto result = session.feed(std::string(256 * 1024 + 1, 'x'));
         require(result.failure_reason == "acp_record_bound_exceeded", "unterminated record bound");
+    }
+    for (const auto& [tail, exit, timeout, reason] : {
+            std::tuple<const char*, int, bool, const char*>{"", 0, false, ""},
+            {"", 7, false, "acp_nonzero_exit"}, {"malformed", 7, false, "acp_nonzero_exit"},
+            {"", 0, true, "acp_timed_out"}, {"unexpected", 0, false, "acp_invalid_close"}})
+    {
+        Session session(attestation);
+        session.reach_prompt();
+        session.feed(k_message + k_end_turn);
+        const auto closing = session.feed(k_closed);
+        require(!closing.complete && closing.close_stdin && !closing.stdin_bytes && !closing.result_bytes,
+            "the native close acknowledgment requests EOF and waits for the actual process exit");
+        const auto terminal = session.feed(tail, true, timeout, exit);
+        require(terminal.complete && (std::string_view(reason).empty()
+            ? terminal.result_bytes == "Finished" && !terminal.failure_reason
+            : !terminal.result_bytes && terminal.failure_reason == reason),
+            "final native exit and trailing output decide the delegated result");
     }
     {
         Session session(attestation);
@@ -817,6 +852,19 @@ void run(const fs::path& attestation)
             request("call_task", k_task_tool, "other", true));
         require(!task.complete && task.stdin_bytes, "an announced Task tool call is answered");
         require_permission_reply(*task.stdin_bytes, Json(17), "once");
+        for (const bool same_name : {true, false}) {
+            // Native OpenCode 2 also reports the tool's registered name.
+            auto announced = parse(announce("call_task", k_task_tool, "other"));
+            announced.find("params")->find("update")->set("name", Json(k_task_tool));
+            auto permission = parse(request("call_task", k_task_tool, "other", true));
+            permission.find("params")->find("toolCall")->set("name", Json(same_name ? k_task_tool : "execute"));
+            Session session(attestation);
+            session.reach_prompt();
+            const auto reply = session.feed(addon::serialize_json(announced) + '\n' +
+                addon::serialize_json(permission) + '\n');
+            require(reply.stdin_bytes.has_value(), "a native named permission request has a single reply");
+            require_permission_reply(*reply.stdin_bytes, Json(17), same_name ? "once" : "reject");
+        }
         for (const auto& [announced, requested, kind] : {
                 std::tuple<std::string, std::string, const char*>{"bash", k_task_tool, "execute"},
                 {"logonomic-task-t-task_control_other", "logonomic-task-t-task_control_other", "other"},

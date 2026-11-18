@@ -7,6 +7,8 @@
   "delegated_acp_minimum": "1.18.25",
   "native_tui_contract": "@opencode/cli 2.1.4",
   "native_tui_source": "https://github.com/anomalyco/opencode/tree/68bc26b7da1990ce10ffecfbc1e09eb13aa5d824",
+  "standalone_acp_contract": "@opencode/cli 2.1.4 and 2.3.2",
+  "standalone_acp_source": "https://github.com/anomalyco/opencode/tree/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/cli/src/acp",
   "forward_policy": "Newer versions are admitted after stock launcher verification; actual ACP and event records are validated.",
   "icons_source": "https://github.com/lobehub/lobe-icons/tree/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75",
   "icons_license": "notices/lobe_icons_mit.txt"

@@ -10,8 +10,8 @@ OpenCode has no singular global account, authentication, quota, or usage model i
 this integration. Those capabilities are not advertised. Read-only structured
 review is unavailable; structured inspection belongs to delegated implementation.
 
-A delegated task keeps the launcher's permission posture: OpenCode's own
-`permission` configuration, which the package passes through unchanged, decides
+A delegated task keeps the launcher's permission posture. OpenCode's own
+`permission` (1.x) or `permissions` (2.x) configuration decides
 which tools run and which ask. When OpenCode asks, the package answers with the
 request's own `once` option only for the task's own Task tools
 (`logonomic-task-<task>-<server>_<action>`, announced by OpenCode's `tool_call`
@@ -30,7 +30,15 @@ the native session's model first and effort second, and requires OpenCode to
 acknowledge the exact values before submitting the prompt. An unavailable model,
 effort or native configuration option refuses the task. Omitted fields retain
 the native defaults, and saved launchers and configuration files remain unchanged.
-The OpenCode 2 TUI integration retains its existing delegated ACP limitation.
+
+OpenCode 2 starts a private server for each delegated ACP process. Its inline
+configuration exposes each host-supplied MCP relay's actions directly with
+the native per-server `codemode: false` setting. The client requires the
+host's nonce receipt before sending the task prompt and matches the registered
+tool name when OpenCode supplies it in a permission request. Child-session
+text projected into the same ACP stream cannot supply the task's root answer.
+After the native session closes, the client closes stdin and waits for a
+successful exit before publishing that answer.
 
 The ACP client advertises no filesystem capability. Valid native
 `fs/write_text_file` requests receive JSON-RPC `-32601`; OpenCode owns the
@@ -61,7 +69,8 @@ configuration; OpenCode discovers its TUI entrypoint alongside the user's existi
 | Native contract | Integrated behavior |
 | --- | --- |
 | `opencode-ai` hooks and SDK | Lifecycle, native questions and permissions, context telemetry, changed-file tools, resume, delegated ACP and idle wake |
-| `@opencode/cli` 2.x TUI and inbox | Selected root session, execution outcomes, native forms and permissions, resume and idle wake; delegated ACP, context telemetry and changed-file tools are not advertised through this contract |
+| `@opencode/cli` 2.x TUI and inbox | Selected root session, execution outcomes, native forms and permissions, resume and idle wake |
+| `@opencode/cli` 2.x ACP | Delegated implementation through the native private server, including frozen workspace, task relay, permissions, model and reasoning-effort selection |
 
 A stored session resumes through the same verified launcher with
 `--session <id>` added. The hooks plugin confirms the native store identity;
@@ -167,7 +176,8 @@ can resolve only the host-selected conversational hint. No transcript hydration
 or external classification is used. Pending question, reply, and hint tracking
 are bounded; overflow uses the existing lifecycle-degradation path.
 
-Delegated ACP question disabling and base helper-ingress contracts are unchanged.
+OpenCode 1 disables its native question tool for delegated ACP. OpenCode 2
+receives no form-elicitation capability and handles unavailable native forms.
 Provider fixtures establish protocol behavior, not paid native or UI qualification.
 The wake fixture exercises the real authenticated bridge and packaged C++ adapter,
 including repeat delivery, busy/attention deferral and uncertain acceptance.
