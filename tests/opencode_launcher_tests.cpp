@@ -1001,6 +1001,18 @@ int main(int argc, char** argv)
         "cancelled request does not probe");
     context.cancelled = false;
     effective.set("OPENCODE_FIXTURE_VERSION", addon::Json_value("1.18.25"));
+    const auto saved_deadline = context.invocation.deadline_ms;
+    context.invocation.deadline_ms = addon::limits::k_no_invoke_deadline_ms;
+    const auto started = std::chrono::steady_clock::now();
+    const int cold_start_budget = opencode::remaining_probe_ms(context, started);
+    check(cold_start_budget > 10000 && cold_start_budget <= addon::limits::k_launch_prepare_deadline_ms,
+        "a cold stock launcher receives the remaining native preparation budget");
+    context.invocation.deadline_ms = 1234;
+    const auto half_spent = started - std::chrono::milliseconds(600);
+    check(opencode::remaining_probe_ms(context, half_spent) <= 634 &&
+        !opencode::verified_launch(launcher, {program_text}, effective, path_string(root), false, context,
+            started - std::chrono::seconds(2)), "a short host deadline also bounds cached proofs and subsequent probes");
+    context.invocation.deadline_ms = saved_deadline;
     for (const char* mode : {"overflow", "failed"}) {
         effective.set("OPENCODE_FIXTURE_MODE", addon::Json_value(mode));
         check(!opencode::verified_launch(launcher, {program_text}, effective, path_string(root), false, context), mode);

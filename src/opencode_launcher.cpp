@@ -623,10 +623,18 @@ std::optional<Delegated_launcher_options> delegated_launcher_options(const std::
     return options;
 }
 
+int remaining_probe_ms(const addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
+{
+    const auto budget = std::min<std::int64_t>(context.request().deadline_ms, addon::limits::k_launch_prepare_deadline_ms);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    return context.cancel_requested() ? 0 : static_cast<int>(std::max<std::int64_t>(0, budget - elapsed));
+}
+
 std::optional<Verified_launch> verified_launch(
     const addon::Launcher_request& launcher, const std::vector<std::string>& launcher_argv,
     const addon::Json_value& effective_environment, std::string_view working_directory,
-    bool delegated, addon::Invocation_context& context)
+    bool delegated, addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
 {
     auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
@@ -748,7 +756,6 @@ std::optional<Verified_launch> verified_launch(
         launch_argv.emplace_back(path_to_utf8(*node_script));
     }
     std::vector<std::string> standalone_acp_argv;
-    int timeout_ms = 10000;
     // The stock Node launcher selects a platform package at runtime, so its
     // selected native image cannot participate in our file-identity cache.
     bool cacheable = !node_script;
@@ -831,14 +838,16 @@ std::optional<Verified_launch> verified_launch(
     if (cacheable) {
         std::lock_guard lock(cache_mutex);
         const auto cached = cache.find(cache_key);
-        if (cached != cache.end() && !context.cancel_requested()) {
+        if (cached != cache.end() && remaining_probe_ms(context, started)) {
             if ((!package_version.empty() && cached->second != package_version) ||
                 !version_is_at_least(cached->second, 1, 18, delegated ? 25 : 11)) return std::nullopt;
             return result(cached->second);
         }
     }
+    const auto timeout_ms = remaining_probe_ms(context, started);
+    if (!timeout_ms) return std::nullopt;
     const auto output = addon::probe(probe_argv, environment, working_directory, timeout_ms, context);
-    if (!output) return std::nullopt;
+    if (!output || !remaining_probe_ms(context, started)) return std::nullopt;
     for (std::size_t index = 0; index < files.size(); ++index) {
         std::error_code error;
         if (fs::file_size(files[index], error) != identities[index].first || error) return std::nullopt;

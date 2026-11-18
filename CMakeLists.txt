@@ -268,7 +268,7 @@ set_tests_properties(
 if(WIN32)
     # The full lifecycle and actor-limit fixtures start hundreds of native
     # helper and wrapper processes, including a 130-child sequential run.
-    set_tests_properties(opencode_plugin_tests opencode_context_plugin_tests PROPERTIES TIMEOUT 900)
+    set_tests_properties(opencode_plugin_tests opencode_context_plugin_tests opencode_tui_plugin_tests PROPERTIES TIMEOUT 900)
 endif()
 
 # Exercise this repository's actual producer, never a substitute packaging

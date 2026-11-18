@@ -479,7 +479,8 @@ bool interactive_launcher_admitted(
 std::optional<std::vector<std::string>> prepare_initial_prompt(
     const addon::Prepare_request& request,
     const Verified_launch&        launch,
-    addon::Invocation_context&    context)
+    addon::Invocation_context&    context,
+    std::chrono::steady_clock::time_point started)
 {
     auto invocation = initial_prompt_invocation(
         request.launcher, request.launcher_argv, request.launch_environment->effective_environment,
@@ -494,9 +495,11 @@ std::optional<std::vector<std::string>> prepare_initial_prompt(
     for (const auto& [name, value] : launch.environment) {
         addon::set_environment(environment, name, value);
     }
-    const auto help = addon::probe(probe, environment, request.working_directory, 10000, context);
+    const auto timeout_ms = remaining_probe_ms(context, started);
+    const auto help = timeout_ms ? addon::probe(probe, environment, request.working_directory, timeout_ms, context)
+                                 : std::nullopt;
     static const std::regex prompt_option(R"((^|\n)[^\n]*[ \t]--prompt([ \t=<]|$))");
-    if (!help || (!std::regex_search(help->output, prompt_option) &&
+    if (!help || !remaining_probe_ms(context, started) || (!std::regex_search(help->output, prompt_option) &&
                  !std::regex_search(help->errors, prompt_option)))
     {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
@@ -543,7 +546,7 @@ void finish_interactive(
     context.succeed(addon::encode_launch_patch(patch, 3));
 }
 
-void prepare_interactive(addon::Invocation_context& context)
+void prepare_interactive(addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
 {
     addon::Contract_failure failure;
     const auto request = addon::decode_prepare_request(context.request().payload, &failure, 3);
@@ -560,7 +563,7 @@ void prepare_interactive(addon::Invocation_context& context)
     // The host's complete invocation, shell included, is what the verification
     // must match before the event relay may report this launch's lifecycle.
     const auto launch = verified_launch(request->launcher, request->launcher_argv,
-        request->launch_environment->effective_environment, request->working_directory, false, context);
+        request->launch_environment->effective_environment, request->working_directory, false, context, started);
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
@@ -573,7 +576,7 @@ void prepare_interactive(addon::Invocation_context& context)
             context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable);
             return;
         }
-        initial_invocation = prepare_initial_prompt(*request, *launch, context);
+        initial_invocation = prepare_initial_prompt(*request, *launch, context, started);
         if (!initial_invocation) {
             return;
         }
@@ -651,7 +654,7 @@ bool source_matches(const addon::Json_value& record, const std::optional<std::st
     return !retained || (source && retained->as_string() == *source);
 }
 
-void inspect_resume(addon::Invocation_context& context)
+void inspect_resume(addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
 {
     addon::Contract_failure failure;
     const auto request = addon::decode_resume_inspect_request(context.request().payload, &failure);
@@ -667,7 +670,7 @@ void inspect_resume(addon::Invocation_context& context)
     addon::Resume_inspect_result result;
     const auto& launch = request->context;
     const auto verified = verified_launch(launch.launcher, launch.launcher_argv,
-        launch.launch_environment->effective_environment, launch.working_directory, false, context);
+        launch.launch_environment->effective_environment, launch.working_directory, false, context, started);
     if (verified) {
         const auto source = prepare_conversation_source(launch.launcher, launch.launcher_argv,
             launch.launch_environment->effective_environment, launch.working_directory, &*verified);
@@ -679,7 +682,7 @@ void inspect_resume(addon::Invocation_context& context)
     context.succeed(addon::encode_resume_inspect_result(result, context.request().capability.version));
 }
 
-void prepare_resume(addon::Invocation_context& context)
+void prepare_resume(addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
 {
     addon::Contract_failure failure;
     const auto request = addon::decode_resume_prepare_request(context.request().payload, &failure, 2);
@@ -703,7 +706,7 @@ void prepare_resume(addon::Invocation_context& context)
     // The resumed session confirms its identity through its lifecycle, so a
     // launch that cannot report lifecycle cannot resume.
     const auto verified = verified_launch(launch.launcher, launch.launcher_argv,
-        launch.launch_environment->effective_environment, launch.working_directory, false, context);
+        launch.launch_environment->effective_environment, launch.working_directory, false, context, started);
     if (!verified) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
@@ -767,7 +770,7 @@ void prepare_resume(addon::Invocation_context& context)
     context.succeed(addon::encode_resume_prepare_result(result, 2));
 }
 
-void prepare_delegated(addon::Invocation_context& context)
+void prepare_delegated(addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
 {
     addon::Contract_failure failure;
     const auto request = addon::decode_delegated_prepare_request(context.request().payload, &failure);
@@ -795,7 +798,7 @@ void prepare_delegated(addon::Invocation_context& context)
         return;
     }
     const auto launch = verified_launch(request->context.launcher, request->context.launcher_argv,
-        request->context.launch_environment->effective_environment, request->context.working_directory, true, context);
+        request->context.launch_environment->effective_environment, request->context.working_directory, true, context, started);
     if (!launch) {
         context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
             context.cancel_requested() ? "cancelled" : "launcher_program_unavailable");
@@ -932,19 +935,20 @@ void prepare_delegated(addon::Invocation_context& context)
 
 void handle_preparation(addon::Invocation_context& context)
 {
+    const auto started = std::chrono::steady_clock::now();
     const auto& request = context.request();
     if (request.capability.capability_id == "interactive-resume" &&
         request.operation == addon::k_inspect_resume_operation &&
         (request.capability.version == 3 || request.capability.version == 4))
     {
-        inspect_resume(context);
+        inspect_resume(context, started);
     }
     else
     if (request.capability.capability_id == "interactive-resume" &&
         request.capability.version == 2 &&
         request.operation == addon::k_prepare_resume_operation)
     {
-        prepare_resume(context);
+        prepare_resume(context, started);
     }
     else
     if (request.operation != "prepare") {
@@ -952,11 +956,11 @@ void handle_preparation(addon::Invocation_context& context)
     }
     else
     if (request.capability.capability_id == "launch-preparation") {
-        prepare_interactive(context);
+        prepare_interactive(context, started);
     }
     else
     if (request.capability.capability_id == "delegated-session") {
-        prepare_delegated(context);
+        prepare_delegated(context, started);
     }
     else
     if (request.capability.capability_id == "structured-session") {

@@ -3,6 +3,7 @@
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/launcher_discovery.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -80,6 +81,8 @@ struct Delegated_launcher_options
 
 std::optional<Delegated_launcher_options> delegated_launcher_options(const std::vector<std::string>& literal);
 
+int remaining_probe_ms(const addon::Invocation_context& context, std::chrono::steady_clock::time_point started);
+
 // Probes only a native image or a verified stock npm installation. Delegated
 // probes execute the selected shim, preserving its behavior and version evidence.
 std::optional<Verified_launch> verified_launch(
@@ -88,6 +91,7 @@ std::optional<Verified_launch> verified_launch(
     const addon::Json_value&        effective_environment,
     std::string_view                working_directory,
     bool                            delegated,
-    addon::Invocation_context&     context);
+    addon::Invocation_context&     context,
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now());
 
 } // namespace opencode
