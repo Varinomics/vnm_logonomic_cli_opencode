@@ -1148,6 +1148,27 @@ int main(int argc, char** argv)
     std::ofstream(classic_package / "bin" / "fixture.version") << "1.18.25\n";
     std::ofstream(npm_package / "bin" / "fixture.version") << "2.1.4\n";
     npm_environment.set("OPENCODE_FIXTURE_MODE", addon::Json_value("installed-version"));
+    const auto project_bin = npm_root / "node_modules" / ".bin";
+    fs::create_directories(project_bin);
+    for (const auto& [entry, alias, version] : {
+            std::tuple{"opencode-ai", "opencode", "1.18.25"}, {"@opencode/cli", "opencode2", "2.1.4"}})
+    {
+        const std::string target = "../" + std::string(entry) + "/bin/opencode.exe";
+        for (const bool powershell : {false, true}) {
+            const auto shim = project_bin / (std::string(alias) + (powershell ? ".ps1" : ".cmd"));
+            std::string batch_target = target;
+            std::replace(batch_target.begin(), batch_target.end(), '/', '\\');
+            std::ofstream(shim, std::ios::binary) << (powershell ? "& \"$basedir/" + target + "\" $args\n"
+                : "@echo off\r\n\"%dp0%\\" + batch_target + "\" %*\r\n");
+#ifndef _WIN32
+            fs::permissions(shim, fs::perms::owner_all, fs::perm_options::replace);
+#endif
+            const auto selected = opencode::verified_launch({"\"" + path_string(shim) + "\"", "direct", ""},
+                {path_string(shim)}, npm_environment, path_string(root), false, context);
+            check(selected && selected->version == version,
+                "project-local npm links select their exact sibling package's declared native binary");
+        }
+    }
     const auto mixed_launch = opencode::verified_launch({"\"" + path_string(npm_shim) + "\"", "direct", ""},
         {path_string(npm_shim)}, npm_environment, path_string(root), false, context);
     if (mixed_launch && mixed_launch->version != "2.1.4") {

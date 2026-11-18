@@ -85,13 +85,14 @@ class Session
 {
 public:
     explicit Session(const fs::path& attestation, bool auto_approve = false,
-        const std::optional<addon::Delegated_model_selection>& selection = std::nullopt)
+        const std::optional<addon::Delegated_model_selection>& selection = std::nullopt,
+        const std::string& version = "1.2.3")
     {
         const auto path = attestation.u8string();
         Json entry = parse("{\"server_id\":\"task_control\",\"nonce\":\"0123456789abcdef0123456789abcdef\"}");
         entry.set("path", Json(std::string(path.begin(), path.end())));
         m_state = opencode::make_acp_inspection(
-            "Implement the requested change", ".", "1.2.3", Json::array(),
+            "Implement the requested change", ".", version, Json::array(),
             Json(Json::Array{entry}), Json(Json::Array{Json(k_task_tool)}), auto_approve, selection).protocol_state;
     }
 
@@ -186,6 +187,29 @@ void model_selection_contract(const fs::path& attestation)
     const auto initial = reply(2, options("provider/default-model", "default"));
     const auto model = options(*selected.model, "default");
     const auto complete = options(*selected.model, *selected.reasoning_effort);
+    for (const bool confirms : {true, false}) {
+        Session session(attestation, false, selected, "2.3.2");
+        auto native = parse(k_initialize);
+        native.find("result")->find("agentInfo")->set("version", Json("2.3.2"));
+        session.feed(addon::serialize_json(native) + '\n');
+        session.feed(initial);
+        session.feed(reply(5, model));
+        // Native 2.3.2 on Linux returned the previous default in response 6,
+        // then asynchronously announced the requested high effort.
+        const auto retry = session.feed(reply(6, model) + update(complete));
+        check_request(retry, "effort", "future-effort");
+        require(parse(*retry.stdin_bytes).find("id")->as_number() == 8,
+            "a stale echo can trigger one repeat with a fresh request id");
+        const auto result = session.feed(reply(8, confirms ? complete : model));
+        if (confirms) {
+            require(result.stdin_bytes && parse(*result.stdin_bytes).find("method")->as_string() == "session/prompt",
+                "a fresh confirmation of both requested settings releases the task");
+        }
+        else {
+            require(result.failure_reason == "reasoning_effort_unavailable" && !result.stdin_bytes,
+                "an unconfirmed setting is never retried indefinitely or used for a prompt");
+        }
+    }
     {
         Session session(attestation, false, selected);
         session.feed(k_initialize);

@@ -298,11 +298,14 @@ bool selection_confirmed(const Json& options, const addon::Delegated_model_selec
         (!selection.reasoning_effort || configuration_value(options, "effort") == selection.reasoning_effort);
 }
 
-std::string configure_input(Json& state, bool model, const std::string& value)
+std::string configure_input(Json& state, bool model, const std::string& value,
+    const std::optional<std::string>& previous)
 {
     state.set("stage", Json(model ? "await_model" : "await_effort"));
+    state.set("configuration_before", previous ? Json(*previous) : Json());
     return json_line(object({
-        {"jsonrpc", Json("2.0")}, {"id", Json(model ? 5 : 6)}, {"method", Json("session/set_config_option")},
+        {"jsonrpc", Json("2.0")}, {"id", Json((model ? 5 : 6) + (previous ? 0 : 2))},
+        {"method", Json("session/set_config_option")},
         {"params", object({
             {"sessionId", member(state, "session_id")},
             {"configId", Json(model ? "model" : "effort")}, {"value", Json(value)},
@@ -312,6 +315,7 @@ std::string configure_input(Json& state, bool model, const std::string& value)
 
 std::string prompt_input(Json& state, const std::string& prompt)
 {
+    state.erase("configuration_before");
     state.set("stage", Json("await_prompt"));
     state.set("prompt_base64", Json(""));
     return json_line(object({
@@ -657,7 +661,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                                   "working_directory", "provider_version", "result_base64",
                                   "result_message_id", "permission_ids", "mcp_servers", "attestations",
                                   "deferred_input_base64", "deferred_input_is_request", "deferred_input_has_permission_reply",
-                                  "task_tools", "announced", "auto_approve", "model_selection"}))
+                                  "task_tools", "announced", "auto_approve", "model_selection", "configuration_before"}))
     {
         return failure("acp_invalid_state");
     }
@@ -836,7 +840,8 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             const bool select_model = model_selection && model_selection->model;
             const bool select_effort = model_selection && model_selection->reasoning_effort;
             if (select_model || select_effort) {
-                if (!configuration_value(member(response_result, "configOptions"), select_model ? "model" : "effort")) {
+                const auto previous = configuration_value(member(response_result, "configOptions"), select_model ? "model" : "effort");
+                if (!previous) {
                     return failure(select_model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
                 }
                 if (!select_model) {
@@ -852,7 +857,7 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
                     state.set("model_selection", addon::encode_delegated_model_selection(*model_selection));
                 }
                 next_input = configure_input(state, select_model,
-                    select_model ? *model_selection->model : *model_selection->reasoning_effort);
+                    select_model ? *model_selection->model : *model_selection->reasoning_effort, previous);
             }
             else {
                 next_input = prompt_input(state, *prompt_bytes);
@@ -861,9 +866,11 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
         else
         if (stage == "await_model" || stage == "await_effort") {
             const bool model = stage == "await_model";
+            const auto* previous = state.find("configuration_before");
+            const bool retry = previous && previous->is_null();
             if (!model_selection || (model && !model_selection->model) ||
                 (!model && !model_selection->reasoning_effort) ||
-                !next_input.empty() || !response(value, model ? 5 : 6, &response_result) ||
+                !next_input.empty() || !response(value, (model ? 5 : 6) + (retry ? 2 : 0), &response_result) ||
                 !only_keys(response_result, {"_meta", "configOptions"}) || !valid_meta(response_result))
             {
                 return failure(model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
@@ -872,13 +879,25 @@ addon::Structured_inspect_result inspect_acp(const addon::Structured_inspection&
             if ((model && configuration_value(options, "model") != model_selection->model) ||
                 (!model && !selection_confirmed(options, *model_selection)))
             {
-                return failure(model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
+                // OpenCode 2 can briefly echo the previous selection while applying its switch.
+                // Repeat that same setting once and require a fresh, correlated confirmation.
+                const auto current = configuration_value(options, model ? "model" : "effort");
+                if (!text(member(state, "provider_version")).starts_with("2.") ||
+                    !previous || !previous->is_string() || current != previous->as_string() ||
+                    (!model && configuration_value(options, "model") != model_selection->model))
+                {
+                    return failure(model ? "model_selection_unavailable" : "reasoning_effort_unavailable");
+                }
+                next_input = configure_input(state, model,
+                    model ? *model_selection->model : *model_selection->reasoning_effort, std::nullopt);
             }
+            else
             if (model && model_selection->reasoning_effort) {
-                if (!configuration_value(options, "effort")) {
+                const auto effort = configuration_value(options, "effort");
+                if (!effort) {
                     return failure("reasoning_effort_unavailable");
                 }
-                next_input = configure_input(state, false, *model_selection->reasoning_effort);
+                next_input = configure_input(state, false, *model_selection->reasoning_effort, effort);
             }
             else {
                 next_input = prompt_input(state, *prompt_bytes);

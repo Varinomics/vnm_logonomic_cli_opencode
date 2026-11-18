@@ -679,14 +679,18 @@ std::optional<Verified_launch> verified_launch(
         std::optional<fs::path> shim_target;
         if (!script_module) {
             shim_target = npm_shim_target(*selected);
-            const auto classic = fs::path("node_modules/opencode-ai");
-            const auto native = fs::path("node_modules/@opencode/cli");
+            const auto bin_directory = selected->parent_path();
+            const bool project_bin = bin_directory.filename() == ".bin" &&
+                bin_directory.parent_path().filename() == "node_modules";
+            const auto packages = fs::path(project_bin ? ".." : "node_modules");
+            const auto classic = packages / "opencode-ai";
+            const auto native = packages / "@opencode/cli";
             if (shim_target == classic / "bin/opencode.exe") {
-                root = selected->parent_path() / classic;
+                root = (bin_directory / classic).lexically_normal();
             }
             else if (shim_target == native / "bin/opencode.exe" ||
                      shim_target == native / "bin" / (command_name + ".cjs")) {
-                root = selected->parent_path() / native;
+                root = (bin_directory / native).lexically_normal();
             }
             else return std::nullopt;
         }
