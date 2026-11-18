@@ -820,6 +820,18 @@ int main(int argc, char** argv)
     resume.context.launch_environment = interactive.launch_environment;
     resume.title_instruction          = interactive.title_instruction;
     resume.resume_record.set("provider_session_id", addon::Json_value(resumed_session));
+    for (const auto version : {std::uint16_t{3}, std::uint16_t{4}}) {
+        addon::Resume_inspect_request inspection;
+        inspection.context = resume.context;
+        inspection.resume_record = resume.resume_record;
+        Context cancelled;
+        cancelled.cancelled = true;
+        cancelled.invocation = {"inspect", {"interactive-resume", version}, addon::k_inspect_resume_operation,
+            addon::encode_resume_inspect_request(inspection)};
+        opencode::handle_preparation(cancelled);
+        check(cancelled.reason == "cancelled" && !cancelled.payload,
+            "cancelled exact resume inspection cannot publish availability");
+    }
     const auto prepare_resume = [&resume](std::string* reason) -> std::optional<addon::Resume_prepare_result> {
         Context prepared_resume;
         prepared_resume.invocation = {"resume", {"interactive-resume", 2}, "prepare_resume",

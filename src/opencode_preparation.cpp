@@ -678,6 +678,10 @@ void inspect_resume(addon::Invocation_context& context, std::chrono::steady_cloc
             result = inspect_conversation(*source, session->as_string(), [&context] { return context.cancel_requested(); });
         }
     }
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
     result.request_digest_hex = addon::resume_inspect_request_digest_hex(*request);
     context.succeed(addon::encode_resume_inspect_result(result, context.request().capability.version));
 }
@@ -718,9 +722,14 @@ void prepare_resume(addon::Invocation_context& context, std::chrono::steady_cloc
         context.fail(addon::Result_status::UNAVAILABLE, "resume_source_unavailable");
         return;
     }
-    if (record.find("source") && conversation_source && inspect_conversation(*conversation_source, session->as_string(),
-            [&context] { return context.cancel_requested(); }).availability == addon::Resume_availability::ABSENT)
-    {
+    const bool absent = record.find("source") && conversation_source && inspect_conversation(
+        *conversation_source, session->as_string(),
+        [&context] { return context.cancel_requested(); }).availability == addon::Resume_availability::ABSENT;
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    if (absent) {
         context.fail(addon::Result_status::UNAVAILABLE, "resume_target_absent");
         return;
     }
