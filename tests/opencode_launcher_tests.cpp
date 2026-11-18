@@ -822,7 +822,10 @@ int main(int argc, char** argv)
     resume.resume_record.set("provider_session_id", addon::Json_value(resumed_session));
     for (const auto version : {std::uint16_t{3}, std::uint16_t{4}}) {
         addon::Resume_inspect_request inspection;
-        inspection.context = resume.context;
+        inspection.context.launcher = resume.context.launcher;
+        inspection.context.launcher_argv = resume.context.launcher_argv;
+        inspection.context.working_directory = resume.context.working_directory;
+        inspection.context.launch_environment = resume.context.launch_environment;
         inspection.resume_record = resume.resume_record;
         Context cancelled;
         cancelled.cancelled = true;
