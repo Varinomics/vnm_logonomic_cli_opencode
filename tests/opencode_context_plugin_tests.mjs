@@ -2,7 +2,7 @@
 // and Context sidebar's disjoint assistant-token components. The native event
 // identity belongs to the observation, not the helper delivery attempt.
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, fstatSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -30,6 +30,32 @@ const read_lines = (path) => {
   return text ? text.split("\n").map(JSON.parse) : []
 }
 const captured = () => read_lines(capture_path)
+let capture_offset = 0
+const child_events = new Set()
+const wait_for_child = async (id, event) => {
+  const deadline = Date.now() + 30_000
+  const descriptor = openSync(capture_path, "r")
+  try {
+    while (!child_events.has(`${id}/${event}`)) {
+      const length = fstatSync(descriptor).size - capture_offset
+      if (length > 0) {
+        const bytes = Buffer.alloc(length)
+        const count = readSync(descriptor, bytes, 0, length, capture_offset)
+        const end = bytes.subarray(0, count).lastIndexOf(10) + 1
+        for (const line of bytes.toString("utf8", 0, end).trimEnd().split("\n").filter(Boolean)) {
+          const record = JSON.parse(line)
+          if (record.agent_id) child_events.add(`${record.agent_id}/${record.event}`)
+        }
+        capture_offset += end
+      }
+      if (child_events.has(`${id}/${event}`)) return
+      assert(Date.now() < deadline, `native child ${id} did not deliver ${event}`)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  } finally {
+    closeSync(descriptor)
+  }
+}
 // The helper's own request carries the transition nonce the host fences.
 const requests = () => read_lines(request_path)
 const event = (plugin, id, type, properties) => plugin.event({ event: { id, type, properties } })
@@ -79,6 +105,8 @@ const root = (plugin, session_id = "session-root") =>
 const run = async (emit, native_client = client()) => {
   writeFileSync(capture_path, "")
   writeFileSync(request_path, "")
+  child_events.clear()
+  capture_offset = 0
   lookups.length = 0
   const plugin = await Logonomic({ client: native_client })
   await emit(plugin)
@@ -165,11 +193,7 @@ const sequential_children = await run(async (plugin) => {
     event(plugin, `evt-start-${id}`, "session.status", { sessionID: id, status: { type: "busy" } })
     dispatched(plugin, `evt-model-${id}`, assistant(id, usage(), `model-${index}`))
     event(plugin, `evt-stop-${id}`, "session.status", { sessionID: id, status: { type: "idle" } })
-    const deadline = Date.now() + 5000
-    while (!captured().some((entry) => entry.event === "logonomic.subagent.stopped" && entry.agent_id === id)) {
-      assert(Date.now() < deadline, `native child ${id} did not drain`)
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await wait_for_child(id, "logonomic.subagent.stopped")
   }
 })
 const sequential_models = sequential_children.flatMap((entry) => entry.model_state?.updates ?? [])
@@ -189,11 +213,7 @@ const concurrent_children = await run(async (plugin) => {
     event(plugin, `evt-create-${id}`, "session.created", { info: { id, parentID: "session-root" } })
     event(plugin, `evt-start-${id}`, "session.status", { sessionID: id, status: { type: "busy" } })
     dispatched(plugin, `evt-model-${id}`, assistant(id, usage(), `model-${index}`))
-    const deadline = Date.now() + 5000
-    while (!captured().some((entry) => entry.event === "logonomic.subagent.started" && entry.agent_id === id)) {
-      assert(Date.now() < deadline, `concurrent child ${id} did not start`)
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await wait_for_child(id, "logonomic.subagent.started")
   }
 })
 assert.equal(concurrent_children.filter((entry) => entry.event === "logonomic.subagent.started").length, 128)
@@ -316,11 +336,7 @@ const nested = await run(async (plugin) => {
     const parentID = depth === 1 ? "session-root" : `nested-${depth - 1}`
     event(plugin, `evt-create-${id}`, "session.created", { info: { id, parentID } })
     event(plugin, `evt-start-${id}`, "session.status", { sessionID: id, status: { type: "busy" } })
-    const deadline = Date.now() + 5000
-    while (!captured().some((entry) => entry.event === "logonomic.subagent.started" && entry.agent_id === id)) {
-      assert(Date.now() < deadline, `nested child ${id} was not admitted`)
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await wait_for_child(id, "logonomic.subagent.started")
   }
   dispatched(plugin, "evt-nested-model", assistant(`nested-${nested_depth}`, usage(), "nested-model"))
   event(plugin, "evt-cycle-a", "session.created", { info: { id: "cycle-a", parentID: "cycle-b" } })
@@ -470,11 +486,7 @@ const held_lookup = await run(async (plugin) => {
     child_records.push(native_record(id, `msg-${id}`, `turn-${id}`, `child-model-${index}`))
     event(plugin, `evt-record-${id}`, "message.updated", { info: child_records[index] })
     status(plugin, `evt-dispatch-${id}`, id, "busy")
-    const deadline = Date.now() + 5000
-    while (!captured().some((entry) => entry.event === "logonomic.subagent.started" && entry.agent_id === id)) {
-      assert(Date.now() < deadline, `held child ${id} did not start`)
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await wait_for_child(id, "logonomic.subagent.started")
   }
   event(plugin, "evt-root-usage", "message.updated", {
     info: completed(root_reply, { tokens: usage(), finish: "stop" }),

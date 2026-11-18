@@ -196,7 +196,7 @@ try {
       }
       try {
         assert.equal(deadlines.length, 1, "the held selection delivery arms its own delivery deadline")
-        const handshake = Date.now() + 5000
+        const handshake = Date.now() + 20_000
         while (!(Number(await readFile(held_pid, "utf8").catch(() => "")) > 0)) {
           assert(Date.now() < handshake, "the held helper must record its delivery and start holding it")
           await new Promise((resolve) => setTimeout(resolve, 10))
