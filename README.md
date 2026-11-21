@@ -210,24 +210,12 @@ winsqlite3 headers and import library. On Linux and macOS, install the SQLite3 d
 CMake fetches the SDK from `vnm_logonomic_cli_addon` on `master` unless you supply
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE`.
 
-Run every compiler-invoking configure or build through `queued-build` with an
-explicit numeric slot count matching native parallelism. Windows uses Visual
-Studio 2026 x64 with MSVC v145 (`vcvarsall.bat x64 -vcvars_ver=14.51`) and FASTBuild
-when available. Set `CMAKE_FASTBUILD_CAPTURE_SYSTEM_ENV=OFF`; cache-enabled MSVC
-uses Embedded `/Z7` debug information. Use a fresh out-of-source build directory.
+Use a fresh out-of-source build directory.
 The `opencode_package` target assembles and indexes the platform package under
 `<build>/package/logonomic.cli.opencode` for a single-configuration generator, or
 `<build>/package/<config>/logonomic.cli.opencode` for a multi-configuration generator.
 
-The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
-during configuration. `cmake --install` exports a fresh artifact beneath its install-time
-prefix and preserves executable permissions. An existing per-package destination,
-including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
-nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
-a failure may leave a partial artifact directory. Choose a fresh destination or
-manually remove only that identified disposable export before retrying; never
-remove an installed generation this way. The application's package ingestion
-owns atomic installation and updates.
+Use `cmake --install` to export the indexed package to a fresh directory. See [SDK package export](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/package_contract.md#exporting-a-package).
 
 After the sources are ready, build once for the selected platform and run its
 registered CTest entries. `opencode_package_validation` checks indexed bytes and

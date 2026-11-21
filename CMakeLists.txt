@@ -139,6 +139,7 @@ else()
 endif()
 
 add_executable(opencode_adapter src/adapter.cpp)
+target_compile_definitions(opencode_adapter PRIVATE LOGONOMIC_CLI_ADDON_ADAPTER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(opencode_adapter PRIVATE opencode_provider)
 opencode_target(opencode_adapter)
 

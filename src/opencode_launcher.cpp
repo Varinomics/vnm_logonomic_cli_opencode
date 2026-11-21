@@ -828,6 +828,10 @@ std::optional<Verified_launch> verified_launch(
         append(addon::file_time_ticks_text(identities[index].second));
     }
     const auto cache_key = addon::to_hex(digest.finish());
+    const auto accepts_version = [&](const std::string& version) {
+        return (package_version.empty() || version == package_version) &&
+            version_is_at_least(version, 1, 18, delegated ? 25 : 11);
+    };
     const auto result = [&](const std::string& version) {
         return Verified_launch{
             delegated && uses_tui_plugin(version) ? std::move(standalone_acp_argv) : std::move(launch_argv),
@@ -839,8 +843,9 @@ std::optional<Verified_launch> verified_launch(
         std::lock_guard lock(cache_mutex);
         const auto cached = cache.find(cache_key);
         if (cached != cache.end() && remaining_probe_ms(context, started)) {
-            if ((!package_version.empty() && cached->second != package_version) ||
-                !version_is_at_least(cached->second, 1, 18, delegated ? 25 : 11)) return std::nullopt;
+            if (!accepts_version(cached->second)) {
+                return std::nullopt;
+            }
             return result(cached->second);
         }
     }
@@ -854,8 +859,9 @@ std::optional<Verified_launch> verified_launch(
         if (fs::last_write_time(files[index], error) != identities[index].second || error) return std::nullopt;
     }
     const auto version = parse_version_output(output->output, output->errors);
-    if ((!package_version.empty() && version != package_version) ||
-        !version_is_at_least(version, 1, 18, delegated ? 25 : 11)) return std::nullopt;
+    if (!accepts_version(version)) {
+        return std::nullopt;
+    }
     if (cacheable) {
         std::lock_guard lock(cache_mutex);
         if (cache.size() >= 32) cache.erase(cache.begin());
