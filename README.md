@@ -4,7 +4,7 @@
 
 This standalone package supplies OpenCode launcher recognition, interactive
 configuration and tools, delegated ACP implementation, lifecycle delivery, and
-interactive resume through the public Logonomic CLI add-on SDK. Its package identity is `logonomic.cli.opencode`.
+interactive resume through the Logonomic CLI add-on SDK. Its package identity is `logonomic.cli.opencode`.
 
 OpenCode has no singular global account, authentication, quota, or usage model in
 this integration. Those capabilities are not advertised. Read-only structured
@@ -129,6 +129,9 @@ No version ceiling is imposed on compatible launchers.
 
 ## Building and local qualification
 
+The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
+Send provider pull requests to [the opencode repository](https://github.com/Varinomics/vnm_logonomic_cli_opencode/pulls).
+
 Interactive native question events retain `question.asked`, `question.replied`,
 and `question.rejected` and the native question identity. Root questions retain
 their original root turn; child questions retain their native child and request
@@ -202,10 +205,10 @@ Supplying the test event wrapper also checks actual manual new/resume selection,
 idle return before another prompt, picker cancellation and native default-directory
 movement through the packaged helper.
 
-The project is C++20 and uses only the standalone SDK, the standard library and
-platform APIs. CMake tracks the SDK source on Logonomic `master`; a local SDK
-checkout can be supplied with `LOGONOMIC_CLI_ADDON_SDK_SOURCE`. Provider sources
-and build outputs remain separate from the desktop app.
+The C++20 provider uses SQLite for conversation extraction. Windows uses the Windows SDK's
+winsqlite3 headers and import library. On Linux and macOS, install the SQLite3 development files.
+CMake fetches the SDK from `vnm_logonomic_cli_addon` on `master` unless you supply
+`LOGONOMIC_CLI_ADDON_SDK_SOURCE`.
 
 Run every compiler-invoking configure or build through `queued-build` with an
 explicit numeric slot count matching native parallelism. Windows uses Visual
