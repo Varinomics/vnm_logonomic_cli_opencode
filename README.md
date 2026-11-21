@@ -131,6 +131,7 @@ No version ceiling is imposed on compatible launchers.
 
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the opencode repository](https://github.com/Varinomics/vnm_logonomic_cli_opencode/pulls).
+See the [repository license](LICENSE) for the terms covering Varinomics code.
 
 Interactive native question events retain `question.asked`, `question.replied`,
 and `question.rejected` and the native question identity. Root questions retain
@@ -225,9 +226,8 @@ and Linux require separate native qualification; evidence from one does not prov
 the other's process paths. Local staging uses `logonomic_cli_addon_stage` and the
 desktop's generic package ingestion in isolated profiles.
 
-Local qualification does not activate this package in a user's live profile.
-[Bundle publication qualification](https://github.com/Varinomics/vnm_logonomic_cli_bundle/blob/master/docs/publication.md)
-owns signed availability, hosted rehearsal, restoration and observation gates.
+To check the package against an installed desktop before loading it in that
+profile, use the [SDK compatibility validator](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/sdk_tools.md#validating-a-package).
 
 ## Attribution
 

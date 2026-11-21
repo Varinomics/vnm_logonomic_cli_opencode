@@ -152,6 +152,7 @@ logonomic_cli_addon_package_platform(OPENCODE_PLATFORM)
 set(OPENCODE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
 logonomic_cli_addon_add_package(opencode_package logonomic.cli.opencode OPENCODE_PACKAGE_DIRECTORY
+    PROJECT_LICENSE LICENSE
     ADAPTER opencode_adapter
     HELPERS opencode_helper opencode_launch_bridge
     INDEX_ARGUMENTS
@@ -297,6 +298,7 @@ get_directory_property(_provider_tests TESTS)
 set_property(TEST ${_provider_tests} APPEND PROPERTY LABELS "cli-addon;provider-contract")
 
 add_executable(opencode_error_boundary_tests tests/opencode_error_boundary_tests.cpp)
+target_compile_definitions(opencode_error_boundary_tests PRIVATE LOGONOMIC_CLI_ADDON_ADAPTER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(opencode_error_boundary_tests PRIVATE opencode_provider logonomic_cli_addon_sdk::test_support)
 opencode_target(opencode_error_boundary_tests)
 add_test(NAME opencode_error_boundary_tests COMMAND opencode_error_boundary_tests)
