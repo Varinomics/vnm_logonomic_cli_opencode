@@ -92,6 +92,7 @@ std::optional<Verified_launch> verified_launch(
     std::string_view                working_directory,
     bool                            delegated,
     addon::Invocation_context&     context,
-    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now());
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now(),
+    bool                            probe_native_image = false);
 
 } // namespace opencode

@@ -1,4 +1,5 @@
 #include "opencode_acp.h"
+#include "opencode_authoring.h"
 #include "opencode_conversation.h"
 #include "opencode_launcher.h"
 #include "opencode_launcher_approval.h"
@@ -56,7 +57,10 @@ void invoke(addon::Invocation_context& context)
 {
     const auto& request = context.request();
     try {
-        if (request.capability.capability_id == addon::k_conversation_export_capability_id) {
+        if (request.capability.capability_id == addon::k_authoring_session_capability_id) {
+            opencode::handle_authoring(context);
+        }
+        else if (request.capability.capability_id == addon::k_conversation_export_capability_id) {
             addon::handle_conversation_export(context, opencode::export_conversation);
         }
         else
@@ -150,6 +154,7 @@ int main()
         {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1},
         {"launch-preparation", 3}, {"managed-assets", 1}, {"structured-session", 3},
+        {addon::k_authoring_session_capability_id, addon::k_authoring_session_version},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {"delegated-session", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {addon::k_delegated_model_selection_capability_id, addon::k_delegated_model_selection_version},

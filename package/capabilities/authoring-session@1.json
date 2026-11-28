@@ -1,0 +1,19 @@
+{
+  "capability_id": "authoring-session",
+  "version": 1,
+  "payload": {
+    "environment_names": [
+      "OPENCODE_CONFIG_CONTENT",
+      "OPENCODE_CONFIG",
+      "OPENCODE_CONFIG_DIR",
+      "OPENCODE_TEST_HOME",
+      "OPENCODE_DB",
+      "XDG_CACHE_HOME",
+      "XDG_STATE_HOME",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}

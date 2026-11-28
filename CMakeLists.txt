@@ -53,6 +53,7 @@ endfunction()
 
 add_library(opencode_provider STATIC
     src/opencode_acp.cpp
+    src/opencode_authoring.cpp
     src/opencode_conversation.cpp
     src/opencode_conversation_legacy.cpp
     src/opencode_conversation_source.cpp

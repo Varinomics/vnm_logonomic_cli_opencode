@@ -634,7 +634,8 @@ int remaining_probe_ms(const addon::Invocation_context& context, std::chrono::st
 std::optional<Verified_launch> verified_launch(
     const addon::Launcher_request& launcher, const std::vector<std::string>& launcher_argv,
     const addon::Json_value& effective_environment, std::string_view working_directory,
-    bool delegated, addon::Invocation_context& context, std::chrono::steady_clock::time_point started)
+    bool delegated, addon::Invocation_context& context, std::chrono::steady_clock::time_point started,
+    bool probe_native_image)
 {
     auto command = recognize_launcher(launcher.script_body, launcher.runner_key);
     if (!command || !command->prefix_arguments.empty() || launcher_argv.empty()) return std::nullopt;
@@ -784,7 +785,7 @@ std::optional<Verified_launch> verified_launch(
 #endif
         }
     }
-    else if (launcher.runner_key == "powershell") {
+    else if (launcher.runner_key == "powershell" && !probe_native_image) {
 #ifdef _WIN32
         // Probe the program the launch's own shell resolves and runs, which may
         // be a shim other than the installation the package located. PowerShell
